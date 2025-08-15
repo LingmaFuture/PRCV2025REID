@@ -1,0 +1,1715 @@
+# config.py
+import os
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+import yaml
+import torchvision.transforms as T
+
+@dataclass
+class TrainingConfig:
+    """修复后的训练配置"""
+    # 数据相关
+    data_root: str = "./data/train"
+    json_file: str = "./data/train/text_annos.json"
+    
+    # 数据集划分
+    val_ratio: float = 0.2
+    seed: int = 42
+    
+    # 模型相关 - 简化架构，专注核心功能
+    backbone: str = "resnet50"      # 支持 "resnet50" 或 "vit_base_patch16_224"
+    use_pretrained_vision: bool = False
+
+    # 统一的融合维度（视觉与文本都会被投到这个维度）
+    fusion_dim: int = 768
+
+    # 文本模型配置
+    text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    freeze_text: bool = True
+    
+    image_size: int = 224  # 匹配ViT模型要求的输入尺寸
+    feature_dim: int = 2048  # ResNet50特征维度
+    hidden_dim: int = 512  
+    num_classes: int = 999
+    dropout_rate: float = 0.3
+    
+    # 训练相关 - 调整超参数
+    batch_size: int = 16  # 增加批次大小，避免BatchNorm问题
+    num_epochs: int = 100
+    learning_rate: float = 1e-4  # 降低学习率
+    weight_decay: float = 5e-4
+    warmup_epochs: int = 5
+    scheduler: str = "step"
+    
+    # 损失权重 - 简化损失函数
+    ce_weight: float = 1.0
+    contrastive_weight: float = 0.5
+    
+    # 数据增强 - 减少过度增强
+    random_flip: bool = True
+    random_crop: bool = False  # 暂时关闭随机裁剪
+    color_jitter: bool = True
+    random_erase: float = 0.2  # 降低随机擦除概率
+    
+    # 模态dropout
+    modality_dropout: float = 0.1  # 降低dropout概率
+    min_modalities: int = 2
+    
+    # 设备和并行
+    device: str = "cuda"
+    num_workers: int = 2
+    pin_memory: bool = True
+    
+    # 保存和日志
+    save_dir: str = "./checkpoints"
+    log_dir: str = "./logs"
+    save_freq: int = 20
+    eval_freq: int = 10
+    
+    # 验证和推理相关配置
+    inference_batch_size: int = 32
+    best_model_path: str = "./checkpoints/best_model.pth"
+    
+    def __post_init__(self):
+        """初始化配置后的处理"""
+        os.makedirs(self.save_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+        
+        # 设置验证集图像预处理
+        self.val_transform = T.Compose([
+            T.Resize((self.image_size, self.image_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+# dataset.py
+import torch
+from torch.utils.data import Dataset, Sampler
+import torchvision.transforms as transforms
+from PIL import Image
+import json
+import os
+import random
+from collections import defaultdict
+
+class FixedModalityAugmentation:
+    """修复后的数据增强"""
+    
+    def __init__(self, config, is_training=True):
+        self.config = config
+        self.is_training = is_training
+    
+    def get_transform(self):
+        if self.is_training:
+            return transforms.Compose([
+                transforms.Resize((self.config.image_size, self.config.image_size)),
+                transforms.RandomHorizontalFlip(0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2) if self.config.color_jitter else transforms.Lambda(lambda x: x),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.RandomErasing(p=self.config.random_erase, scale=(0.02, 0.2)) if self.config.random_erase > 0 else transforms.Lambda(lambda x: x)
+            ])
+        else:
+            return transforms.Compose([
+                transforms.Resize((self.config.image_size, self.config.image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+
+class FixedMultiModalDataset(Dataset):
+    """修复后的多模态数据集"""
+    
+    def __init__(self, config, split='train', person_ids=None):
+        self.config = config
+        self.split = split
+        self.is_training = (split == 'train')
+        self.modality_folders = ['vis', 'nir', 'sk', 'cp']
+        
+        # 加载标注
+        self._load_annotations()
+        
+        # 设置person_ids
+        if person_ids is not None:
+            self.person_ids = person_ids
+        else:
+            self.person_ids = self._get_available_person_ids()
+        
+        self.pid2label = {pid: i for i, pid in enumerate(self.person_ids)}
+        # 构建数据列表
+        self._build_data_list()
+        
+        # 数据变换
+        self.transform = FixedModalityAugmentation(config, split == 'train').get_transform()
+        
+        # 缓存图像路径
+        self._cache_image_paths()
+        
+        print(f"{split} dataset: {len(self.data_list)} samples, {len(self.person_ids)} identities")
+    
+    def _load_annotations(self):
+        """加载标注文件 - 使用file_path中的目录ID作为身份ID"""
+        with open(self.config.json_file, 'r', encoding='utf-8') as f:
+            annotations_list = json.load(f)
+        
+        # 按file_path中的目录ID分组文本标注，同时记录文件路径
+        self.id_to_annotations = {}
+        self.id_to_files = {}
+        
+        for item in annotations_list:
+            file_path = item['file_path']
+            caption = item['caption']
+            
+            # 从file_path中提取目录ID作为身份ID
+            parts = file_path.split('/')
+            if len(parts) >= 3:
+                dir_name = parts[1]  # 0001
+                if dir_name.isdigit():
+                    person_id = int(dir_name)  # 使用目录ID作为身份ID
+                else:
+                    continue  # 跳过无效路径
+            else:
+                continue  # 跳过无效路径
+            
+            if person_id not in self.id_to_annotations:
+                self.id_to_annotations[person_id] = []
+                self.id_to_files[person_id] = []
+            
+            self.id_to_annotations[person_id].append(caption)
+            # 移除vis/前缀，匹配实际目录结构
+            actual_path = file_path.replace('vis/', '')
+            self.id_to_files[person_id].append(actual_path)
+        
+        # 为每个身份创建合并的文本描述
+        self.annotations = {}
+        for person_id, captions in self.id_to_annotations.items():
+            person_id_str = f"{person_id:04d}"
+            # 合并该身份的所有文本描述
+            combined_caption = ' '.join(captions)
+            self.annotations[person_id_str] = combined_caption
+    
+    def _get_available_person_ids(self):
+        """获取可用的person_ids - 基于json标注"""
+        # 使用json中的身份ID作为主要依据
+        json_ids = set(self.id_to_annotations.keys())
+        
+        # 检查这些身份在vis模态中是否有对应的目录（作为gallery）
+        final_ids = []
+        missing_vis = []
+        for pid in json_ids:
+            # 检查vis模态是否存在（作为gallery目标）
+            vis_path = os.path.join(self.config.data_root, 'vis', f"{pid:04d}")
+            if os.path.exists(vis_path):
+                final_ids.append(pid)
+            else:
+                missing_vis.append(pid)
+        
+        print(f"数据集加载信息:")
+        print(f"  json中的身份ID: {len(json_ids)}")
+        print(f"  最终可用的身份ID: {len(final_ids)}")
+        print(f"  缺少vis目录的身份ID: {len(missing_vis)}")
+        
+        if missing_vis:
+            print(f"  缺少vis目录的示例身份ID: {missing_vis[:10]}")
+        
+        return sorted(final_ids)
+    
+    def _build_data_list(self):
+        """构建数据列表"""
+        self.data_list = []
+        for person_id in self.person_ids:
+            person_id_str = f"{person_id:04d}"
+            text_desc = self.annotations.get(person_id_str, "unknown person")
+            
+            self.data_list.append({
+                'person_id': person_id,
+                'person_id_str': person_id_str,
+                'text_description': text_desc
+            })
+    
+    def _cache_image_paths(self):
+        """缓存图像路径 - 基于json文件路径"""
+        self.image_cache = {}
+        
+        for data in self.data_list:
+            person_id = data['person_id']
+            person_id_str = data['person_id_str']
+            self.image_cache[person_id_str] = {}
+            
+            # 对于vis模态，使用json中的文件路径
+            if person_id in self.id_to_files:
+                vis_files = self.id_to_files[person_id]
+                self.image_cache[person_id_str]['vis'] = []
+                
+                for file_path in vis_files:
+                    # 移除vis/前缀，构建完整路径
+                    actual_path = file_path.replace('vis/', '')
+                    full_path = os.path.join(self.config.data_root, 'vis', actual_path)
+                    if os.path.exists(full_path):
+                        self.image_cache[person_id_str]['vis'].append(full_path)
+            
+            # 对于其他模态，检查目录是否存在
+            for modality in ['nir', 'sk', 'cp']:
+                folder_path = os.path.join(self.config.data_root, modality, person_id_str)
+                
+                if os.path.exists(folder_path):
+                    images = [f for f in os.listdir(folder_path) 
+                             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+                    self.image_cache[person_id_str][modality] = [
+                        os.path.join(folder_path, img) for img in images
+                    ]
+                else:
+                    self.image_cache[person_id_str][modality] = []
+    
+    def __len__(self):
+        return len(self.data_list)
+    
+    def __getitem__(self, idx):
+        data = self.data_list[idx]
+        person_id = data['person_id']
+        person_id_str = data['person_id_str']
+        text_desc = data['text_description']
+
+        # 创建样本字典（统一为 images 字典 + text_description）
+        sample = {
+            'person_id': torch.tensor(self.pid2label[person_id], dtype=torch.long),  # 转换为0-based
+            'text_description': [text_desc],
+            'modality_mask': {},
+        }
+
+        images = {}
+        # 加载图像
+        for modality in self.modality_folders:
+            image_paths = self.image_cache[person_id_str][modality]
+
+            use_drop = self.is_training and (self.config.modality_dropout > 0)
+            if image_paths and (not use_drop or random.random() > self.config.modality_dropout):
+                # 正常加载
+                selected_path = random.choice(image_paths)
+                try:
+                    image = Image.open(selected_path).convert('RGB')
+                    images[modality] = self.transform(image)
+                    sample['modality_mask'][modality] = 1.0
+                except Exception as e:
+                    print(f"Error loading {selected_path}: {e}")
+                    images[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
+                    sample['modality_mask'][modality] = 0.0
+            else:
+                images[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
+                sample['modality_mask'][modality] = 0.0
+
+
+        sample['images'] = images
+        return sample
+
+class FixedBalancedBatchSampler(Sampler):
+    """修复后的平衡批次采样器"""
+    
+    def __init__(self, dataset, batch_size, num_instances=4):  # 增加每个身份的实例数
+        self.batch_size = batch_size
+        self.num_instances = num_instances
+        self.num_pids_per_batch = batch_size // num_instances
+        
+        # 确保batch size至少为2，避免BatchNorm问题
+        if self.batch_size < 2:
+            print(f"警告: batch_size {batch_size} 太小，调整为2")
+            self.batch_size = 2
+            self.num_pids_per_batch = max(1, self.batch_size // num_instances)
+        
+        # 处理Subset
+        if hasattr(dataset, 'dataset'):
+            self.base_dataset = dataset.dataset
+            self.indices = dataset.indices
+        else:
+            self.base_dataset = dataset
+            self.indices = list(range(len(dataset)))
+        
+        # 按ID分组
+        self.index_pid = defaultdict(list)
+        for subset_idx, orig_idx in enumerate(self.indices):
+            if hasattr(self.base_dataset, 'data_list'):
+                person_id = self.base_dataset.data_list[orig_idx]['person_id']
+            else:
+                person_id = self.base_dataset[orig_idx]['person_id'].item() + 1  # 转回1-based
+            
+            self.index_pid[person_id].append(subset_idx)
+        
+        self.pids = list(self.index_pid.keys())
+        self.length = len(self.pids) // self.num_pids_per_batch * self.batch_size
+    
+    def __iter__(self):
+        random.shuffle(self.pids)
+        
+        for start_idx in range(0, len(self.pids), self.num_pids_per_batch):
+            batch_indices = []
+            end_idx = min(start_idx + self.num_pids_per_batch, len(self.pids))
+            selected_pids = self.pids[start_idx:end_idx]
+            
+            for pid in selected_pids:
+                indices = self.index_pid[pid]
+                if len(indices) >= self.num_instances:
+                    selected = random.sample(indices, self.num_instances)
+                else:
+                    selected = random.choices(indices, k=self.num_instances)
+                batch_indices.extend(selected)
+            
+            # 补齐批次 - 确保batch size一致
+            while len(batch_indices) < self.batch_size:
+                pid = random.choice(self.pids)
+                idx = random.choice(self.index_pid[pid])
+                batch_indices.append(idx)
+            
+            # 确保返回的batch size正确
+            if len(batch_indices) != self.batch_size:
+                print(f"警告: batch indices数量不匹配: {len(batch_indices)} vs {self.batch_size}")
+                if len(batch_indices) < self.batch_size:
+                    # 重复添加样本直到达到目标batch size
+                    while len(batch_indices) < self.batch_size:
+                        pid = random.choice(self.pids)
+                        idx = random.choice(self.index_pid[pid])
+                        batch_indices.append(idx)
+                else:
+                    # 截断到目标batch size
+                    batch_indices = batch_indices[:self.batch_size]
+            
+            yield batch_indices
+    
+    def __len__(self):
+        # 确保至少返回1个batch，避免空迭代器
+        return max(1, self.length // self.batch_size)
+
+
+def compatible_collate_fn(batch):
+    """
+    兼容的collate函数，统一输出结构：
+    {
+        'person_id': Tensor[B],
+        'images': {
+            'vis'|'nir'|'sk'|'cp': Tensor[B,3,H,W]
+        },
+        'text_description': List[str],
+        'modality_mask': {
+            'vis'|'nir'|'sk'|'cp'|'text': Tensor[B]
+        }
+    }
+    支持两种输入样本：
+    1) 训练集样本：顶层含 'images' 字典
+    2) 旧式样本：顶层直接含各模态键（vis/nir/sk/cp）与 'text_descriptions'
+    """
+    if not batch:
+        return {}
+
+    first_sample = batch[0]
+    batch_dict = {}
+
+    # person_id
+    if 'person_id' in first_sample:
+        batch_dict['person_id'] = torch.stack([sample['person_id'] for sample in batch])
+
+    # 文本统一为 text_description: List[str]
+    text_list = []
+    if 'text_description' in first_sample:
+        for sample in batch:
+            td = sample.get('text_description', [""])
+            if isinstance(td, list) and len(td) > 0:
+                text_list.append(td[0])
+            elif isinstance(td, str):
+                text_list.append(td)
+            else:
+                text_list.append("")
+    elif 'text_descriptions' in first_sample:
+        for sample in batch:
+            td = sample.get('text_descriptions', [""])
+            text_list.append(td[0] if isinstance(td, list) and len(td) > 0 else "")
+    else:
+        text_list = [""] * len(batch)
+    batch_dict['text_description'] = text_list
+
+    # 组织 images
+    images = {}
+    modalities = ['vis', 'nir', 'sk', 'cp']
+    if 'images' in first_sample and isinstance(first_sample['images'], dict):
+        for m in modalities:
+            # 支持缺失模态（用零填充）
+            tensors = []
+            for sample in batch:
+                if 'images' in sample and m in sample['images'] and isinstance(sample['images'][m], torch.Tensor):
+                    tensors.append(sample['images'][m])
+                else:
+                    # 推断尺寸，回退为 3xHxW 的零张量
+                    h = w = getattr(getattr(sample, 'config', None), 'image_size', 224)
+                    tensors.append(torch.zeros(3, h, w))
+            images[m] = torch.stack(tensors)
+    else:
+        # 旧式：顶层各模态
+        for m in modalities:
+            if m in first_sample and isinstance(first_sample[m], torch.Tensor):
+                images[m] = torch.stack([sample[m] for sample in batch])
+    batch_dict['images'] = images
+
+    # modality_mask 统一到 Tensor[B]
+    mask_out = {}
+    for m in modalities + ['text']:
+        vals = []
+        for sample in batch:
+            mv = 0.0
+            if 'modality_mask' in sample and isinstance(sample['modality_mask'], dict):
+                raw = sample['modality_mask'].get(m, 0.0)
+                if isinstance(raw, (float, int)):
+                    mv = float(raw)
+                elif isinstance(raw, bool):
+                    mv = 1.0 if raw else 0.0
+            # 若为文本且未显式标注，则依据文本是否为空
+            if m == 'text' and mv == 0.0:
+                td = sample.get('text_description', sample.get('text_descriptions', [""]))
+                if isinstance(td, list):
+                    mv = 1.0 if (len(td) > 0 and isinstance(td[0], str) and len(td[0]) > 0) else 0.0
+                elif isinstance(td, str):
+                    mv = 1.0 if len(td) > 0 else 0.0
+            vals.append(mv)
+        mask_out[m] = torch.tensor(vals, dtype=torch.float)
+    batch_dict['modality_mask'] = mask_out
+
+    return batch_dict
+# model.py — 优化可运行版
+import math
+from typing import Dict, List, Optional, Tuple
+import contextlib
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+from transformers import AutoModel, AutoTokenizer
+
+
+# -------------------------
+# 基础组件
+# -------------------------
+class LayerScale(nn.Module):
+    """LayerScale for better training stability"""
+    def __init__(self, dim, init_values=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x):
+        return self.gamma * x
+
+class VectorModalityAdapter(nn.Module):
+    """
+    向量级 FiLM 适配器：输入 (B, C)，输出 (B, C)
+    学到逐通道的 scale/bias：y = x * (1 + gamma) + beta
+    """
+    def __init__(self, dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, dim * 2)  # -> [gamma, beta]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gb = self.net(x)                 # (B, 2C)
+        gamma, beta = torch.chunk(gb, 2, dim=-1)
+        return x * (1.0 + gamma) + beta
+
+class ModalityAdapter(nn.Module):
+    """
+    模态适配器（FiLM式）：不改变序列长度，避免 ViT pos_embed 尺寸问题。
+    给定 token 序列，基于 patch 的全局统计，学习到逐通道的 scale/bias。
+    """
+    def __init__(self, embed_dim: int, hidden: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, embed_dim * 2),
+        )
+        self.ln = nn.LayerNorm(embed_dim)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens: (B, 1+N, C) ; 只基于 patch token 做统计
+        patch = tokens[:, 1:, :] if tokens.size(1) > 1 else tokens  # 防卫
+        pooled = patch.mean(dim=1)  # (B, C)
+        gamma_beta = self.mlp(self.ln(pooled))  # (B, 2C)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)  # (B, C), (B, C)
+        return tokens * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+
+class CrossModalTransformerBlock(nn.Module):
+    """跨模态 Transformer 块（Pre-LN 风格，更稳）"""
+    def __init__(self, embed_dim, num_heads=8, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        self.cross_norm_q = nn.LayerNorm(embed_dim)
+        self.cross_norm_kv = nn.LayerNorm(embed_dim)
+        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
+        self.cross_scale = LayerScale(embed_dim)
+
+        self.self_norm = nn.LayerNorm(embed_dim)
+        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
+        self.self_scale = LayerScale(embed_dim)
+
+        self.ffn_norm = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(proj_drop),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(proj_drop),
+        )
+        self.ffn_scale = LayerScale(embed_dim)
+
+    def forward(self, query, key_value, key_padding_mask: Optional[torch.Tensor] = None):
+        # Cross-Attn
+        q = self.cross_norm_q(query)
+        kv = self.cross_norm_kv(key_value)
+        cross_out, _ = self.cross_attn(q, kv, kv, key_padding_mask=key_padding_mask)  # (B,1,C)
+        x = query + self.cross_scale(cross_out)
+
+        # Self-Attn
+        y = self.self_norm(x)
+        self_out, _ = self.self_attn(y, y, y)
+        x = x + self.self_scale(self_out)
+
+        # FFN
+        z = self.ffn_norm(x)
+        x = x + self.ffn_scale(self.mlp(z))
+        return x
+
+
+class HierarchicalMultiModalFusion(nn.Module):
+    """层次化多模态融合（晚期+全局token）——每模态输入为一个向量"""
+    def __init__(self, embed_dim, num_layers=3, num_heads=8):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        self.modality_tokens = nn.ParameterDict({
+            'vis': nn.Parameter(torch.randn(1, embed_dim)),
+            'nir': nn.Parameter(torch.randn(1, embed_dim)),
+            'sk': nn.Parameter(torch.randn(1, embed_dim)),
+            'cp': nn.Parameter(torch.randn(1, embed_dim)),
+            'text': nn.Parameter(torch.randn(1, embed_dim)),
+        })
+
+        self.fusion_layers = nn.ModuleList([
+            CrossModalTransformerBlock(embed_dim, num_heads=num_heads) for _ in range(num_layers)
+        ])
+
+        self.global_token = nn.Parameter(torch.randn(1, embed_dim))
+        self.final_projection = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, modality_features: Dict[str, torch.Tensor], modality_mask: Optional[Dict[str, bool]] = None):
+        # modality_features[k]: (B, C)
+        ref = next(iter(modality_features.values()))
+        device = ref.device
+        batch = ref.size(0)
+
+        sequences = []
+        for m, feat in modality_features.items():
+            if modality_mask is not None and not modality_mask.get(m, True):
+                continue
+            token = self.modality_tokens[m].unsqueeze(0).expand(batch, -1, -1)  # (B, 1, C)
+            feat = feat.unsqueeze(1)  # (B, 1, C)
+            sequences.append(torch.cat([token, feat], dim=1))  # (B, 2, C)
+
+        if not sequences:
+            return torch.zeros(batch, self.embed_dim, device=device)
+
+        all_seq = torch.cat(sequences, dim=1)  # (B, 2*M, C)
+        global_q = self.global_token.unsqueeze(0).expand(batch, 1, -1)  # (B, 1, C)
+
+        # 这里不需要 padding mask（全是有效 token）
+        for layer in self.fusion_layers:
+            global_q = layer(global_q, all_seq, key_padding_mask=None)
+
+        fused = self.final_projection(global_q.squeeze(1))  # (B, C)
+        return fused
+
+
+# -------------------------
+# 损失函数
+# -------------------------
+class AdvancedContrastiveLoss(nn.Module):
+    """
+    稳定的 SupCon + 跨模态 InfoNCE，并带 top-k 硬负样本正则
+    - features: (B, C)（融合后）
+    - labels: (B,)
+    - modal_dict: Dict[str, Tensor]，各模态 (B, C)
+    """
+    def __init__(self, temperature: float = 0.07, margin: float = 0.2, topk: int = 5,
+                 w_fused: float = 1.0, w_xmodal: float = 1.0, anchor_modal: str = 'vis'):
+        super().__init__()
+        self.tau = temperature
+        self.margin = margin
+        self.topk = topk
+        self.w_fused = w_fused
+        self.w_xmodal = w_xmodal
+        self.anchor_modal = anchor_modal
+
+    @staticmethod
+    def _norm(x):
+        return F.normalize(x, dim=-1)
+
+    def _supcon(self, feats: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # 去自对角的监督对比（多正样本求和）
+        B = feats.size(0)
+        feats = self._norm(feats)
+        sim = feats @ feats.t() / self.tau  # (B, B)
+
+        labels = labels.view(-1, 1)
+        pos_mask = labels.eq(labels.t())  # (B, B)
+        eye = torch.eye(B, device=feats.device, dtype=torch.bool)
+        pos_mask = pos_mask & (~eye)
+
+        # 对每一行：-log( sum_pos exp / sum_all_except_self exp )
+        logits = sim
+        logits = logits - torch.max(logits, dim=1, keepdim=True)[0]  # 数值稳定
+        exp_logits = torch.exp(logits)
+
+        # 分母：去掉自身
+        denom = exp_logits.masked_fill(eye, 0.0).sum(dim=1, keepdim=True)  # (B,1)
+
+        # 分子：正样本之和
+        pos_exp = exp_logits * pos_mask.float()
+        pos_sum = pos_exp.sum(dim=1)
+
+        valid = pos_mask.any(dim=1)
+        if valid.any():
+            loss = -torch.log((pos_sum[valid] + 1e-12) / (denom[valid, 0] + 1e-12)).mean()
+        else:
+            loss = torch.tensor(0.0, device=feats.device)
+        return loss
+
+    def _xmodal_nce(self, fa: torch.Tensor, fb: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        a->b 的 InfoNCE：同 ID 的 b 为正，所有 b 为候选。
+        """
+        B = fa.size(0)
+        fa = self._norm(fa)
+        fb = self._norm(fb)
+        sim = fa @ fb.t() / self.tau  # (B, B)
+
+        labels = labels.view(-1, 1)
+        pos_mask = labels.eq(labels.t())  # (B, B)
+
+        # 稳定化
+        sim = sim - torch.max(sim, dim=1, keepdim=True)[0]
+        exp_sim = torch.exp(sim)  # (B,B)
+
+        pos_exp = exp_sim * pos_mask.float()
+        pos_sum = pos_exp.sum(dim=1)  # (B,)
+        denom = exp_sim.sum(dim=1)    # (B,)
+
+        valid = pos_mask.any(dim=1)
+        if valid.any():
+            loss = -torch.log((pos_sum[valid] + 1e-12) / (denom[valid] + 1e-12)).mean()
+        else:
+            loss = torch.tensor(0.0, device=fa.device)
+        return loss
+
+    def _hard_negative_reg(self, feats: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        feats = self._norm(feats)
+        sim = feats @ feats.t()  # (B,B)
+        B = sim.size(0)
+
+        eye = torch.eye(B, device=feats.device, dtype=torch.bool)
+        pos = labels.view(-1,1).eq(labels.view(1,-1))
+        neg = (~pos) & (~eye)
+
+        sim_neg = sim.masked_fill(~neg, -1e4)
+        k = min(self.topk, max(1, B - 1))
+        hard_vals, _ = sim_neg.topk(k, dim=1)  # (B,k)
+        # 想要负样本相似度 < 1 - margin
+        target = 1.0 - self.margin
+        reg = F.relu(hard_vals - target).mean()
+        return reg
+
+    def forward(self, fused: torch.Tensor, labels: torch.Tensor, modal_dict: Optional[Dict[str, torch.Tensor]] = None):
+        loss = self.w_fused * self._supcon(fused, labels)
+
+        # 跨模态：以 anchor_modal（可见光）为锚，与其他模态做双向 InfoNCE
+        if modal_dict is not None and self.anchor_modal in modal_dict:
+            anchor = modal_dict[self.anchor_modal]
+            for m, feats in modal_dict.items():
+                if m == self.anchor_modal:
+                    continue
+                loss = loss + self.w_xmodal * (
+                    self._xmodal_nce(anchor, feats, labels) +
+                    self._xmodal_nce(feats, anchor, labels)
+                )
+
+        # 硬负样本正则（融合特征上）
+        loss = loss + 0.1 * self._hard_negative_reg(fused, labels)
+        return loss
+
+
+# -------------------------
+# 模型主体
+# -------------------------
+class MultiModalReIDModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # 统一的融合维度（后续所有特征都映射到这个维度）
+        self.fusion_dim = getattr(config, "fusion_dim", 768)
+
+        # ===== 视觉骨干：支持 ViT 或 ResNet =====
+        self.backbone_name = getattr(config, "backbone", "resnet50")
+        use_pretrained = getattr(config, "use_pretrained_vision", False)
+
+        if self.backbone_name.startswith("vit"):
+            # --- ViT 分支 ---
+            self.backbone_type = "vit"
+            self.vision_backbone = timm.create_model(
+                self.backbone_name,  # e.g., 'vit_base_patch16_224'
+                pretrained=use_pretrained,
+                num_classes=0,
+            )
+            self.vision_out_dim = self.vision_backbone.num_features  # 通常 768
+
+            # Token 级模态适配器（保留你的实现）
+            self.modality_adapters = nn.ModuleDict({
+                'vis': ModalityAdapter(self.vision_out_dim),
+                'nir': ModalityAdapter(self.vision_out_dim),
+                'sk':  ModalityAdapter(self.vision_out_dim),
+                'cp':  ModalityAdapter(self.vision_out_dim),
+            })
+
+        else:
+            # --- ResNet / CNN 分支 ---
+            self.backbone_type = "cnn"
+            # timm 的 resnet50：num_classes=0 + global_pool='avg' -> 直接输出 (B, C)
+            self.vision_backbone = timm.create_model(
+                self.backbone_name,  # e.g., 'resnet50'
+                pretrained=use_pretrained,
+                num_classes=0,
+                global_pool='avg'
+            )
+            self.vision_out_dim = self.vision_backbone.num_features  # resnet50 通常 2048
+
+            # 向量级模态适配器
+            self.modality_vec_adapters = nn.ModuleDict({
+                'vis': VectorModalityAdapter(self.vision_out_dim),
+                'nir': VectorModalityAdapter(self.vision_out_dim),
+                'sk':  VectorModalityAdapter(self.vision_out_dim),
+                'cp':  VectorModalityAdapter(self.vision_out_dim),
+            })
+
+        # 统一视觉输出到 fusion_dim
+        self.visual_projection = (
+            nn.Identity() if self.vision_out_dim == self.fusion_dim
+            else nn.Sequential(
+                nn.Linear(self.vision_out_dim, self.fusion_dim),
+                nn.LayerNorm(self.fusion_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+            )
+        )
+
+        # ===== 文本编码器（与配置对齐）=====
+        txt_name = getattr(config, "text_model_name", "sentence-transformers/all-MiniLM-L6-v2")
+        self.text_tokenizer = AutoTokenizer.from_pretrained(txt_name)
+        self.text_encoder  = AutoModel.from_pretrained(txt_name)
+        self.freeze_text = getattr(config, "freeze_text", True)
+        if self.freeze_text:
+            for p in self.text_encoder.parameters():
+                p.requires_grad = False
+
+        # 文本 384 -> fusion_dim
+        self.text_in_dim = 384
+        self.text_projection = nn.Sequential(
+            nn.Linear(self.text_in_dim, self.fusion_dim),
+            nn.LayerNorm(self.fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
+
+        # ===== 融合模块 / BNNeck / 分类头 / 检索头 =====
+        self.fusion_module = HierarchicalMultiModalFusion(self.fusion_dim, num_layers=3, num_heads=8)
+
+        self.bnneck = nn.BatchNorm1d(self.fusion_dim)
+        self.classifier = nn.Linear(self.fusion_dim, self.config.num_classes, bias=False)
+
+        self.feature_projection = nn.Sequential(
+            nn.Linear(self.fusion_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.1),
+        )
+
+        self.contrastive_loss = AdvancedContrastiveLoss(
+            temperature=getattr(config, "contrastive_tau", 0.07),
+            margin=getattr(config, "contrastive_margin", 0.2),
+            topk=getattr(config, "hard_topk", 5),
+            w_fused=1.0, w_xmodal=0.5, anchor_modal='vis'
+        )
+
+        self.ce_loss = nn.CrossEntropyLoss()
+
+
+    # ---- 工具 ----
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def _vit_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        返回 ViT 的完整 token 序列（含 CLS），形状 (B, 1+N, C)
+        """
+        assert self.backbone_type == "vit", "Only ViT backbone uses _vit_tokens()"
+        m = self.vision_backbone
+        x = m.patch_embed(x)  # (B, N, C)
+        cls = m.cls_token.expand(x.size(0), -1, -1)  # (B, 1, C)
+        x = torch.cat((cls, x), dim=1)  # (B, 1+N, C)
+
+        # 位置编码可能比序列长（timm 兼容插值），这里对齐前缀长度
+        pos_embed = m.pos_embed[:, :x.size(1), :]
+        x = x + pos_embed
+        x = m.pos_drop(x)
+
+        # Transformer blocks
+        for blk in m.blocks:
+            x = blk(x)
+        x = m.norm(x)
+        return x  # (B, 1+N, C)
+
+    def encode_image(self, image: torch.Tensor, modality_type: str) -> torch.Tensor:
+        """
+        返回 (B, fusion_dim)
+        - ViT：tokens -> (token级)模态适配器 -> 对 patch 做 mean pool -> 视觉投影
+        - ResNet：全局池化特征 -> (向量级)模态适配器 -> 视觉投影
+        """
+        if self.backbone_type == "vit":
+            tokens = self._vit_tokens(image)  # (B, 1+N, C)
+            if modality_type in self.modality_adapters:
+                tokens = self.modality_adapters[modality_type](tokens)
+
+            if tokens.size(1) > 1:
+                patch = tokens[:, 1:, :]
+                feats = patch.mean(dim=1)     # (B, vision_out_dim)
+            else:
+                feats = tokens.squeeze(1)
+
+        else:
+            # CNN 分支：timm 返回 (B, C) 已经是全局池化
+            feats = self.vision_backbone(image)  # (B, vision_out_dim)
+            if modality_type in self.modality_vec_adapters:
+                feats = self.modality_vec_adapters[modality_type](feats)
+
+        # 统一到 fusion_dim
+        feats = self.visual_projection(feats)    # (B, fusion_dim)
+        return feats
+
+
+
+    def encode_text(self, text_descriptions: List[str]) -> torch.Tensor:
+        batch_size = len(text_descriptions)
+        if batch_size == 0:
+            return torch.zeros(0, self.fusion_dim, device=self.device)
+
+        valid_texts = [t if isinstance(t, str) and len(t) > 0 else "[UNK]" for t in text_descriptions]
+        enc = self.text_tokenizer(valid_texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
+        enc = {k: v.to(self.device) for k, v in enc.items()}
+
+        ctx = torch.no_grad() if self.freeze_text else contextlib.nullcontext()
+        with ctx:
+            out = self.text_encoder(**enc, return_dict=True)
+            token = out.last_hidden_state  # (B, L, 384)
+
+        mask = enc['attention_mask'].unsqueeze(-1).float()
+        text_vec = (token * mask).sum(1) / mask.sum(1).clamp_min(1e-6)  # (B, 384)
+        text_vec = self.text_projection(text_vec)  # (B, fusion_dim)
+        return text_vec
+
+
+    # ---- 前向 ----
+    def forward(self, batch: Dict, return_features: bool = False):
+        """
+        batch 结构约定：
+        {
+            'images': {
+                'vis': Tensor[B,3,224,224],  # 可能子集
+                'nir': Tensor[B,3,224,224],
+                'sk' : ...
+                'cp' : ...
+            },
+            'text_description': List[str] (len=B),
+            'modality_mask': Optional[Dict[str, bool]]
+        }
+        """
+        images: Dict[str, torch.Tensor] = batch['images']
+        text_descriptions: List[str] = batch.get('text_description', [])
+
+        # >>> 提前构造 mask_for_fusion，后面用它来决定是否引入文本等模态
+        raw_mm = batch.get('modality_mask', None)
+        mask_for_fusion = None
+        if isinstance(raw_mm, dict):
+            mask_for_fusion = {}
+            for m in ['vis','nir','sk','cp','text']:
+                v = raw_mm.get(m, 0.0)
+                if isinstance(v, torch.Tensor):
+                    mask_for_fusion[m] = bool((v > 0.5).any().item())
+                elif isinstance(v, (int, float, bool)):
+                    mask_for_fusion[m] = bool(v)
+                else:
+                    mask_for_fusion[m] = False
+        else:
+            mask_for_fusion = None
+        # <<< 提前构造结束
+
+        # 各模态特征
+        modality_features: Dict[str, torch.Tensor] = {}
+        for m in ['vis', 'nir', 'sk', 'cp']:
+            if m in images and images[m] is not None:
+                modality_features[m] = self.encode_image(images[m].to(self.device), m)
+
+        # 文本特征：仅当有“非空白文本”且 mask 允许时才加入
+        add_text = any((isinstance(t, str) and t.strip()) for t in text_descriptions)
+        if add_text and (mask_for_fusion is None or mask_for_fusion.get('text', False)):
+            modality_features['text'] = self.encode_text(text_descriptions)
+    
+        # 融合
+        fused_features = self.fusion_module(modality_features, mask_for_fusion)  # (B, C)
+
+        # 检索向量（训练与评测统一用它）
+        reid = self.feature_projection(fused_features)          # (B, 512)
+        reid_norm = F.normalize(reid, p=2, dim=1)
+
+        if return_features:
+            return reid_norm
+
+        # 分类（BNNeck）
+        neck = self.bnneck(fused_features)
+        logits = self.classifier(neck)
+
+        return {
+            'logits': logits,                       # (B, num_classes)
+            'features': fused_features,             # (B, C) 可选留作监控
+            'reid_features': reid_norm,             # (B, 512) —— 训练用这个做对比损失
+            'modality_features': modality_features  # Dict[str, (B, C)]
+        }
+
+    def compute_loss(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor):
+        """
+        返回总损失 + 分项
+        """
+        ce = self.ce_loss(outputs['logits'], labels)
+
+        con = self.contrastive_loss(
+            outputs['reid_features'],
+            labels,
+            outputs['modality_features']
+        )
+
+
+        total = ce + 0.5 * con
+        return {
+            'total_loss': total,
+            'ce_loss': ce,
+            'contrastive_loss': con
+        }
+# train.py 
+import os
+import time
+import math
+import random
+import pickle
+import logging
+from collections import defaultdict
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset, Dataset
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR
+
+from sklearn.model_selection import train_test_split
+
+# === 你项目里的数据与模型 ===
+from datasets.dataset import FixedMultiModalDataset, FixedBalancedBatchSampler, compatible_collate_fn
+from models.model import MultiModalReIDModel  
+from configs.config import TrainingConfig
+
+
+# ------------------------------
+# 实用工具
+# ------------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # ViT + 数据增广场景下一般不强制 deterministic，benchmark=True 更快
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+def setup_logging(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, "training.log")),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+def move_batch_to_device(batch, device):
+    """将批次数据移动到指定设备（仅移动 Tensor）"""
+    if isinstance(batch, dict):
+        out = {}
+        for k, v in batch.items():
+            out[k] = move_batch_to_device(v, device)
+        return out
+    elif isinstance(batch, list):
+        return [move_batch_to_device(x, device) for x in batch]
+    elif isinstance(batch, tuple):
+        return tuple(move_batch_to_device(x, device) for x in batch)
+    elif torch.is_tensor(batch):
+        return batch.to(device)
+    else:
+        return batch
+
+
+# ------------------------------
+# 评估指标（修正版）
+# ------------------------------
+def compute_map(query_features, gallery_features, query_labels, gallery_labels, k=100):
+    """mAP@k（稳定写法）"""
+    query_features = F.normalize(query_features, p=2, dim=1)
+    gallery_features = F.normalize(gallery_features, p=2, dim=1)
+    sim = torch.mm(query_features, gallery_features.t())  # (Q, G)
+
+    aps = []
+    for i in range(sim.size(0)):
+        scores = sim[i]
+        qy = query_labels[i]
+        _, idx = torch.sort(scores, descending=True)
+        ranked = gallery_labels[idx[:k]]  # (k,)
+
+        matches = (ranked == qy).float()
+        if matches.sum() > 0:
+            cum_matches = torch.cumsum(matches, dim=0)
+            ranks = torch.arange(1, matches.numel() + 1, device=matches.device, dtype=matches.dtype)
+            precision = cum_matches / ranks
+            ap = precision[matches.bool()].mean().item()
+            aps.append(ap)
+
+    return float(np.mean(aps)) if aps else 0.0
+
+
+def compute_cmc(query_features, gallery_features, query_labels, gallery_labels, k=10):
+    """CMC@k（稳定写法）"""
+    query_features = F.normalize(query_features, p=2, dim=1)
+    gallery_features = F.normalize(gallery_features, p=2, dim=1)
+    sim = torch.mm(query_features, gallery_features.t())
+    correct = 0
+    for i in range(sim.size(0)):
+        _, idx = torch.sort(sim[i], descending=True)
+        topk_labels = gallery_labels[idx[:k]]
+        correct += (topk_labels == query_labels[i]).any().item()
+    return correct / sim.size(0) if sim.size(0) > 0 else 0.0
+
+
+# ------------------------------
+# 训练/验证数据划分
+# ------------------------------
+def split_train_dataset(dataset, val_ratio=0.2, seed=42):
+    """
+    基于“每个 index 就是一个身份”的数据设定：
+    - person_ids 直接来自 dataset.data_list[i]['person_id']
+    - 确保同一身份不会跨集合
+    """
+    person_ids = [dataset.data_list[i]['person_id'] for i in range(len(dataset))]
+    person_ids = sorted(list(set(person_ids)))
+    train_ids, val_ids = train_test_split(person_ids, test_size=val_ratio, random_state=seed)
+
+    train_indices, val_indices = [], []
+    for i, sample in enumerate(dataset.data_list):
+        if sample['person_id'] in train_ids:
+            train_indices.append(i)
+        else:
+            val_indices.append(i)
+
+    logging.info(f"训练集: {len(train_ids)} 个身份, {len(train_indices)} 个索引")
+    logging.info(f"验证集: {len(val_ids)} 个身份, {len(val_indices)} 个索引")
+    return train_indices, val_indices, train_ids, val_ids
+
+
+# ------------------------------
+# 赛制对齐：验证集构建（RGB=gallery，其它模态=queries）
+# 假设：dataset[i] 返回：
+#   {
+#     'person_id': Tensor[1] or int,
+#     'images': {'vis': Tensor[C,H,W], 'nir': ..., 'sk': ..., 'cp': ...}  # 仅存在的模态会出现
+#     'text_description': str 或 list[str]
+#   }
+# ------------------------------
+MODALITIES = ['vis', 'nir', 'sk', 'cp', 'text']
+
+
+def _peek_modalities_of_index(dataset, idx) -> Dict[str, bool]:
+    """
+    只访问一次 __getitem__ 来判断该身份有哪些模态可用
+    返回：{'vis': True/False, 'nir': ..., 'sk': ..., 'cp': ..., 'text': True/False}
+    """
+    rec = dataset[idx]
+    has = {m: False for m in MODALITIES}
+    # 图像模态
+    imgs = rec.get('images', {})
+    for m in ['vis', 'nir', 'sk', 'cp']:
+        if isinstance(imgs, dict) and m in imgs and torch.is_tensor(imgs[m]):
+            has[m] = True
+    # 文本
+    td = rec.get('text_description', "")
+    if isinstance(td, list):
+        has['text'] = len(td) > 0 and isinstance(td[0], str) and len(td[0]) > 0
+    elif isinstance(td, str):
+        has['text'] = len(td) > 0
+    else:
+        has['text'] = False
+    return has
+
+
+def build_val_presence_table(dataset, val_indices):
+    presence = {}
+    for idx in val_indices:
+        entry = dataset.data_list[idx]
+        pid_str = entry['person_id_str']
+        has = {m: False for m in ['vis','nir','sk','cp','text']}
+
+        # 图像模态：看缓存里有没有文件路径
+        cache = dataset.image_cache.get(pid_str, {})
+        for m in ['vis','nir','sk','cp']:
+            has[m] = len(cache.get(m, [])) > 0
+
+        # 文本：看 data_list 里的合并描述是否非空
+        td = entry.get('text_description', '')
+        has['text'] = isinstance(td, str) and len(td) > 0
+
+        presence[idx] = has
+    return presence
+
+
+
+class GalleryOnlyVIS(Dataset):
+    """画廊只保留可见光（vis）的 wrapper"""
+    def __init__(self, base_dataset: Dataset, indices: List[int], presence: Dict[int, Dict[str, bool]]):
+        self.base = base_dataset
+        # 只保留有 vis 的身份
+        self.indices = [i for i in indices if presence.get(i, {}).get('vis', False)]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        base_idx = self.indices[i]
+        rec = self.base[base_idx]  # dict
+        # 仅保留 vis
+        images = {}
+        if 'images' in rec and 'vis' in rec['images']:
+            images['vis'] = rec['images']['vis']
+        pid = rec['person_id']
+        if torch.is_tensor(pid):
+            pid = int(pid.item())
+
+        # 文本在画廊阶段不需要
+        return {
+            'person_id': torch.tensor(pid, dtype=torch.long),
+            'images': images,                  # 仅 vis
+            'text_description': [""],          # 空文本（不会被编码，因为 mask 会禁用）
+            'modality_mask': {
+                'vis': True, 'nir': False, 'sk': False, 'cp': False, 'text': False
+            }
+        }
+
+
+class CombinationQueryDataset(Dataset):
+    """
+    查询集合：对每个身份 index，选择指定的模态组合（不含 vis），把其它模态过滤掉
+    q_items: List[{'idx': int, 'pid': int, 'modalities': List[str]}]
+    """
+    def __init__(self, base_dataset: Dataset, q_items: List[Dict]):
+        self.base = base_dataset
+        self.items = q_items
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        info = self.items[i]
+        base_idx = info['idx']
+        mods = info['modalities']
+        rec = self.base[base_idx]
+
+        # 过滤 images
+        images = {}
+        if 'images' in rec and isinstance(rec['images'], dict):
+            for m in mods:
+                if m in ['nir', 'sk', 'cp'] and m in rec['images'] and torch.is_tensor(rec['images'][m]):
+                    images[m] = rec['images'][m]
+
+        # 文本
+        text_desc = ""
+        if 'text' in mods:
+            td = rec.get('text_description', "")
+            if isinstance(td, list):
+                text_desc = td[0] if len(td) > 0 else ""
+            elif isinstance(td, str):
+                text_desc = td
+
+        # 关键：label 直接用底层样本的映射后 ID
+        pid_t = rec['person_id']
+        pid = int(pid_t.item()) if torch.is_tensor(pid_t) else int(pid_t)
+
+        return {
+            'person_id': torch.tensor(pid, dtype=torch.long),
+            'images': images,
+            'text_description': [text_desc],
+            'modality_mask': {m: True for m in mods}
+        }
+
+
+def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pin_memory):
+    """
+    根据赛制构建：
+      - gallery_loader：只含 vis 的画廊
+      - query_loaders ：{'single':{comb: loader}, 'double':{...}, 'triple':{...}, 'quad':{...}}
+    """
+    presence = build_val_presence_table(dataset, val_indices)
+
+    # 画廊
+    gal_ds = GalleryOnlyVIS(dataset, val_indices, presence)
+    gallery_loader = DataLoader(
+        gal_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=compatible_collate_fn
+    )
+
+    # 查询组合（非 vis）
+    non_vis = ['nir', 'sk', 'cp', 'text']
+
+    def _make_items(group: List[str]) -> List[Dict]:
+        items = []
+        for idx in val_indices:
+            has = presence[idx]
+            if all(has.get(m, False) for m in group):
+                items.append({'idx': idx,  'modalities': group})
+        return items
+
+    query_loaders = {'single': {}, 'double': {}, 'triple': {}, 'quad': {}}
+
+    # 单模态
+    for m in non_vis:
+        items = _make_items([m])
+        if items:
+            loader = DataLoader(
+                CombinationQueryDataset(dataset, items),
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=compatible_collate_fn
+            )
+            query_loaders['single'][m] = loader
+
+    # 双/三/四模态
+    import itertools
+    for gsize, tag in [(2, 'double'), (3, 'triple'), (4, 'quad')]:
+        for comb in itertools.combinations(non_vis, gsize):
+            group = list(comb)
+            key = '+'.join(group)
+            items = _make_items(group)
+            if items:
+                loader = DataLoader(
+                    CombinationQueryDataset(dataset, items),
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    collate_fn=compatible_collate_fn
+                )
+                query_loaders[tag][key] = loader
+
+    return gallery_loader, query_loaders
+
+
+def validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100):
+    """
+    赛制对齐评测：
+      - 用同一 RGB 画廊
+      - 对各类（single/double/triple/quad）组合分别算 mAP，然后四类平均
+      - 额外汇报合并查询后的 CMC@1/5/10（非赛制指标，仅供参考）
+    """
+    model.eval()
+
+    # 画廊特征
+    with torch.no_grad():
+        gal_feats, gal_labels = [], []
+        for batch in tqdm(gallery_loader, desc='提取画廊特征'):
+            batch = move_batch_to_device(batch, device)
+            feats = model(batch, return_features=True)
+            labels = batch['person_id']
+            gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
+        gal_feats = torch.cat(gal_feats, dim=0)
+        gal_labels = torch.cat(gal_labels, dim=0)
+
+    detail = {'single': {}, 'double': {}, 'triple': {}, 'quad': {}}
+    buckets = {'single': [], 'double': [], 'triple': [], 'quad': []}
+    all_q_feats, all_q_labels = [], []
+
+    with torch.no_grad():
+        for tag, group in query_loaders.items():
+            for key, qloader in group.items():
+                qf, ql = [], []
+                for batch in tqdm(qloader, desc=f'提取查询特征[{tag}:{key}]'):
+                    batch = move_batch_to_device(batch, device)
+                    feats = model(batch, return_features=True)
+                    labels = batch['person_id']
+                    qf.append(feats.cpu()); ql.append(labels.cpu())
+                if not qf:
+                    continue
+                qf = torch.cat(qf, dim=0); ql = torch.cat(ql, dim=0)
+                km = min(k_map, gal_feats.size(0))
+                m = compute_map(qf, gal_feats, ql, gal_labels, k=km)
+
+                detail[tag][key] = float(m)
+                buckets[tag].append(m)
+                all_q_feats.append(qf); all_q_labels.append(ql)
+
+    def _avg(x): return float(np.mean(x)) if x else 0.0
+
+    map_single = _avg(buckets['single'])
+    map_double = _avg(buckets['double'])
+    map_triple = _avg(buckets['triple'])
+    map_quad   = _avg(buckets['quad'])
+    map_avg4   = float(np.mean([map_single, map_double, map_triple, map_quad]))
+
+    if all_q_feats:
+        all_q_feats = torch.cat(all_q_feats, dim=0)
+        all_q_labels = torch.cat(all_q_labels, dim=0)
+        cmc1 = compute_cmc(all_q_feats, gal_feats, all_q_labels, gal_labels, k=1)
+        cmc5 = compute_cmc(all_q_feats, gal_feats, all_q_labels, gal_labels, k=5)
+        cmc10 = compute_cmc(all_q_feats, gal_feats, all_q_labels, gal_labels, k=10)
+    else:
+        cmc1 = cmc5 = cmc10 = 0.0
+
+    return {
+        'map_single': map_single,
+        'map_double': map_double,
+        'map_triple': map_triple,
+        'map_quad': map_quad,
+        'map_avg4': map_avg4,
+        'detail': detail,
+        'cmc1': cmc1, 'cmc5': cmc5, 'cmc10': cmc10
+    }
+
+
+# ------------------------------
+# 训练一个 epoch（使用模型自带损失）
+# ------------------------------
+def train_epoch(model, dataloader, optimizer, device, epoch):
+    model.train()
+    total_loss = 0.0
+    ce_loss_sum = 0.0
+    contrastive_loss_sum = 0.0
+    correct = 0
+    total = 0
+    
+    # 新增：特征范数统计
+    feature_norms = []
+
+    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+    for batch_idx, batch in enumerate(pbar):
+        batch = move_batch_to_device(batch, device)
+        labels = batch['person_id']
+
+        optimizer.zero_grad()
+        outputs = model(batch)
+        loss_dict = model.compute_loss(outputs, labels)
+
+        loss = loss_dict['total_loss']
+        ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
+        cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        ce_loss_sum += ce_loss.item()
+        contrastive_loss_sum += cont_loss.item()
+
+        # 分类准确率（仅作训练监控）
+        if isinstance(outputs, dict) and 'logits' in outputs:
+            _, predicted = outputs['logits'].max(1)
+        else:
+            _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        
+        # 新增：特征范数监控
+        if isinstance(outputs, dict) and 'reid_features' in outputs:
+            norms = torch.norm(outputs['reid_features'], p=2, dim=1)
+            feature_norms.extend(norms.detach().cpu().numpy())
+
+
+        # 计算平均特征范数
+        avg_norm = np.mean(feature_norms) if feature_norms else 0.0
+
+        pbar.set_postfix({
+            'Loss': f'{loss.item():.3f}',
+            'CE': f'{float(ce_loss.item()):.3f}',
+            'Cont': f'{float(cont_loss.item()):.3f}',
+            'FeatNorm': f'{avg_norm:.3f}'
+        })
+
+    avg_loss = total_loss / max(1, len(dataloader))
+    accuracy = 100. * correct / max(1, total)
+    avg_feat_norm = np.mean(feature_norms) if feature_norms else 0.0
+    
+    return {
+        'total_loss': avg_loss,
+        'ce_loss': ce_loss_sum / max(1, len(dataloader)),
+        'contrastive_loss': contrastive_loss_sum / max(1, len(dataloader)),
+        'accuracy': accuracy,
+        'feature_norm': avg_feat_norm
+    }
+
+
+# ------------------------------
+# 训练主流程
+# ------------------------------
+def train_multimodal_reid():
+    # 配置与设备
+    config = TrainingConfig()
+    set_seed(getattr(config, "seed", 42))
+
+    device_str = getattr(config, "device", "cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
+    setup_logging(getattr(config, "log_dir", "./logs"))
+
+    # 先加载全量，只用于身份统计与划分
+    full_dataset = FixedMultiModalDataset(config, split='train')
+
+    train_indices, val_indices, train_ids, val_ids = split_train_dataset(
+        full_dataset,
+        val_ratio=getattr(config, "val_ratio", 0.2),
+        seed=getattr(config, "seed", 42)
+    )
+
+    # ☆ 关键：按身份重建两个独立数据集（内部会用传入的 person_ids 重建 pid2label）
+    train_dataset = FixedMultiModalDataset(config, split='train', person_ids=train_ids)
+    val_dataset   = FixedMultiModalDataset(config, split='val', person_ids=val_ids)
+
+    # 更新类别数为训练身份数
+    config.num_classes = len(train_ids)
+
+
+
+    # 训练 DataLoader（Balanced PK 采样，直接用 train_dataset）
+    num_instances = 4
+    effective_batch_size = max(getattr(config, "batch_size", 32), 16)
+    effective_batch_size = max(num_instances, (effective_batch_size // num_instances) * num_instances)
+
+    train_sampler = FixedBalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        num_workers=getattr(config, "num_workers", 4),
+        pin_memory=getattr(config, "pin_memory", True),
+        collate_fn=compatible_collate_fn
+    )
+
+    # 验证（赛制对齐）DataLoader
+    gallery_loader, query_loaders = build_eval_loaders_by_rule(
+        val_dataset, list(range(len(val_dataset))),
+        batch_size=effective_batch_size,
+        num_workers=getattr(config, "num_workers", 4),
+        pin_memory=getattr(config, "pin_memory", True)
+    )
+
+
+    # 模型
+    model = MultiModalReIDModel(config).to(device)
+
+    # 优化器
+    optimizer = AdamW(model.parameters(),
+                      lr=getattr(config, "learning_rate", 3e-4),
+                      weight_decay=getattr(config, "weight_decay", 1e-4))
+
+    # 学习率调度器
+    scheduler_type = getattr(config, "scheduler", "cosine")
+    if scheduler_type == 'cosine':
+        scheduler = CosineAnnealingLR(optimizer, T_max=getattr(config, "num_epochs", 100), eta_min=1e-6)
+    elif scheduler_type == 'step':
+        scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    elif scheduler_type == 'multistep':
+        scheduler = MultiStepLR(optimizer, milestones=[40, 70, 90], gamma=0.1)
+    else:
+        scheduler = None
+
+    # 训练循环
+    best_map = 0.0
+    train_history, val_history = [], []
+    num_epochs = getattr(config, "num_epochs", 100)
+    eval_freq = getattr(config, "eval_freq", 1)
+    save_dir = getattr(config, "save_dir", "./checkpoints")
+    os.makedirs(save_dir, exist_ok=True)
+
+    for epoch in range(1, num_epochs + 1):
+        start_time = time.time()
+
+        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch)
+
+        if epoch % eval_freq == 0:
+            comp_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100)
+
+            train_history.append({'epoch': epoch, **train_metrics})
+            val_history.append({'epoch': epoch, **comp_metrics})
+
+            score = comp_metrics['map_avg4']
+            if score > best_map:
+                best_map = score
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, best_map, config,
+                    os.path.join(save_dir, 'best_model.pth')
+                )
+                logging.info(f"新的最佳(四类平均) mAP: {best_map:.4f}")
+
+            logging.info(
+                f"Epoch {epoch}/{num_epochs} - "
+                f"Train ClsAcc: {train_metrics['accuracy']:.2f}% - "
+                f"mAP(single/double/triple/quad/avg4): "
+                f"{comp_metrics['map_single']:.4f}/"
+                f"{comp_metrics['map_double']:.4f}/"
+                f"{comp_metrics['map_triple']:.4f}/"
+                f"{comp_metrics['map_quad']:.4f}/"
+                f"{comp_metrics['map_avg4']:.4f} - "
+                f"CMC@1/5/10: {comp_metrics['cmc1']:.4f}/"
+                f"{comp_metrics['cmc5']:.4f}/"
+                f"{comp_metrics['cmc10']:.4f} - "
+                f"用时: {time.time() - start_time:.2f}s"
+            )
+
+        # 定期保存 checkpoint
+        if epoch % getattr(config, "save_freq", 10) == 0:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, best_map, config,
+                os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
+            )
+
+        if scheduler:
+            scheduler.step()
+
+    # 保存训练历史
+    log_dir = getattr(config, "log_dir", "./logs")
+    os.makedirs(log_dir, exist_ok=True)
+    pd.DataFrame(train_history).to_csv(os.path.join(log_dir, 'train_history.csv'), index=False)
+    pd.DataFrame(val_history).to_csv(os.path.join(log_dir, 'val_history.csv'), index=False)
+
+    # 保存划分
+    split_info = {
+        'train_ids': train_ids,
+        'val_ids': val_ids,
+        'train_indices': train_indices,
+        'val_indices': val_indices
+    }
+    with open(os.path.join(save_dir, 'dataset_split.pkl'), 'wb') as f:
+        pickle.dump(split_info, f)
+
+    logging.info(f"训练完成. 最佳(四类平均) mAP: {best_map:.4f}")
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, best_map, config, filename):
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'best_map': best_map,
+        'config': config.__dict__ if hasattr(config, '__dict__') else str(config)
+    }
+    torch.save(checkpoint, filename)
+
+
+if __name__ == "__main__":
+    train_multimodal_reid()
+分析为什么训练的map很低
+提取查询特征[triple:sk+cp+text]: 100%|████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[quad:nir+sk+cp+text]: 100%|██████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+2025-08-15 00:00:35,340 - INFO - Epoch 80/100 - Train ClsAcc: 100.00% - mAP(single/double/triple/quad/avg4): 0.1365/0.1397/0.1464/0.1250/0.1369 - CMC@1/5/10: 0.0458/0.1925/0.3483 - 用时: 274.87s
+Epoch 81: 100%|█| 80/80 [00:41<00:00,  1.92it/s, Loss=0.862, CE=0.010, Cont=1.704, FeatNorm=1.00
+Epoch 82: 100%|█| 80/80 [00:40<00:00,  1.95it/s, Loss=1.452, CE=0.021, Cont=2.862, FeatNorm=1.00 
+Epoch 83: 100%|█| 80/80 [00:41<00:00,  1.93it/s, Loss=1.060, CE=0.015, Cont=2.091, FeatNorm=1.00 
+Epoch 84: 100%|█| 80/80 [00:41<00:00,  1.94it/s, Loss=1.015, CE=0.019, Cont=1.993, FeatNorm=1.00 
+Epoch 85: 100%|█| 80/80 [00:40<00:00,  1.95it/s, Loss=1.197, CE=0.010, Cont=2.373, FeatNorm=1.00 
+Epoch 86: 100%|█| 80/80 [00:41<00:00,  1.95it/s, Loss=1.406, CE=0.010, Cont=2.792, FeatNorm=1.00 
+Epoch 87: 100%|█| 80/80 [00:41<00:00,  1.95it/s, Loss=1.122, CE=0.015, Cont=2.213, FeatNorm=1.00 
+Epoch 88: 100%|█| 80/80 [00:40<00:00,  1.95it/s, Loss=1.020, CE=0.020, Cont=1.999, FeatNorm=1.00 
+Epoch 89: 100%|█| 80/80 [00:41<00:00,  1.95it/s, Loss=0.893, CE=0.020, Cont=1.745, FeatNorm=1.00 
+Epoch 90: 100%|█| 80/80 [00:40<00:00,  1.95it/s, Loss=1.327, CE=0.013, Cont=2.628, FeatNorm=1.00 
+提取画廊特征: 100%|███████████████████████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[single:nir]: 100%|███████████████████████████████████| 5/5 [00:14<00:00,  2.87s/it] 
+提取查询特征[single:sk]: 100%|████████████████████████████████████| 5/5 [00:14<00:00,  2.89s/it] 
+提取查询特征[single:cp]: 100%|████████████████████████████████████| 5/5 [00:14<00:00,  2.96s/it] 
+提取查询特征[single:text]: 100%|██████████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[double:nir+sk]: 100%|████████████████████████████████| 5/5 [00:14<00:00,  2.91s/it] 
+提取查询特征[double:nir+cp]: 100%|████████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[double:nir+text]: 100%|██████████████████████████████| 5/5 [00:14<00:00,  2.91s/it] 
+提取查询特征[double:sk+cp]: 100%|█████████████████████████████████| 5/5 [00:14<00:00,  2.88s/it] 
+提取查询特征[double:sk+text]: 100%|███████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[double:cp+text]: 100%|███████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[triple:nir+sk+cp]: 100%|█████████████████████████████| 5/5 [00:14<00:00,  2.90s/it] 
+提取查询特征[triple:nir+sk+text]: 100%|███████████████████████████| 5/5 [00:14<00:00,  2.90s/it] 
+提取查询特征[triple:nir+cp+text]: 100%|███████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[triple:sk+cp+text]: 100%|████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[quad:nir+sk+cp+text]: 100%|██████████████████████████| 5/5 [00:14<00:00,  2.95s/it] 
+2025-08-15 00:11:20,738 - INFO - Epoch 90/100 - Train ClsAcc: 100.00% - mAP(single/double/triple/quad/avg4): 0.1100/0.1217/0.1203/0.0968/0.1122 - CMC@1/5/10: 0.0283/0.1492/0.2825 - 用时: 274.25s
+Epoch 91: 100%|█| 80/80 [00:40<00:00,  1.95it/s, Loss=1.139, CE=0.023, Cont=2.232, FeatNorm=1.00
+Epoch 92: 100%|█| 80/80 [00:40<00:00,  1.96it/s, Loss=1.644, CE=0.017, Cont=3.256, FeatNorm=1.00 
+Epoch 93: 100%|█| 80/80 [00:40<00:00,  1.96it/s, Loss=0.951, CE=0.011, Cont=1.879, FeatNorm=1.00 
+Epoch 94: 100%|█| 80/80 [00:40<00:00,  1.95it/s, Loss=2.502, CE=0.020, Cont=4.964, FeatNorm=1.00 
+Epoch 95: 100%|█| 80/80 [00:40<00:00,  1.96it/s, Loss=1.823, CE=0.014, Cont=3.618, FeatNorm=1.00 
+Epoch 96: 100%|█| 80/80 [00:40<00:00,  1.96it/s, Loss=1.454, CE=0.027, Cont=2.853, FeatNorm=1.00 
+Epoch 97: 100%|█| 80/80 [00:41<00:00,  1.95it/s, Loss=0.603, CE=0.012, Cont=1.183, FeatNorm=1.00 
+Epoch 98: 100%|█| 80/80 [00:40<00:00,  1.96it/s, Loss=1.455, CE=0.012, Cont=2.885, FeatNorm=1.00 
+Epoch 99: 100%|█| 80/80 [00:40<00:00,  1.96it/s, Loss=1.056, CE=0.017, Cont=2.078, FeatNorm=1.00 
+Epoch 100: 100%|█| 80/80 [00:40<00:00,  1.95it/s, Loss=1.931, CE=0.008, Cont=3.845, FeatNorm=1.0 
+提取画廊特征: 100%|███████████████████████████████████████████████| 5/5 [00:14<00:00,  2.91s/it] 
+提取查询特征[single:nir]: 100%|███████████████████████████████████| 5/5 [00:14<00:00,  2.88s/it] 
+提取查询特征[single:sk]: 100%|████████████████████████████████████| 5/5 [00:14<00:00,  2.93s/it] 
+提取查询特征[single:cp]: 100%|████████████████████████████████████| 5/5 [00:14<00:00,  2.90s/it] 
+提取查询特征[single:text]: 100%|██████████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[double:nir+sk]: 100%|████████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[double:nir+cp]: 100%|████████████████████████████████| 5/5 [00:14<00:00,  2.92s/it]
+提取查询特征[double:nir+text]: 100%|██████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[double:sk+cp]: 100%|█████████████████████████████████| 5/5 [00:14<00:00,  2.90s/it] 
+提取查询特征[double:sk+text]: 100%|███████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[double:cp+text]: 100%|███████████████████████████████| 5/5 [00:14<00:00,  2.94s/it] 
+提取查询特征[triple:nir+sk+cp]: 100%|█████████████████████████████| 5/5 [00:14<00:00,  2.90s/it] 
+提取查询特征[triple:nir+sk+text]: 100%|███████████████████████████| 5/5 [00:14<00:00,  2.93s/it] 
+提取查询特征[triple:nir+cp+text]: 100%|███████████████████████████| 5/5 [00:14<00:00,  2.90s/it] 
+提取查询特征[triple:sk+cp+text]: 100%|████████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+提取查询特征[quad:nir+sk+cp+text]: 100%|██████████████████████████| 5/5 [00:14<00:00,  2.92s/it] 
+2025-08-15 00:22:03,297 - INFO - Epoch 100/100 - Train ClsAcc: 100.00% - mAP(single/double/triple/quad/avg4): 0.1217/0.1402/0.1347/0.1272/0.1309 - CMC@1/5/10: 0.0417/0.1833/0.3617 - 用时: 274.41s
+2025-08-15 00:22:04,012 - INFO - 训练完成. 最佳(四类平均) mAP: 0.1474

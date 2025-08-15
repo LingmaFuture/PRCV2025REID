@@ -1,0 +1,12 @@
+torch>=1.9.0
+torchvision>=0.10.0
+transformers>=4.20.0
+timm>=0.6.0
+sentence-transformers>=2.0.0
+Pillow>=8.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+tqdm>=4.60.0
+opencv-python>=4.5.0
+PyYAML>=6.0 
