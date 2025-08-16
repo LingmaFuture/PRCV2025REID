@@ -28,8 +28,8 @@ class TrainingConfig:
     freeze_text: bool = True  # 保持向后兼容
     text_finetune_strategy: str = "top_layers"  # frozen, top_layers, lora, full
     
-    # CLIP联合预训练模型配置
-    use_clip: bool = True  # 安装CLIP后可设为True以启用联合预训练
+    # CLIP联合预训练模型配置（暂时禁用排查nan问题）
+    use_clip: bool = False  # 暂时禁用CLIP排查nan问题
     clip_model_name: str = "ViT-B/32"  # 可选: ViT-B/32, ViT-B/16, ViT-L/14, RN50, RN101
     
     image_size: int = 224  # 匹配ViT模型要求的输入尺寸
@@ -46,16 +46,16 @@ class TrainingConfig:
     warmup_epochs: int = 5      # 预训练模型收敛更快，减少warmup
     scheduler: str = "cosine"
     
-    # 分层学习率设置（基于base learning_rate的倍数）
-    backbone_lr_mult: float = 0.1      # 预训练骨干：10%基础学习率
-    text_lr_mult: float = 0.1          # 文本编码器：10%基础学习率
-    fusion_lr_mult: float = 1.0        # 融合模块：100%基础学习率
-    heads_lr_mult: float = 2.0         # 分类/检索头：200%基础学习率
-    adapters_lr_mult: float = 1.5      # 模态适配器：150%基础学习率
+    # 分层学习率设置（基于base learning_rate的倍数）- 降低倍数防止nan
+    backbone_lr_mult: float = 0.05     # 预训练骨干：5%基础学习率
+    text_lr_mult: float = 0.05         # 文本编码器：5%基础学习率
+    fusion_lr_mult: float = 0.5        # 融合模块：50%基础学习率
+    heads_lr_mult: float = 1.0         # 分类/检索头：100%基础学习率
+    adapters_lr_mult: float = 0.5      # 模态适配器：50%基础学习率
     
-    # 损失权重 - 重新平衡 
+    # 损失权重 - 重新平衡（暂时禁用对比损失防止nan）
     ce_weight: float = 1.0
-    contrastive_weight: float = 0.05  # 预训练模型可以使用小权重对比损失
+    contrastive_weight: float = 0.0  # 暂时完全禁用对比损失
     
     # 数据增强 - 适度增强（预训练模型更稳定）
     random_flip: bool = True
@@ -66,6 +66,10 @@ class TrainingConfig:
     # 模态dropout - 适度泛化
     modality_dropout: float = 0.3  # 适度dropout
     min_modalities: int = 1  # 允许单模态训练
+    
+    # 模态感知批次采样配置（暂时禁用排查nan问题）
+    use_modality_aware_sampling: bool = False  # 暂时禁用模态感知采样器
+    min_modality_combinations: int = 3  # 每个批次最少包含的模态组合数
     
     # 设备和并行
     device: str = "cuda"

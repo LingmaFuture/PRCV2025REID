@@ -537,7 +537,7 @@ class MultiModalReIDModel(nn.Module):
             temperature=getattr(config, "contrastive_tau", 0.1),  # 提高温度降低锐度
             margin=getattr(config, "contrastive_margin", 0.2),
             topk=getattr(config, "hard_topk", 5),
-            w_fused=1.0, w_xmodal=0.5, anchor_modal='vis'  # 启用跨模态损失
+            w_fused=1.0, w_xmodal=0.0, anchor_modal='vis'  # 暂时禁用跨模态损失
         )
 
         self.ce_loss = nn.CrossEntropyLoss()

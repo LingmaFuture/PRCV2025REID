@@ -245,6 +245,171 @@ class MultiModalDataset(Dataset):
         sample['images'] = images
         return sample
 
+class ModalityAwareBatchSampler(Sampler):
+    """模态感知批次采样器 - 确保每个批次包含多样化的模态组合"""
+    
+    def __init__(self, dataset, batch_size, num_instances=4, min_modality_combinations=3):
+        """
+        Args:
+            dataset: 数据集
+            batch_size: 批次大小
+            num_instances: 每个身份的样本数
+            min_modality_combinations: 每个批次最少包含的模态组合数
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_instances = num_instances
+        self.min_modality_combinations = min_modality_combinations
+        
+        # 处理Subset
+        if hasattr(dataset, 'dataset'):
+            self.base_dataset = dataset.dataset
+            self.indices = dataset.indices
+        else:
+            self.base_dataset = dataset
+            self.indices = list(range(len(dataset)))
+        
+        # 先计算批次参数
+        self.num_pids_per_batch = max(1, self.batch_size // num_instances)
+        
+        # 分析每个样本的模态情况
+        self._analyze_modality_coverage()
+        
+        # 按身份和模态组合分组
+        self._group_by_identity_and_modality()
+        
+    def _analyze_modality_coverage(self):
+        """分析数据集的模态覆盖情况"""
+        self.sample_modalities = {}  # {idx: set of available modalities}
+        
+        for subset_idx, orig_idx in enumerate(self.indices):
+            if hasattr(self.base_dataset, 'data_list'):
+                data_item = self.base_dataset.data_list[orig_idx]
+                person_id_str = data_item['person_id_str']
+                
+                # 检查该样本的模态可用性
+                modalities = set()
+                
+                # 检查图像模态
+                if hasattr(self.base_dataset, 'image_cache') and person_id_str in self.base_dataset.image_cache:
+                    cache = self.base_dataset.image_cache[person_id_str]
+                    for modality in ['vis', 'nir', 'sk', 'cp']:
+                        if len(cache.get(modality, [])) > 0:
+                            modalities.add(modality)
+                
+                # 检查文本模态
+                if data_item.get('text_description', '').strip():
+                    modalities.add('text')
+                
+                self.sample_modalities[subset_idx] = modalities
+        
+        # 统计模态组合
+        modality_combo_count = {}
+        for modalities in self.sample_modalities.values():
+            combo = tuple(sorted(modalities))
+            modality_combo_count[combo] = modality_combo_count.get(combo, 0) + 1
+        
+        print(f"模态组合统计:")
+        for combo, count in sorted(modality_combo_count.items(), key=lambda x: -x[1]):
+            print(f"  {combo}: {count} 个样本")
+    
+    def _group_by_identity_and_modality(self):
+        """按身份和模态组合分组"""
+        self.identity_modality_groups = defaultdict(lambda: defaultdict(list))
+        
+        for subset_idx, orig_idx in enumerate(self.indices):
+            if hasattr(self.base_dataset, 'data_list'):
+                person_id = self.base_dataset.data_list[orig_idx]['person_id']
+            else:
+                person_id = self.base_dataset[orig_idx]['person_id'].item()
+            
+            modalities = self.sample_modalities[subset_idx]
+            modality_key = tuple(sorted(modalities))
+            
+            self.identity_modality_groups[person_id][modality_key].append(subset_idx)
+        
+        self.pids = list(self.identity_modality_groups.keys())
+        self.length = len(self.pids) // self.num_pids_per_batch * self.batch_size
+    
+    def __iter__(self):
+        random.shuffle(self.pids)
+        
+        for start_idx in range(0, len(self.pids), self.num_pids_per_batch):
+            batch_indices = []
+            end_idx = min(start_idx + self.num_pids_per_batch, len(self.pids))
+            selected_pids = self.pids[start_idx:end_idx]
+            
+            # 收集当前批次的模态组合
+            current_batch_modalities = set()
+            
+            for pid in selected_pids:
+                modality_groups = self.identity_modality_groups[pid]
+                
+                # 优先选择能增加模态多样性的组合
+                best_modality_key = None
+                best_score = -1
+                
+                for modality_key, indices in modality_groups.items():
+                    if len(indices) == 0:
+                        continue
+                    
+                    # 计算选择该模态组合的分数
+                    score = 0
+                    # 1. 优先选择尚未在批次中出现的模态组合
+                    if modality_key not in current_batch_modalities:
+                        score += 10
+                    
+                    # 2. 优先选择包含更多模态的组合
+                    score += len(modality_key)
+                    
+                    # 3. 随机性
+                    score += random.random()
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_modality_key = modality_key
+                
+                # 从最佳模态组合中采样
+                if best_modality_key and best_modality_key in modality_groups:
+                    indices = modality_groups[best_modality_key]
+                    if len(indices) >= self.num_instances:
+                        selected = random.sample(indices, self.num_instances)
+                    else:
+                        selected = random.choices(indices, k=self.num_instances)
+                    
+                    batch_indices.extend(selected)
+                    current_batch_modalities.add(best_modality_key)
+                else:
+                    # 回退策略：从所有可用样本中随机选择
+                    all_indices = []
+                    for indices in modality_groups.values():
+                        all_indices.extend(indices)
+                    if all_indices:
+                        if len(all_indices) >= self.num_instances:
+                            selected = random.sample(all_indices, self.num_instances)
+                        else:
+                            selected = random.choices(all_indices, k=self.num_instances)
+                        batch_indices.extend(selected)
+            
+            # 补齐批次大小
+            while len(batch_indices) < self.batch_size:
+                pid = random.choice(self.pids)
+                modality_groups = self.identity_modality_groups[pid]
+                all_indices = []
+                for indices in modality_groups.values():
+                    all_indices.extend(indices)
+                if all_indices:
+                    idx = random.choice(all_indices)
+                    batch_indices.append(idx)
+            
+            # 确保批次大小正确
+            batch_indices = batch_indices[:self.batch_size]
+            yield batch_indices
+    
+    def __len__(self):
+        return self.length
+
+
 class BalancedBatchSampler(Sampler):
     """修复后的平衡批次采样器"""
     

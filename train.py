@@ -25,7 +25,7 @@ from torch.amp import autocast, GradScaler
 from sklearn.model_selection import train_test_split
 
 # === 你项目里的数据与模型 ===
-from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn
+from datasets.dataset import MultiModalDataset, BalancedBatchSampler, ModalityAwareBatchSampler, compatible_collate_fn
 from models.model import MultiModalReIDModel  
 from configs.config import TrainingConfig
 
@@ -482,6 +482,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
             loss_dict = model.compute_loss(outputs, labels)
             loss = loss_dict['total_loss']
         
+        # 检查损失是否为nan或inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"警告: 检测到异常损失值: {loss.item()}, 跳过此批次")
+            print(f"  CE损失: {loss_dict.get('ce_loss', 'N/A')}")
+            print(f"  对比损失: {loss_dict.get('contrastive_loss', 'N/A')}")
+            continue
+        
         ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
         cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
 
@@ -489,12 +496,26 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
         if use_amp:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # 更保守的梯度裁剪
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            
+            # 检查梯度是否正常
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"警告: 检测到异常梯度: {grad_norm}, 跳过此次更新")
+                scaler.update()
+                continue
+                
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            
+            # 检查梯度是否正常
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"警告: 检测到异常梯度: {grad_norm}, 跳过此次更新")
+                continue
+                
             optimizer.step()
 
         total_loss += loss.item()
@@ -670,7 +691,20 @@ def train_multimodal_reid(stage: str = "stage1"):
     effective_batch_size = max(getattr(config, "batch_size", 32), 16)
     effective_batch_size = max(num_instances, (effective_batch_size // num_instances) * num_instances)
 
-    train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
+    # 选择采样策略
+    use_modality_aware_sampling = getattr(config, "use_modality_aware_sampling", True)
+    
+    if use_modality_aware_sampling:
+        logging.info("使用模态感知批次采样器")
+        train_sampler = ModalityAwareBatchSampler(
+            train_dataset, 
+            effective_batch_size, 
+            num_instances=num_instances,
+            min_modality_combinations=getattr(config, "min_modality_combinations", 3)
+        )
+    else:
+        logging.info("使用标准平衡批次采样器")
+        train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
