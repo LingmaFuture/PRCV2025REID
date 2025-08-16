@@ -25,7 +25,12 @@ class TrainingConfig:
 
     # 文本模型配置
     text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
-    freeze_text: bool = True
+    freeze_text: bool = True  # 保持向后兼容
+    text_finetune_strategy: str = "top_layers"  # frozen, top_layers, lora, full
+    
+    # CLIP联合预训练模型配置
+    use_clip: bool = True  # 安装CLIP后可设为True以启用联合预训练
+    clip_model_name: str = "ViT-B/32"  # 可选: ViT-B/32, ViT-B/16, ViT-L/14, RN50, RN101
     
     image_size: int = 224  # 匹配ViT模型要求的输入尺寸
     feature_dim: int = 2048  # ResNet50特征维度
