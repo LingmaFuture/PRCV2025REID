@@ -18,11 +18,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR
+from torch.amp import autocast, GradScaler
 
 from sklearn.model_selection import train_test_split
 
 # === 你项目里的数据与模型 ===
-from datasets.dataset import FixedMultiModalDataset, FixedBalancedBatchSampler, compatible_collate_fn
+from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn
 from models.model import MultiModalReIDModel  
 from configs.config import TrainingConfig
 
@@ -130,7 +131,7 @@ def split_train_dataset(dataset, val_ratio=0.2, seed=42):
             val_indices.append(i)
 
     logging.info(f"训练集: {len(train_ids)} 个身份, {len(train_indices)} 个索引")
-    logging.info(f"验证集: {len(val_ids)} 个身份, {len(val_indices)} 个索引")
+    logging.info(f"本地划分验证集: {len(val_ids)} 个身份, {len(val_indices)} 个索引")
     return train_indices, val_indices, train_ids, val_ids
 
 
@@ -260,11 +261,16 @@ class CombinationQueryDataset(Dataset):
         pid_t = rec['person_id']
         pid = int(pid_t.item()) if torch.is_tensor(pid_t) else int(pid_t)
 
+        # 完整的modality_mask，确保所有模态都有明确的True/False设置
+        modality_mask = {'vis': False, 'nir': False, 'sk': False, 'cp': False, 'text': False}
+        for m in mods:
+            modality_mask[m] = True
+            
         return {
             'person_id': torch.tensor(pid, dtype=torch.long),
             'images': images,
             'text_description': [text_desc],
-            'modality_mask': {m: True for m in mods}
+            'modality_mask': modality_mask
         }
 
 
@@ -335,21 +341,30 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
     return gallery_loader, query_loaders
 
 
-def validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100):
+def validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0):
     """
     赛制对齐评测：
       - 用同一 RGB 画廊
       - 对各类（single/double/triple/quad）组合分别算 mAP，然后四类平均
       - 额外汇报合并查询后的 CMC@1/5/10（非赛制指标，仅供参考）
+      - sample_ratio: 采样比例，用于快速评估 (0.3表示只用30%数据)
     """
     model.eval()
 
-    # 画廊特征
+    # 画廊特征 (支持采样)
     with torch.no_grad():
         gal_feats, gal_labels = [], []
-        for batch in tqdm(gallery_loader, desc='提取画廊特征'):
+        total_batches = len(gallery_loader)
+        sample_batches = max(1, int(total_batches * sample_ratio))
+        
+        batch_indices = random.sample(range(total_batches), sample_batches) if sample_ratio < 1.0 else range(total_batches)
+        
+        for i, batch in enumerate(tqdm(gallery_loader, desc=f'提取画廊特征(采样{sample_ratio:.1f})')):
+            if sample_ratio < 1.0 and i not in batch_indices:
+                continue
             batch = move_batch_to_device(batch, device)
-            feats = model(batch, return_features=True)
+            with autocast(device_type='cuda', enabled=device.type == 'cuda'):
+                feats = model(batch, return_features=True)
             labels = batch['person_id']
             gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
         gal_feats = torch.cat(gal_feats, dim=0)
@@ -363,9 +378,16 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
         for tag, group in query_loaders.items():
             for key, qloader in group.items():
                 qf, ql = [], []
-                for batch in tqdm(qloader, desc=f'提取查询特征[{tag}:{key}]'):
+                total_batches = len(qloader)
+                sample_batches = max(1, int(total_batches * sample_ratio))
+                batch_indices = random.sample(range(total_batches), sample_batches) if sample_ratio < 1.0 else range(total_batches)
+                
+                for i, batch in enumerate(tqdm(qloader, desc=f'提取查询特征[{tag}:{key}](采样{sample_ratio:.1f})')):
+                    if sample_ratio < 1.0 and i not in batch_indices:
+                        continue
                     batch = move_batch_to_device(batch, device)
-                    feats = model(batch, return_features=True)
+                    with autocast(device_type='cuda', enabled=device.type == 'cuda'):
+                        feats = model(batch, return_features=True)
                     labels = batch['person_id']
                     qf.append(feats.cpu()); ql.append(labels.cpu())
                 if not qf:
@@ -409,7 +431,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
 # ------------------------------
 # 训练一个 epoch（使用模型自带损失）
 # ------------------------------
-def train_epoch(model, dataloader, optimizer, device, epoch):
+def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
     model.train()
     total_loss = 0.0
     ce_loss_sum = 0.0
@@ -419,6 +441,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     
     # 新增：特征范数统计
     feature_norms = []
+    
+    use_amp = scaler is not None
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     for batch_idx, batch in enumerate(pbar):
@@ -426,16 +450,27 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         labels = batch['person_id']
 
         optimizer.zero_grad()
-        outputs = model(batch)
-        loss_dict = model.compute_loss(outputs, labels)
-
-        loss = loss_dict['total_loss']
+        
+        # 混合精度前向传播
+        with autocast(device_type='cuda', enabled=use_amp):
+            outputs = model(batch)
+            loss_dict = model.compute_loss(outputs, labels)
+            loss = loss_dict['total_loss']
+        
         ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
         cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # 混合精度反向传播
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         ce_loss_sum += ce_loss.item()
@@ -495,8 +530,9 @@ def train_multimodal_reid():
 
     setup_logging(getattr(config, "log_dir", "./logs"))
 
-    # 先加载全量，只用于身份统计与划分
-    full_dataset = FixedMultiModalDataset(config, split='train')
+    # 先加载全量，只用于身份统计与划分  
+    logging.info("加载完整数据集用于身份划分...")
+    full_dataset = MultiModalDataset(config, split='train')
 
     train_indices, val_indices, train_ids, val_ids = split_train_dataset(
         full_dataset,
@@ -504,12 +540,26 @@ def train_multimodal_reid():
         seed=getattr(config, "seed", 42)
     )
 
-    # ☆ 关键：按身份重建两个独立数据集（内部会用传入的 person_ids 重建 pid2label）
-    train_dataset = FixedMultiModalDataset(config, split='train', person_ids=train_ids)
-    val_dataset   = FixedMultiModalDataset(config, split='val', person_ids=val_ids)
+    # ☆ 修复：使用统一的person_ids确保标签映射一致
+    all_person_ids = sorted(train_ids + val_ids)  # 统一的person_id到label映射
+    logging.info("创建训练数据集...")
+    train_dataset = MultiModalDataset(config, split='train', person_ids=all_person_ids)
+    train_dataset._suppress_print = True  # 抑制重复打印
+    
+    logging.info("创建本地划分验证数据集...")  
+    local_val_dataset = MultiModalDataset(config, split='train', person_ids=all_person_ids)  # 都用train split但不同person_ids
+    local_val_dataset._suppress_print = True  # 抑制重复打印
+    
+    # 手动过滤数据：只保留对应集合的样本
+    train_dataset.data_list = [item for item in train_dataset.data_list if item['person_id'] in train_ids]
+    local_val_dataset.data_list = [item for item in local_val_dataset.data_list if item['person_id'] in val_ids]
+    
+    # 输出实际的样本统计
+    logging.info(f"修复后 - 训练集: {len(train_ids)} 个身份, {len(train_dataset.data_list)} 个样本")
+    logging.info(f"修复后 - 本地划分验证集: {len(val_ids)} 个身份, {len(local_val_dataset.data_list)} 个样本")
 
-    # 更新类别数为训练身份数
-    config.num_classes = len(train_ids)
+    # 更新类别数为全部身份数（确保标签映射正确）
+    config.num_classes = len(all_person_ids)
 
 
 
@@ -518,7 +568,7 @@ def train_multimodal_reid():
     effective_batch_size = max(getattr(config, "batch_size", 32), 16)
     effective_batch_size = max(num_instances, (effective_batch_size // num_instances) * num_instances)
 
-    train_sampler = FixedBalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
+    train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
@@ -527,9 +577,9 @@ def train_multimodal_reid():
         collate_fn=compatible_collate_fn
     )
 
-    # 验证（赛制对齐）DataLoader
+    # 本地验证（赛制对齐）DataLoader
     gallery_loader, query_loaders = build_eval_loaders_by_rule(
-        val_dataset, list(range(len(val_dataset))),
+        local_val_dataset, list(range(len(local_val_dataset))),
         batch_size=effective_batch_size,
         num_workers=getattr(config, "num_workers", 4),
         pin_memory=getattr(config, "pin_memory", True)
@@ -543,6 +593,13 @@ def train_multimodal_reid():
     optimizer = AdamW(model.parameters(),
                       lr=getattr(config, "learning_rate", 3e-4),
                       weight_decay=getattr(config, "weight_decay", 1e-4))
+    
+    # 混合精度训练
+    scaler = GradScaler('cuda') if device.type == 'cuda' else None
+    if scaler:
+        logging.info("启用混合精度训练 (AMP)")
+    else:
+        logging.info("使用全精度训练")
 
     # 学习率调度器
     scheduler_type = getattr(config, "scheduler", "cosine")
@@ -566,10 +623,12 @@ def train_multimodal_reid():
     for epoch in range(1, num_epochs + 1):
         start_time = time.time()
 
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler)
 
         if epoch % eval_freq == 0:
-            comp_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100)
+            # 使用采样评估进行快速性能估算（本地划分验证集）
+            sample_ratio = getattr(config, "eval_sample_ratio", 0.3)
+            comp_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=sample_ratio)
 
             train_history.append({'epoch': epoch, **train_metrics})
             val_history.append({'epoch': epoch, **comp_metrics})
@@ -608,11 +667,25 @@ def train_multimodal_reid():
         if scheduler:
             scheduler.step()
 
+    # 训练结束后进行完整评估（本地划分验证集）
+    logging.info("训练完成，开始本地划分验证集的完整评估...")
+    final_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0)
+    logging.info(f"本地划分验证集最终评估 - mAP(single/double/triple/quad/avg4): "
+                f"{final_metrics['map_single']:.4f}/"
+                f"{final_metrics['map_double']:.4f}/"
+                f"{final_metrics['map_triple']:.4f}/"
+                f"{final_metrics['map_quad']:.4f}/"
+                f"{final_metrics['map_avg4']:.4f}")
+
     # 保存训练历史
     log_dir = getattr(config, "log_dir", "./logs")
     os.makedirs(log_dir, exist_ok=True)
     pd.DataFrame(train_history).to_csv(os.path.join(log_dir, 'train_history.csv'), index=False)
-    pd.DataFrame(val_history).to_csv(os.path.join(log_dir, 'val_history.csv'), index=False)
+    pd.DataFrame(val_history).to_csv(os.path.join(log_dir, 'local_val_history.csv'), index=False)
+    
+    # 保存最终评估结果
+    final_results = {'epoch': 'final', **final_metrics}
+    pd.DataFrame([final_results]).to_csv(os.path.join(log_dir, 'local_val_final_evaluation.csv'), index=False)
 
     # 保存划分
     split_info = {
@@ -624,7 +697,7 @@ def train_multimodal_reid():
     with open(os.path.join(save_dir, 'dataset_split.pkl'), 'wb') as f:
         pickle.dump(split_info, f)
 
-    logging.info(f"训练完成. 最佳(四类平均) mAP: {best_map:.4f}")
+    logging.info(f"训练完成. 本地划分验证集最佳(四类平均) mAP: {best_map:.4f}")
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, best_map, config, filename):

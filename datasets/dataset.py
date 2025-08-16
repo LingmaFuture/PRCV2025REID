@@ -8,7 +8,7 @@ import os
 import random
 from collections import defaultdict
 
-class FixedModalityAugmentation:
+class ModalityAugmentation:
     """修复后的数据增强"""
     
     def __init__(self, config, is_training=True):
@@ -32,7 +32,7 @@ class FixedModalityAugmentation:
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
 
-class FixedMultiModalDataset(Dataset):
+class MultiModalDataset(Dataset):
     """修复后的多模态数据集"""
     
     def __init__(self, config, split='train', person_ids=None):
@@ -55,12 +55,15 @@ class FixedMultiModalDataset(Dataset):
         self._build_data_list()
         
         # 数据变换
-        self.transform = FixedModalityAugmentation(config, split == 'train').get_transform()
+        self.transform = ModalityAugmentation(config, split == 'train').get_transform()
         
         # 缓存图像路径
         self._cache_image_paths()
         
-        print(f"{split} dataset: {len(self.data_list)} samples, {len(self.person_ids)} identities")
+        if hasattr(self, '_suppress_print') and self._suppress_print:
+            pass  # 不打印，避免重复信息
+        else:
+            print(f"{split} dataset: {len(self.data_list)} samples, {len(self.person_ids)} identities")
     
     def _load_annotations(self):
         """加载标注文件 - 使用file_path中的目录ID作为身份ID"""
@@ -130,17 +133,30 @@ class FixedMultiModalDataset(Dataset):
         return sorted(final_ids)
     
     def _build_data_list(self):
-        """构建数据列表"""
+        """构建数据列表 - 修复：为每个图片文件创建独立样本"""
         self.data_list = []
         for person_id in self.person_ids:
             person_id_str = f"{person_id:04d}"
             text_desc = self.annotations.get(person_id_str, "unknown person")
             
-            self.data_list.append({
-                'person_id': person_id,
-                'person_id_str': person_id_str,
-                'text_description': text_desc
-            })
+            # 检查该身份是否有图片文件
+            if person_id in self.id_to_files:
+                # 为每个图片文件创建一个样本
+                for file_path in self.id_to_files[person_id]:
+                    self.data_list.append({
+                        'person_id': person_id,
+                        'person_id_str': person_id_str,
+                        'text_description': text_desc,
+                        'file_path': file_path  # 添加具体文件路径
+                    })
+            else:
+                # 没有图片文件的身份，创建一个基本样本
+                self.data_list.append({
+                    'person_id': person_id,
+                    'person_id_str': person_id_str,
+                    'text_description': text_desc,
+                    'file_path': None
+                })
     
     def _cache_image_paths(self):
         """缓存图像路径 - 基于json文件路径"""
@@ -193,14 +209,26 @@ class FixedMultiModalDataset(Dataset):
         }
 
         images = {}
-        # 加载图像
+        # 加载图像 - 优先使用指定的file_path，否则随机选择
+        file_path = data.get('file_path', None)
+        
         for modality in self.modality_folders:
             image_paths = self.image_cache[person_id_str][modality]
 
             use_drop = self.is_training and (self.config.modality_dropout > 0)
             if image_paths and (not use_drop or random.random() > self.config.modality_dropout):
-                # 正常加载
-                selected_path = random.choice(image_paths)
+                # 如果有指定文件路径，尝试使用对应的模态图片
+                if file_path and modality == 'vis':
+                    # 对于vis模态，尝试使用指定的file_path
+                    full_path = os.path.join(self.config.data_root, file_path)
+                    if os.path.exists(full_path):
+                        selected_path = full_path
+                    else:
+                        selected_path = random.choice(image_paths)
+                else:
+                    # 其他模态随机选择
+                    selected_path = random.choice(image_paths)
+                    
                 try:
                     image = Image.open(selected_path).convert('RGB')
                     images[modality] = self.transform(image)
@@ -217,7 +245,7 @@ class FixedMultiModalDataset(Dataset):
         sample['images'] = images
         return sample
 
-class FixedBalancedBatchSampler(Sampler):
+class BalancedBatchSampler(Sampler):
     """修复后的平衡批次采样器"""
     
     def __init__(self, dataset, batch_size, num_instances=4):  # 增加每个身份的实例数
