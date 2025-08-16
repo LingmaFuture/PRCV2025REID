@@ -348,8 +348,8 @@ class MultiModalReIDModel(nn.Module):
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
 
-        # 文本 384 -> fusion_dim
-        self.text_in_dim = 384
+        # 动态获取文本编码器维度
+        self.text_in_dim = self.text_encoder.config.hidden_size  # 自动获取维度
         self.text_projection = nn.Sequential(
             nn.Linear(self.text_in_dim, self.fusion_dim),
             nn.LayerNorm(self.fusion_dim),

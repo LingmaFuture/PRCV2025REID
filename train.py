@@ -363,7 +363,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
             if sample_ratio < 1.0 and i not in batch_indices:
                 continue
             batch = move_batch_to_device(batch, device)
-            with autocast(enabled=device.type == 'cuda'):
+            with autocast(device_type='cuda', enabled=device.type == 'cuda'):
                 feats = model(batch, return_features=True)
             labels = batch['person_id']
             gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
@@ -386,7 +386,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                     if sample_ratio < 1.0 and i not in batch_indices:
                         continue
                     batch = move_batch_to_device(batch, device)
-                    with autocast(enabled=device.type == 'cuda'):
+                    with autocast(device_type='cuda', enabled=device.type == 'cuda'):
                         feats = model(batch, return_features=True)
                     labels = batch['person_id']
                     qf.append(feats.cpu()); ql.append(labels.cpu())
@@ -452,7 +452,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
         optimizer.zero_grad()
         
         # 混合精度前向传播
-        with autocast('cuda', enabled=use_amp):
+        with autocast(device_type='cuda', enabled=use_amp):
             outputs = model(batch)
             loss_dict = model.compute_loss(outputs, labels)
             loss = loss_dict['total_loss']
