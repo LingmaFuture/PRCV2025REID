@@ -16,7 +16,7 @@ class TrainingConfig:
     val_ratio: float = 0.2
     seed: int = 42
     
-    # 模型相关 - 基于预训练ViT微调
+    # 模型相关 - 使用ViT-Base预训练模型
     backbone: str = "vit_base_patch16_224"  # 使用ViT-Base预训练模型
     use_pretrained_vision: bool = True      # 启用ImageNet预训练权重
 
@@ -36,35 +36,35 @@ class TrainingConfig:
     feature_dim: int = 2048  # ResNet50特征维度
     hidden_dim: int = 512  
     num_classes: int = 999
-    dropout_rate: float = 0.5  # 增强dropout
+    dropout_rate: float = 0.1  # 极小dropout
     
-    # 训练相关 - 预训练模型微调超参数
-    batch_size: int = 16  # 降低批次大小，增加泛化
+    # 训练相关 - 极保守设置以防止NaN
+    batch_size: int = 8   # 进一步降低批次大小
     num_epochs: int = 150
-    learning_rate: float = 2e-5  # 预训练模型需要更小学习率
-    weight_decay: float = 5e-3  # 适度正则化
-    warmup_epochs: int = 5      # 预训练模型收敛更快，减少warmup
-    scheduler: str = "cosine"
+    learning_rate: float = 1e-6  # 极小学习率
+    weight_decay: float = 1e-4   # 极小权重衰减
+    warmup_epochs: int = 3       # 减少warmup
+    scheduler: str = "constant"   # 暂时使用常数学习率
     
-    # 分层学习率设置（基于base learning_rate的倍数）- 降低倍数防止nan
-    backbone_lr_mult: float = 0.05     # 预训练骨干：5%基础学习率
-    text_lr_mult: float = 0.05         # 文本编码器：5%基础学习率
-    fusion_lr_mult: float = 0.5        # 融合模块：50%基础学习率
-    heads_lr_mult: float = 1.0         # 分类/检索头：100%基础学习率
-    adapters_lr_mult: float = 0.5      # 模态适配器：50%基础学习率
+    # 分层学习率设置（基于base learning_rate的倍数）- 极保守设置
+    backbone_lr_mult: float = 0.01     # 预训练骨干：1%基础学习率
+    text_lr_mult: float = 0.01         # 文本编码器：1%基础学习率
+    fusion_lr_mult: float = 0.1        # 融合模块：10%基础学习率
+    heads_lr_mult: float = 0.5         # 分类/检索头：50%基础学习率
+    adapters_lr_mult: float = 0.1      # 模态适配器：10%基础学习率
     
     # 损失权重 - 重新平衡（暂时禁用对比损失防止nan）
     ce_weight: float = 1.0
     contrastive_weight: float = 0.0  # 暂时完全禁用对比损失
     
-    # 数据增强 - 适度增强（预训练模型更稳定）
-    random_flip: bool = True
-    random_crop: bool = True  # 重新启用随机裁剪
-    color_jitter: bool = True
-    random_erase: float = 0.3  # 适度随机擦除
+    # 数据增强 - 暂时禁用所有增强
+    random_flip: bool = False
+    random_crop: bool = False
+    color_jitter: bool = False
+    random_erase: float = 0.0  # 禁用随机擦除
     
-    # 模态dropout - 适度泛化
-    modality_dropout: float = 0.3  # 适度dropout
+    # 模态dropout - 暂时禁用以简化
+    modality_dropout: float = 0.0  # 禁用dropout
     min_modalities: int = 1  # 允许单模态训练
     
     # 模态感知批次采样配置（暂时禁用排查nan问题）
@@ -73,7 +73,7 @@ class TrainingConfig:
     
     # 设备和并行
     device: str = "cuda"
-    num_workers: int = 2
+    num_workers: int = 0  # 临时设置为0避免多进程序列化问题
     pin_memory: bool = True
     
     # 保存和日志

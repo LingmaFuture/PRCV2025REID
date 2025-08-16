@@ -482,11 +482,23 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
             loss_dict = model.compute_loss(outputs, labels)
             loss = loss_dict['total_loss']
         
-        # 检查损失是否为nan或inf
+        # 详细的NaN检测和诊断
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"警告: 检测到异常损失值: {loss.item()}, 跳过此批次")
+            print(f"\n!!! 检测到异常损失值: {loss.item()} !!!")
             print(f"  CE损失: {loss_dict.get('ce_loss', 'N/A')}")
             print(f"  对比损失: {loss_dict.get('contrastive_loss', 'N/A')}")
+            print(f"  批次索引: {batch_idx}")
+            print(f"  标签范围: [{labels.min().item()}, {labels.max().item()}]")
+            
+            # 检查模型输出是否正常
+            if isinstance(outputs, dict):
+                for key, value in outputs.items():
+                    if torch.is_tensor(value):
+                        has_nan = torch.isnan(value).any().item()
+                        has_inf = torch.isinf(value).any().item()
+                        print(f"  {key}: nan={has_nan}, inf={has_inf}, shape={value.shape}")
+            
+            print("  跳过此批次并继续训练...")
             continue
         
         ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
@@ -499,9 +511,23 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
             # 更保守的梯度裁剪
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
-            # 检查梯度是否正常
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                print(f"警告: 检测到异常梯度: {grad_norm}, 跳过此次更新")
+            # 详细的梯度检查和诊断
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm) or grad_norm > 100.0:
+                print(f"\n!!! 检测到异常梯度: {grad_norm} !!!")
+                
+                # 检查每个参数组的梯度
+                for group_idx, param_group in enumerate(optimizer.param_groups):
+                    group_grads = []
+                    for param in param_group['params']:
+                        if param.grad is not None:
+                            grad_norm_single = param.grad.norm().item()
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"    参数组{group_idx}: 发现NaN/Inf梯度")
+                            group_grads.append(grad_norm_single)
+                    if group_grads:
+                        print(f"    参数组{group_idx}: 平均梯度范数={np.mean(group_grads):.6f}")
+                
+                print("  跳过此次更新...")
                 scaler.update()
                 continue
                 
@@ -511,9 +537,23 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
-            # 检查梯度是否正常
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                print(f"警告: 检测到异常梯度: {grad_norm}, 跳过此次更新")
+            # 详细的梯度检查和诊断（非AMP模式）
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm) or grad_norm > 100.0:
+                print(f"\n!!! 检测到异常梯度: {grad_norm} !!!")
+                
+                # 检查每个参数组的梯度
+                for group_idx, param_group in enumerate(optimizer.param_groups):
+                    group_grads = []
+                    for param in param_group['params']:
+                        if param.grad is not None:
+                            grad_norm_single = param.grad.norm().item()
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"    参数组{group_idx}: 发现NaN/Inf梯度")
+                            group_grads.append(grad_norm_single)
+                    if group_grads:
+                        print(f"    参数组{group_idx}: 平均梯度范数={np.mean(group_grads):.6f}")
+                
+                print("  跳过此次更新...")
                 continue
                 
             optimizer.step()
@@ -580,6 +620,48 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
         'feature_norm': avg_feat_norm
     }
 
+
+# ------------------------------
+# 模型健全性检查
+# ------------------------------
+def check_model_sanity(model, sample_batch, device):
+    """模型健全性检查：确保模型可以正常前向传播而不产生NaN"""
+    print("\n=== 模型健全性检查 ===")
+    model.eval()
+    
+    with torch.no_grad():
+        sample_batch = move_batch_to_device(sample_batch, device)
+        try:
+            outputs = model(sample_batch)
+            
+            # 检查输出是否包含NaN或Inf
+            if isinstance(outputs, dict):
+                for key, value in outputs.items():
+                    if torch.is_tensor(value):
+                        has_nan = torch.isnan(value).any().item()
+                        has_inf = torch.isinf(value).any().item()
+                        value_range = f"[{value.min().item():.3f}, {value.max().item():.3f}]"
+                        print(f"  {key}: shape={value.shape}, range={value_range}, nan={has_nan}, inf={has_inf}")
+                        if has_nan or has_inf:
+                            print(f"    !!! 发现异常值在 {key} !!!")
+                            return False
+            else:
+                has_nan = torch.isnan(outputs).any().item()
+                has_inf = torch.isinf(outputs).any().item()
+                value_range = f"[{outputs.min().item():.3f}, {outputs.max().item():.3f}]"
+                print(f"  outputs: shape={outputs.shape}, range={value_range}, nan={has_nan}, inf={has_inf}")
+                if has_nan or has_inf:
+                    print("    !!! 发现异常值在输出中 !!!")
+                    return False
+            
+            print("  ✅ 模型前向传播正常")
+            return True
+            
+        except Exception as e:
+            print(f"  ❌ 模型前向传播失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
 # ------------------------------
 # 训练主流程
@@ -666,6 +748,7 @@ def train_multimodal_reid(stage: str = "stage1"):
         logging.info(f"Stage 1 - 训练身份: {len(train_ids)}, 验证身份: {len(val_ids)}")
         logging.info(f"Stage 1 - 训练样本: {len(train_dataset)}, 验证样本: {len(val_dataset)}")
         
+        
     elif stage == "stage2":
         logging.info("=== Stage 2: 最终模型训练阶段 ===")
         
@@ -679,6 +762,7 @@ def train_multimodal_reid(stage: str = "stage1"):
         logging.info(f"Stage 2 - 全局pid2label示例: {dict(list(full_dataset.pid2label.items())[:5])}")
         logging.info(f"Stage 2 - 使用全部训练数据: {len(all_person_ids)} 个身份, {len(train_dataset)} 个样本")
         
+        
     else:
         raise ValueError(f"未知的训练阶段: {stage}")
 
@@ -691,20 +775,11 @@ def train_multimodal_reid(stage: str = "stage1"):
     effective_batch_size = max(getattr(config, "batch_size", 32), 16)
     effective_batch_size = max(num_instances, (effective_batch_size // num_instances) * num_instances)
 
-    # 选择采样策略
-    use_modality_aware_sampling = getattr(config, "use_modality_aware_sampling", True)
+    # 选择采样策略（暂时强制使用标准采样器）
+    use_modality_aware_sampling = False  # 暂时禁用以排查NaN问题
     
-    if use_modality_aware_sampling:
-        logging.info("使用模态感知批次采样器")
-        train_sampler = ModalityAwareBatchSampler(
-            train_dataset, 
-            effective_batch_size, 
-            num_instances=num_instances,
-            min_modality_combinations=getattr(config, "min_modality_combinations", 3)
-        )
-    else:
-        logging.info("使用标准平衡批次采样器")
-        train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
+    logging.info("使用标准平衡批次采样器（暂时禁用模态感知采样以排查NaN问题）")
+    train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
@@ -734,6 +809,18 @@ def train_multimodal_reid(stage: str = "stage1"):
 
     # 模型
     model = MultiModalReIDModel(config).to(device)
+    
+    # 进行模型健全性检查
+    print("\n获取样本批次进行健全性检查...")    
+    temp_sampler = BalancedBatchSampler(train_dataset, batch_size=min(4, config.batch_size), num_instances=2)
+    temp_loader = DataLoader(train_dataset, batch_sampler=temp_sampler, num_workers=0, collate_fn=compatible_collate_fn)
+    sample_batch = next(iter(temp_loader))
+    
+    if not check_model_sanity(model, sample_batch, device):
+        print("\n❌ 模型健全性检查失败，终止训练")
+        return
+    
+    print("\n✅ 模型健全性检查通过，继续训练")
 
     # 分组优化器：不同模块使用不同学习率
     def get_parameter_groups(model, config):
@@ -863,12 +950,9 @@ def train_multimodal_reid(stage: str = "stage1"):
         num_params = sum(p.numel() for p in group['params'])
         logging.info(f"  {group['name']}: LR={group['lr']:.2e}, 参数量={num_params:,}")
     
-    # 混合精度训练
-    scaler = GradScaler('cuda') if device.type == 'cuda' else None
-    if scaler:
-        logging.info("启用混合精度训练 (AMP)")
-    else:
-        logging.info("使用全精度训练")
+    # 暂时禁用混合精度训练以排查NaN问题
+    scaler = None  # GradScaler('cuda') if device.type == 'cuda' else None
+    logging.info("暂时禁用混合精度训练以排查NaN问题，使用全精度训练")
 
     # 学习率调度器（含warmup）
     warmup_epochs = getattr(config, "warmup_epochs", 5)

@@ -17,14 +17,25 @@ class ModalityAugmentation:
     
     def get_transform(self):
         if self.is_training:
-            return transforms.Compose([
+            transform_list = [
                 transforms.Resize((self.config.image_size, self.config.image_size)),
                 transforms.RandomHorizontalFlip(0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2) if self.config.color_jitter else transforms.Lambda(lambda x: x),
+            ]
+            
+            # 添加颜色抖动（如果启用）
+            if self.config.color_jitter:
+                transform_list.append(transforms.ColorJitter(brightness=0.2, contrast=0.2))
+            
+            transform_list.extend([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                transforms.RandomErasing(p=self.config.random_erase, scale=(0.02, 0.2)) if self.config.random_erase > 0 else transforms.Lambda(lambda x: x)
             ])
+            
+            # 添加随机擦除（如果启用）
+            if self.config.random_erase > 0:
+                transform_list.append(transforms.RandomErasing(p=self.config.random_erase, scale=(0.02, 0.2)))
+            
+            return transforms.Compose(transform_list)
         else:
             return transforms.Compose([
                 transforms.Resize((self.config.image_size, self.config.image_size)),
