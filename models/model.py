@@ -64,21 +64,19 @@ class ModalityAdapter(nn.Module):
 
 
 class CrossModalTransformerBlock(nn.Module):
-    """跨模态 Transformer 块（Pre-LN 风格，更稳）"""
+    """跨模态 Transformer 块（Post-LN 风格，小数据集更优）"""
     def __init__(self, embed_dim, num_heads=8, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.embed_dim = embed_dim
 
-        self.cross_norm_q = nn.LayerNorm(embed_dim)
-        self.cross_norm_kv = nn.LayerNorm(embed_dim)
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
+        self.cross_norm = nn.LayerNorm(embed_dim)
         self.cross_scale = LayerScale(embed_dim)
 
-        self.self_norm = nn.LayerNorm(embed_dim)
         self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
+        self.self_norm = nn.LayerNorm(embed_dim)
         self.self_scale = LayerScale(embed_dim)
 
-        self.ffn_norm = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
             nn.GELU(),
@@ -86,23 +84,20 @@ class CrossModalTransformerBlock(nn.Module):
             nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
             nn.Dropout(proj_drop),
         )
+        self.ffn_norm = nn.LayerNorm(embed_dim)
         self.ffn_scale = LayerScale(embed_dim)
 
     def forward(self, query, key_value, key_padding_mask: Optional[torch.Tensor] = None):
-        # Cross-Attn
-        q = self.cross_norm_q(query)
-        kv = self.cross_norm_kv(key_value)
-        cross_out, _ = self.cross_attn(q, kv, kv, key_padding_mask=key_padding_mask)  # (B,1,C)
-        x = query + self.cross_scale(cross_out)
+        # Cross-Attn: Attention → Add → LayerNorm
+        cross_out, _ = self.cross_attn(query, key_value, key_value, key_padding_mask=key_padding_mask)
+        x = self.cross_norm(query + self.cross_scale(cross_out))
 
-        # Self-Attn
-        y = self.self_norm(x)
-        self_out, _ = self.self_attn(y, y, y)
-        x = x + self.self_scale(self_out)
+        # Self-Attn: Attention → Add → LayerNorm  
+        self_out, _ = self.self_attn(x, x, x)
+        x = self.self_norm(x + self.self_scale(self_out))
 
-        # FFN
-        z = self.ffn_norm(x)
-        x = x + self.ffn_scale(self.mlp(z))
+        # FFN: MLP → Add → LayerNorm
+        x = self.ffn_norm(x + self.ffn_scale(self.mlp(x)))
         return x
 
 
@@ -348,8 +343,8 @@ class MultiModalReIDModel(nn.Module):
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
 
-        # 文本 384 -> fusion_dim
-        self.text_in_dim = 384
+        # 动态获取文本编码器维度
+        self.text_in_dim = self.text_encoder.config.hidden_size  # 自动获取维度
         self.text_projection = nn.Sequential(
             nn.Linear(self.text_in_dim, self.fusion_dim),
             nn.LayerNorm(self.fusion_dim),
@@ -377,6 +372,10 @@ class MultiModalReIDModel(nn.Module):
         )
 
         self.ce_loss = nn.CrossEntropyLoss()
+        
+        # 文本特征缓存
+        self.text_cache = {}  # {text_str: encoded_features}
+        self.cache_enabled = True
 
 
     # ---- 工具 ----
@@ -440,18 +439,72 @@ class MultiModalReIDModel(nn.Module):
             return torch.zeros(0, self.fusion_dim, device=self.device)
 
         valid_texts = [t if isinstance(t, str) and len(t) > 0 else "[UNK]" for t in text_descriptions]
-        enc = self.text_tokenizer(valid_texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
-        enc = {k: v.to(self.device) for k, v in enc.items()}
+        
+        # 尝试从缓存获取特征
+        if self.cache_enabled:
+            cached_features = []
+            uncached_texts = []
+            uncached_indices = []
+            
+            for i, text in enumerate(valid_texts):
+                if text in self.text_cache:
+                    cached_features.append(self.text_cache[text])
+                else:
+                    uncached_texts.append(text)
+                    uncached_indices.append(i)
+            
+            # 如果全部命中缓存
+            if len(uncached_texts) == 0:
+                return torch.stack(cached_features).to(self.device)
+            
+            # 只对未缓存的文本进行编码
+            if len(uncached_texts) > 0:
+                enc = self.text_tokenizer(uncached_texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
+                enc = {k: v.to(self.device) for k, v in enc.items()}
 
-        ctx = torch.no_grad() if self.freeze_text else contextlib.nullcontext()
-        with ctx:
-            out = self.text_encoder(**enc, return_dict=True)
-            token = out.last_hidden_state  # (B, L, 384)
+                ctx = torch.no_grad() if self.freeze_text else contextlib.nullcontext()
+                with ctx:
+                    out = self.text_encoder(**enc, return_dict=True)
+                    token = out.last_hidden_state  # (B, L, 384)
 
-        mask = enc['attention_mask'].unsqueeze(-1).float()
-        text_vec = (token * mask).sum(1) / mask.sum(1).clamp_min(1e-6)  # (B, 384)
-        text_vec = self.text_projection(text_vec)  # (B, fusion_dim)
-        return text_vec
+                mask = enc['attention_mask'].unsqueeze(-1).float()
+                text_vec = (token * mask).sum(1) / mask.sum(1).clamp_min(1e-6)  # (B, 384)
+                text_vec = self.text_projection(text_vec)  # (B, fusion_dim)
+                
+                # 缓存新编码的特征
+                for i, text in enumerate(uncached_texts):
+                    self.text_cache[text] = text_vec[i].detach().cpu()
+            
+            # 组合缓存和新编码的特征
+            result_features = [None] * batch_size
+            
+            # 填入缓存的特征
+            cached_idx = 0
+            for i in range(batch_size):
+                if i not in uncached_indices:
+                    result_features[i] = cached_features[cached_idx].to(self.device)
+                    cached_idx += 1
+            
+            # 填入新编码的特征
+            for i, orig_idx in enumerate(uncached_indices):
+                result_features[orig_idx] = text_vec[i]
+            
+            return torch.stack(result_features)
+        
+        else:
+            # 原始编码逻辑（无缓存）
+            enc = self.text_tokenizer(valid_texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
+            enc = {k: v.to(self.device) for k, v in enc.items()}
+
+            ctx = torch.no_grad() if self.freeze_text else contextlib.nullcontext()
+            with ctx:
+                out = self.text_encoder(**enc, return_dict=True)
+                token = out.last_hidden_state  # (B, L, 384)
+
+            mask = enc['attention_mask'].unsqueeze(-1).float()
+            text_vec = (token * mask).sum(1) / mask.sum(1).clamp_min(1e-6)  # (B, 384)
+            text_vec = self.text_projection(text_vec)  # (B, fusion_dim)
+            return text_vec
 
 
     # ---- 前向 ----
