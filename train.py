@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR
+from torch.amp import autocast, GradScaler
 
 from sklearn.model_selection import train_test_split
 
@@ -362,7 +363,8 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
             if sample_ratio < 1.0 and i not in batch_indices:
                 continue
             batch = move_batch_to_device(batch, device)
-            feats = model(batch, return_features=True)
+            with autocast(enabled=device.type == 'cuda'):
+                feats = model(batch, return_features=True)
             labels = batch['person_id']
             gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
         gal_feats = torch.cat(gal_feats, dim=0)
@@ -384,7 +386,8 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                     if sample_ratio < 1.0 and i not in batch_indices:
                         continue
                     batch = move_batch_to_device(batch, device)
-                    feats = model(batch, return_features=True)
+                    with autocast(enabled=device.type == 'cuda'):
+                        feats = model(batch, return_features=True)
                     labels = batch['person_id']
                     qf.append(feats.cpu()); ql.append(labels.cpu())
                 if not qf:
@@ -428,7 +431,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
 # ------------------------------
 # 训练一个 epoch（使用模型自带损失）
 # ------------------------------
-def train_epoch(model, dataloader, optimizer, device, epoch):
+def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
     model.train()
     total_loss = 0.0
     ce_loss_sum = 0.0
@@ -438,6 +441,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     
     # 新增：特征范数统计
     feature_norms = []
+    
+    use_amp = scaler is not None
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     for batch_idx, batch in enumerate(pbar):
@@ -445,16 +450,27 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         labels = batch['person_id']
 
         optimizer.zero_grad()
-        outputs = model(batch)
-        loss_dict = model.compute_loss(outputs, labels)
-
-        loss = loss_dict['total_loss']
+        
+        # 混合精度前向传播
+        with autocast('cuda', enabled=use_amp):
+            outputs = model(batch)
+            loss_dict = model.compute_loss(outputs, labels)
+            loss = loss_dict['total_loss']
+        
         ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
         cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # 混合精度反向传播
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         ce_loss_sum += ce_loss.item()
@@ -577,6 +593,13 @@ def train_multimodal_reid():
     optimizer = AdamW(model.parameters(),
                       lr=getattr(config, "learning_rate", 3e-4),
                       weight_decay=getattr(config, "weight_decay", 1e-4))
+    
+    # 混合精度训练
+    scaler = GradScaler('cuda') if device.type == 'cuda' else None
+    if scaler:
+        logging.info("启用混合精度训练 (AMP)")
+    else:
+        logging.info("使用全精度训练")
 
     # 学习率调度器
     scheduler_type = getattr(config, "scheduler", "cosine")
@@ -600,7 +623,7 @@ def train_multimodal_reid():
     for epoch in range(1, num_epochs + 1):
         start_time = time.time()
 
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler)
 
         if epoch % eval_freq == 0:
             # 使用采样评估进行快速性能估算（本地划分验证集）
