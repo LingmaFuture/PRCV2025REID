@@ -31,29 +31,29 @@ class TrainingConfig:
     feature_dim: int = 2048  # ResNet50特征维度
     hidden_dim: int = 512  
     num_classes: int = 999
-    dropout_rate: float = 0.3
+    dropout_rate: float = 0.5  # 增强dropout
     
-    # 训练相关 - 调整超参数
-    batch_size: int = 16  # 增加批次大小，避免BatchNorm问题
-    num_epochs: int = 100
-    learning_rate: float = 1e-4  # 降低学习率
-    weight_decay: float = 5e-4
-    warmup_epochs: int = 5
-    scheduler: str = "step"
+    # 训练相关 - 优化超参数
+    batch_size: int = 16  # 降低批次大小，增加泛化
+    num_epochs: int = 150
+    learning_rate: float = 1e-4  # 进一步降低学习率
+    weight_decay: float = 1e-2  # 极强正则化
+    warmup_epochs: int = 10
+    scheduler: str = "cosine"
     
-    # 损失权重 - 简化损失函数
+    # 损失权重 - 重新平衡 
     ce_weight: float = 1.0
-    contrastive_weight: float = 0.5
+    contrastive_weight: float = 0.0  # 暂时完全关闭对比损失
     
-    # 数据增强 - 减少过度增强
+    # 数据增强 - 增强泛化能力
     random_flip: bool = True
-    random_crop: bool = False  # 暂时关闭随机裁剪
+    random_crop: bool = True  # 重新启用随机裁剪
     color_jitter: bool = True
-    random_erase: float = 0.2  # 降低随机擦除概率
+    random_erase: float = 0.5  # 增加随机擦除概率
     
-    # 模态dropout
-    modality_dropout: float = 0.1  # 降低dropout概率
-    min_modalities: int = 2
+    # 模态dropout - 增强泛化能力
+    modality_dropout: float = 0.5  # 大幅增加dropout概率
+    min_modalities: int = 1  # 允许单模态训练
     
     # 设备和并行
     device: str = "cuda"
@@ -64,7 +64,8 @@ class TrainingConfig:
     save_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     save_freq: int = 20
-    eval_freq: int = 10
+    eval_freq: int = 10  # 降低评估频率，从每10轮改为每20轮
+    eval_sample_ratio: float = 0.3  # 采样评估，只用30%数据进行快速mAP估算
     
     # 验证和推理相关配置
     inference_batch_size: int = 32

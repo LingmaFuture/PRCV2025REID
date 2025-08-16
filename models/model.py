@@ -265,22 +265,14 @@ class AdvancedContrastiveLoss(nn.Module):
         return reg
 
     def forward(self, fused, labels, modal_dict=None, modal_masks=None):
-        loss = self.w_fused * self._supcon(fused, labels)
-
-        if modal_dict is not None and self.anchor_modal in modal_dict:
-            anchor = modal_dict[self.anchor_modal]
-            ma = modal_masks.get(self.anchor_modal) if (modal_masks is not None) else None
-            for m, feats in modal_dict.items():
-                if m == self.anchor_modal:
-                    continue
-                mb = modal_masks.get(m) if (modal_masks is not None) else None
-                loss = loss + self.w_xmodal * (
-                    self._xmodal_nce(anchor, feats, labels, ma, mb) +
-                    self._xmodal_nce(feats, anchor, labels, mb, ma)
-                )
-
-        loss = loss + 0.1 * self._hard_negative_reg(fused, labels)
-        return loss
+        # 简化版：暂时只使用主要的监督对比损失
+        main_loss = self._supcon(fused, labels)
+        
+        # 暂时关闭跨模态损失和硬负样本正则，专注于基础特征学习
+        # xmodal_loss = 0.0 (已通过w_xmodal=0.0关闭)
+        # hard_neg_loss = 0.0 (暂时关闭)
+        
+        return self.w_fused * main_loss
 
 
 # -------------------------
@@ -374,14 +366,14 @@ class MultiModalReIDModel(nn.Module):
         self.feature_projection = nn.Sequential(
             nn.Linear(self.fusion_dim, 512),
             nn.BatchNorm1d(512),
-            nn.Dropout(0.1),
+            nn.Dropout(0.5),  # 增强dropout
         )
 
         self.contrastive_loss = AdvancedContrastiveLoss(
-            temperature=getattr(config, "contrastive_tau", 0.07),
+            temperature=getattr(config, "contrastive_tau", 0.1),  # 提高温度降低锐度
             margin=getattr(config, "contrastive_margin", 0.2),
             topk=getattr(config, "hard_topk", 5),
-            w_fused=1.0, w_xmodal=0.5, anchor_modal='vis'
+            w_fused=1.0, w_xmodal=0.0, anchor_modal='vis'  # 暂时关闭跨模态损失
         )
 
         self.ce_loss = nn.CrossEntropyLoss()
@@ -545,6 +537,8 @@ class MultiModalReIDModel(nn.Module):
             # 新增：把掩码传给对比损失
             modal_masks=outputs.get('modality_masks', None)
         )
-        total = ce + 0.5 * con
+        # 修复：使用配置中的对比损失权重0.1，而不是硬编码的0.5
+        contrastive_weight = getattr(self.config, 'contrastive_weight', 0.1)
+        total = ce + contrastive_weight * con
         return {'total_loss': total, 'ce_loss': ce, 'contrastive_loss': con}
 
