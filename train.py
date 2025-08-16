@@ -466,6 +466,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None):
     for batch_idx, batch in enumerate(pbar):
         batch = move_batch_to_device(batch, device)
         labels = batch['person_id']
+        
+        # 验证标签范围（调试用）
+        if batch_idx == 0:  # 只在第一个batch检查
+            max_label = labels.max().item()
+            min_label = labels.min().item()
+            if max_label >= model.config.num_classes or min_label < 0:
+                raise ValueError(f"标签超出范围: [{min_label}, {max_label}], 应在 [0, {model.config.num_classes-1}]")
 
         optimizer.zero_grad()
         
@@ -579,6 +586,11 @@ def train_multimodal_reid(stage: str = "stage1"):
     # 输出数据集统计
     all_person_ids = sorted(list(set([item['person_id'] for item in full_dataset.data_list])))
     logging.info(f"完整数据集: {len(all_person_ids)} 个身份, {len(full_dataset.data_list)} 个样本")
+    logging.info(f"身份ID范围: {min(all_person_ids)} - {max(all_person_ids)}")
+    
+    # 检查ID分布情况（不在这里重映射，由数据集处理）
+    logging.info(f"原始ID示例: {all_person_ids[:10]}...{all_person_ids[-5:]}")
+    logging.info("ID映射由数据集的pid2label处理")
     
     # 根据训练阶段决定数据划分
     if stage == "stage1":
@@ -611,12 +623,24 @@ def train_multimodal_reid(stage: str = "stage1"):
                 pickle.dump(split_data, f)
             logging.info(f"训练/验证集划分已保存至: {split_file}")
         
-        # 创建训练和验证子集
-        train_dataset = Subset(full_dataset, train_indices)
-        val_dataset = Subset(full_dataset, val_indices)
+        # 为Stage 1创建新的pid2label映射（只包含训练集的身份）
+        train_pid2label = {pid: idx for idx, pid in enumerate(sorted(train_ids))}
+        
+        # 创建训练子集（需要重新设置pid2label）
+        from copy import deepcopy
+        train_dataset_base = deepcopy(full_dataset)
+        train_dataset_base.pid2label = train_pid2label
+        train_dataset = Subset(train_dataset_base, train_indices)
+        
+        # 验证集使用相同的映射（但只包含验证样本）
+        val_dataset_base = deepcopy(full_dataset) 
+        val_dataset_base.pid2label = train_pid2label  # 使用训练集的映射
+        val_dataset = Subset(val_dataset_base, val_indices)
         
         # 更新类别数为训练集身份数
         config.num_classes = len(train_ids)
+        logging.info(f"Stage 1 - 类别数: {config.num_classes}")
+        logging.info(f"Stage 1 - 训练集pid2label示例: {dict(list(train_pid2label.items())[:5])}")
         
         logging.info(f"Stage 1 - 训练身份: {len(train_ids)}, 验证身份: {len(val_ids)}")
         logging.info(f"Stage 1 - 训练样本: {len(train_dataset)}, 验证样本: {len(val_dataset)}")
@@ -624,13 +648,14 @@ def train_multimodal_reid(stage: str = "stage1"):
     elif stage == "stage2":
         logging.info("=== Stage 2: 最终模型训练阶段 ===")
         
-        # 使用全部训练数据
+        # Stage 2使用全部训练数据，验证数据集的pid2label已经是正确的
         train_dataset = full_dataset
         val_dataset = None
         
         # 更新类别数为全部身份数
         config.num_classes = len(all_person_ids)
-        
+        logging.info(f"Stage 2 - 类别数: {config.num_classes}")
+        logging.info(f"Stage 2 - 全局pid2label示例: {dict(list(full_dataset.pid2label.items())[:5])}")
         logging.info(f"Stage 2 - 使用全部训练数据: {len(all_person_ids)} 个身份, {len(train_dataset)} 个样本")
         
     else:
@@ -676,10 +701,133 @@ def train_multimodal_reid(stage: str = "stage1"):
     # 模型
     model = MultiModalReIDModel(config).to(device)
 
-    # 优化器
-    optimizer = AdamW(model.parameters(),
-                      lr=getattr(config, "learning_rate", 3e-4),
-                      weight_decay=getattr(config, "weight_decay", 1e-4))
+    # 分组优化器：不同模块使用不同学习率
+    def get_parameter_groups(model, config):
+        """为不同模块创建参数组"""
+        base_lr = getattr(config, "learning_rate", 2e-5)
+        weight_decay = getattr(config, "weight_decay", 1e-4)
+        
+        # 定义不同模块的学习率倍数
+        lr_multipliers = {
+            'backbone': getattr(config, "backbone_lr_mult", 0.1),      # 预训练骨干：10%基础学习率
+            'text_encoder': getattr(config, "text_lr_mult", 0.1),      # 文本编码器：10%基础学习率  
+            'fusion': getattr(config, "fusion_lr_mult", 1.0),          # 融合模块：100%基础学习率
+            'heads': getattr(config, "heads_lr_mult", 2.0),            # 分类/检索头：200%基础学习率
+            'adapters': getattr(config, "adapters_lr_mult", 1.5),      # 模态适配器：150%基础学习率
+        }
+        
+        param_groups = []
+        
+        # 1. 视觉骨干网络（预训练）
+        if hasattr(model, 'vision_backbone') and model.vision_backbone is not None:
+            param_groups.append({
+                'params': model.vision_backbone.parameters(),
+                'lr': base_lr * lr_multipliers['backbone'],
+                'weight_decay': weight_decay,
+                'name': 'backbone'
+            })
+        
+        # 2. CLIP适配器（如果使用CLIP）
+        if hasattr(model, 'clip_adapter') and model.clip_adapter is not None:
+            # CLIP的backbone部分（冻结）
+            clip_backbone_params = list(model.clip_adapter.clip_model.parameters())
+            if clip_backbone_params:  # 虽然冻结了，但保险起见
+                param_groups.append({
+                    'params': clip_backbone_params,
+                    'lr': 0.0,  # 冻结
+                    'weight_decay': 0.0,
+                    'name': 'clip_backbone'
+                })
+            
+            # CLIP的适配器部分
+            adapter_params = list(model.clip_adapter.visual_adapter.parameters()) + \
+                           list(model.clip_adapter.text_adapter.parameters())
+            if adapter_params:
+                param_groups.append({
+                    'params': adapter_params,
+                    'lr': base_lr * lr_multipliers['adapters'],
+                    'weight_decay': weight_decay,
+                    'name': 'clip_adapters'
+                })
+        
+        # 3. 文本编码器（如果不使用CLIP）
+        if hasattr(model, 'text_encoder') and model.text_encoder is not None:
+            param_groups.append({
+                'params': model.text_encoder.parameters(),
+                'lr': base_lr * lr_multipliers['text_encoder'],
+                'weight_decay': weight_decay * 0.1,  # 文本编码器用更小的weight decay
+                'name': 'text_encoder'
+            })
+        
+        # 4. 模态适配器
+        if hasattr(model, 'modality_adapters') and model.modality_adapters:
+            adapter_params = []
+            for adapter in model.modality_adapters.values():
+                adapter_params.extend(list(adapter.parameters()))
+            if adapter_params:
+                param_groups.append({
+                    'params': adapter_params,
+                    'lr': base_lr * lr_multipliers['adapters'],
+                    'weight_decay': weight_decay,
+                    'name': 'modality_adapters'
+                })
+        
+        # 5. 融合模块
+        if hasattr(model, 'fusion_module'):
+            param_groups.append({
+                'params': model.fusion_module.parameters(),
+                'lr': base_lr * lr_multipliers['fusion'],
+                'weight_decay': weight_decay,
+                'name': 'fusion_module'
+            })
+        
+        # 6. 分类和检索头（新增模块，需要更大学习率）
+        head_params = []
+        if hasattr(model, 'classifier'):
+            head_params.extend(list(model.classifier.parameters()))
+        if hasattr(model, 'feature_projection'):
+            head_params.extend(list(model.feature_projection.parameters()))
+        if hasattr(model, 'bnneck'):
+            head_params.extend(list(model.bnneck.parameters()))
+        
+        if head_params:
+            param_groups.append({
+                'params': head_params,
+                'lr': base_lr * lr_multipliers['heads'],
+                'weight_decay': weight_decay,
+                'name': 'heads'
+            })
+        
+        # 7. 其他未分类的参数（文本投影等）
+        classified_params = set()
+        for group in param_groups:
+            for param in group['params']:
+                classified_params.add(id(param))
+        
+        other_params = []
+        for name, param in model.named_parameters():
+            if id(param) not in classified_params and param.requires_grad:
+                other_params.append(param)
+        
+        if other_params:
+            param_groups.append({
+                'params': other_params,
+                'lr': base_lr,
+                'weight_decay': weight_decay,
+                'name': 'others'
+            })
+        
+        return param_groups
+    
+    # 创建分组参数优化器
+    param_groups = get_parameter_groups(model, config)
+    optimizer = AdamW(param_groups)
+    
+    # 打印参数组信息
+    logging.info("优化器参数组设置:")
+    for i, group in enumerate(param_groups):
+        num_params = sum(p.numel() for p in group['params'])
+        logging.info(f"  {group['name']}: LR={group['lr']:.2e}, 参数量={num_params:,}")
     
     # 混合精度训练
     scaler = GradScaler('cuda') if device.type == 'cuda' else None

@@ -46,6 +46,13 @@ class TrainingConfig:
     warmup_epochs: int = 5      # 预训练模型收敛更快，减少warmup
     scheduler: str = "cosine"
     
+    # 分层学习率设置（基于base learning_rate的倍数）
+    backbone_lr_mult: float = 0.1      # 预训练骨干：10%基础学习率
+    text_lr_mult: float = 0.1          # 文本编码器：10%基础学习率
+    fusion_lr_mult: float = 1.0        # 融合模块：100%基础学习率
+    heads_lr_mult: float = 2.0         # 分类/检索头：200%基础学习率
+    adapters_lr_mult: float = 1.5      # 模态适配器：150%基础学习率
+    
     # 损失权重 - 重新平衡 
     ce_weight: float = 1.0
     contrastive_weight: float = 0.05  # 预训练模型可以使用小权重对比损失
@@ -69,7 +76,7 @@ class TrainingConfig:
     save_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     save_freq: int = 20
-    eval_freq: int = 30  # 降低评估频率，从每10轮改为每20轮（训练时不再使用）
+    eval_freq: int = 10  # 降低评估频率，从每10轮改为每20轮（训练时不再使用）
     eval_sample_ratio: float = 0.3  # 采样评估，只用30%数据进行快速mAP估算（训练时不再使用）
     
     # 早停和优化参数  
