@@ -64,21 +64,19 @@ class ModalityAdapter(nn.Module):
 
 
 class CrossModalTransformerBlock(nn.Module):
-    """跨模态 Transformer 块（Pre-LN 风格，更稳）"""
+    """跨模态 Transformer 块（Post-LN 风格，小数据集更优）"""
     def __init__(self, embed_dim, num_heads=8, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.embed_dim = embed_dim
 
-        self.cross_norm_q = nn.LayerNorm(embed_dim)
-        self.cross_norm_kv = nn.LayerNorm(embed_dim)
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
+        self.cross_norm = nn.LayerNorm(embed_dim)
         self.cross_scale = LayerScale(embed_dim)
 
-        self.self_norm = nn.LayerNorm(embed_dim)
         self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
+        self.self_norm = nn.LayerNorm(embed_dim)
         self.self_scale = LayerScale(embed_dim)
 
-        self.ffn_norm = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
             nn.GELU(),
@@ -86,23 +84,20 @@ class CrossModalTransformerBlock(nn.Module):
             nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
             nn.Dropout(proj_drop),
         )
+        self.ffn_norm = nn.LayerNorm(embed_dim)
         self.ffn_scale = LayerScale(embed_dim)
 
     def forward(self, query, key_value, key_padding_mask: Optional[torch.Tensor] = None):
-        # Cross-Attn
-        q = self.cross_norm_q(query)
-        kv = self.cross_norm_kv(key_value)
-        cross_out, _ = self.cross_attn(q, kv, kv, key_padding_mask=key_padding_mask)  # (B,1,C)
-        x = query + self.cross_scale(cross_out)
+        # Cross-Attn: Attention → Add → LayerNorm
+        cross_out, _ = self.cross_attn(query, key_value, key_value, key_padding_mask=key_padding_mask)
+        x = self.cross_norm(query + self.cross_scale(cross_out))
 
-        # Self-Attn
-        y = self.self_norm(x)
-        self_out, _ = self.self_attn(y, y, y)
-        x = x + self.self_scale(self_out)
+        # Self-Attn: Attention → Add → LayerNorm  
+        self_out, _ = self.self_attn(x, x, x)
+        x = self.self_norm(x + self.self_scale(self_out))
 
-        # FFN
-        z = self.ffn_norm(x)
-        x = x + self.ffn_scale(self.mlp(z))
+        # FFN: MLP → Add → LayerNorm
+        x = self.ffn_norm(x + self.ffn_scale(self.mlp(x)))
         return x
 
 
