@@ -3,7 +3,7 @@ import os
 import time
 import math
 import random
-import pickle
+# 删除pickle导入，不再需要保存数据集划分
 import logging
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -20,7 +20,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR
 from torch.amp import autocast, GradScaler
 
-from sklearn.model_selection import train_test_split
+# 删除sklearn导入，不再需要训练集划分
 
 # === 你项目里的数据与模型 ===
 from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn
@@ -111,28 +111,8 @@ def compute_cmc(query_features, gallery_features, query_labels, gallery_labels, 
 
 
 # ------------------------------
-# 训练/验证数据划分
+# 注意：已删除训练集划分逻辑，使用全部训练数据
 # ------------------------------
-def split_train_dataset(dataset, val_ratio=0.2, seed=42):
-    """
-    基于“每个 index 就是一个身份”的数据设定：
-    - person_ids 直接来自 dataset.data_list[i]['person_id']
-    - 确保同一身份不会跨集合
-    """
-    person_ids = [dataset.data_list[i]['person_id'] for i in range(len(dataset))]
-    person_ids = sorted(list(set(person_ids)))
-    train_ids, val_ids = train_test_split(person_ids, test_size=val_ratio, random_state=seed)
-
-    train_indices, val_indices = [], []
-    for i, sample in enumerate(dataset.data_list):
-        if sample['person_id'] in train_ids:
-            train_indices.append(i)
-        else:
-            val_indices.append(i)
-
-    logging.info(f"训练集: {len(train_ids)} 个身份, {len(train_indices)} 个索引")
-    logging.info(f"本地划分验证集: {len(val_ids)} 个身份, {len(val_indices)} 个索引")
-    return train_indices, val_indices, train_ids, val_ids
 
 
 # ------------------------------
@@ -530,33 +510,17 @@ def train_multimodal_reid():
 
     setup_logging(getattr(config, "log_dir", "./logs"))
 
-    # 先加载全量，只用于身份统计与划分  
-    logging.info("加载完整数据集用于身份划分...")
-    full_dataset = MultiModalDataset(config, split='train')
-
-    train_indices, val_indices, train_ids, val_ids = split_train_dataset(
-        full_dataset,
-        val_ratio=getattr(config, "val_ratio", 0.2),
-        seed=getattr(config, "seed", 42)
-    )
-
-    # ☆ 修复：使用统一的person_ids确保标签映射一致
-    all_person_ids = sorted(train_ids + val_ids)  # 统一的person_id到label映射
-    logging.info("创建训练数据集...")
-    train_dataset = MultiModalDataset(config, split='train', person_ids=all_person_ids)
-    train_dataset._suppress_print = True  # 抑制重复打印
+    # 加载完整训练数据集，不进行划分
+    logging.info("加载完整训练数据集...")
+    train_dataset = MultiModalDataset(config, split='train')
     
-    logging.info("创建本地划分验证数据集...")  
-    local_val_dataset = MultiModalDataset(config, split='train', person_ids=all_person_ids)  # 都用train split但不同person_ids
-    local_val_dataset._suppress_print = True  # 抑制重复打印
+    # 输出数据集统计
+    all_person_ids = sorted(list(set([item['person_id'] for item in train_dataset.data_list])))
+    logging.info(f"训练集: {len(all_person_ids)} 个身份, {len(train_dataset.data_list)} 个样本")
     
-    # 手动过滤数据：只保留对应集合的样本
-    train_dataset.data_list = [item for item in train_dataset.data_list if item['person_id'] in train_ids]
-    local_val_dataset.data_list = [item for item in local_val_dataset.data_list if item['person_id'] in val_ids]
-    
-    # 输出实际的样本统计
-    logging.info(f"修复后 - 训练集: {len(train_ids)} 个身份, {len(train_dataset.data_list)} 个样本")
-    logging.info(f"修复后 - 本地划分验证集: {len(val_ids)} 个身份, {len(local_val_dataset.data_list)} 个样本")
+    # 不使用本地验证集，设为None
+    local_val_dataset = None
+    logging.info("已删除训练集划分逻辑，使用全部训练数据进行训练")
 
     # 更新类别数为全部身份数（确保标签映射正确）
     config.num_classes = len(all_person_ids)
@@ -577,13 +541,9 @@ def train_multimodal_reid():
         collate_fn=compatible_collate_fn
     )
 
-    # 本地验证（赛制对齐）DataLoader
-    gallery_loader, query_loaders = build_eval_loaders_by_rule(
-        local_val_dataset, list(range(len(local_val_dataset))),
-        batch_size=effective_batch_size,
-        num_workers=getattr(config, "num_workers", 4),
-        pin_memory=getattr(config, "pin_memory", True)
-    )
+    # 不使用本地验证集，设置为None
+    gallery_loader, query_loaders = None, None
+    logging.info("跳过本地验证数据加载器构建")
 
 
     # 模型
@@ -601,103 +561,138 @@ def train_multimodal_reid():
     else:
         logging.info("使用全精度训练")
 
-    # 学习率调度器
+    # 学习率调度器（含warmup）
+    warmup_epochs = getattr(config, "warmup_epochs", 5)
+    total_epochs = getattr(config, "num_epochs", 100)
     scheduler_type = getattr(config, "scheduler", "cosine")
+    
     if scheduler_type == 'cosine':
-        scheduler = CosineAnnealingLR(optimizer, T_max=getattr(config, "num_epochs", 100), eta_min=1e-6)
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
     elif scheduler_type == 'step':
         scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
     elif scheduler_type == 'multistep':
         scheduler = MultiStepLR(optimizer, milestones=[40, 70, 90], gamma=0.1)
     else:
         scheduler = None
+    
+    # 记录初始学习率
+    initial_lr = optimizer.param_groups[0]['lr']
+    logging.info(f"初始学习率: {initial_lr}, Warmup轮数: {warmup_epochs}")
 
     # 训练循环
-    best_map = 0.0
-    train_history, val_history = [], []
+    best_loss = float('inf')
+    train_history = []
     num_epochs = getattr(config, "num_epochs", 100)
     eval_freq = getattr(config, "eval_freq", 1)
     save_dir = getattr(config, "save_dir", "./checkpoints")
     os.makedirs(save_dir, exist_ok=True)
+    
+    # 早停参数 - 基于多指标组合判断
+    patience = getattr(config, "patience", 15)  # 15轮不改善就停止
+    patience_counter = 0
+    best_combined_score = float('-inf')  # 组合分数，越高越好
+    
+    # 早停策略：平衡训练效果和过拟合风险
+    loss_weight = 0.6  # 训练损失权重
+    acc_weight = 0.3   # 分类准确率权重  
+    stability_weight = 0.1  # 训练稳定性权重
 
     for epoch in range(1, num_epochs + 1):
         start_time = time.time()
 
+        # Warmup学习率调整
+        if epoch <= warmup_epochs:
+            warmup_factor = epoch / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = initial_lr * warmup_factor
+
         train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler)
 
-        if epoch % eval_freq == 0:
-            # 使用采样评估进行快速性能估算（本地划分验证集）
-            sample_ratio = getattr(config, "eval_sample_ratio", 0.3)
-            comp_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=sample_ratio)
-
-            train_history.append({'epoch': epoch, **train_metrics})
-            val_history.append({'epoch': epoch, **comp_metrics})
-
-            score = comp_metrics['map_avg4']
-            if score > best_map:
-                best_map = score
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, best_map, config,
-                    os.path.join(save_dir, 'best_model.pth')
-                )
-                logging.info(f"新的最佳(四类平均) mAP: {best_map:.4f}")
-
-            logging.info(
-                f"Epoch {epoch}/{num_epochs} - "
-                f"Train ClsAcc: {train_metrics['accuracy']:.2f}% - "
-                f"mAP(single/double/triple/quad/avg4): "
-                f"{comp_metrics['map_single']:.4f}/"
-                f"{comp_metrics['map_double']:.4f}/"
-                f"{comp_metrics['map_triple']:.4f}/"
-                f"{comp_metrics['map_quad']:.4f}/"
-                f"{comp_metrics['map_avg4']:.4f} - "
-                f"CMC@1/5/10: {comp_metrics['cmc1']:.4f}/"
-                f"{comp_metrics['cmc5']:.4f}/"
-                f"{comp_metrics['cmc10']:.4f} - "
-                f"用时: {time.time() - start_time:.2f}s"
-            )
-
-        # 定期保存 checkpoint
-        if epoch % getattr(config, "save_freq", 10) == 0:
+        # 记录训练历史
+        train_history.append({'epoch': epoch, **train_metrics})
+        
+        # 计算组合评估分数（防止过拟合）
+        current_loss = train_metrics['total_loss']
+        current_acc = train_metrics['accuracy']
+        
+        # 计算训练稳定性（基于最近几轮的损失方差）
+        recent_losses = [train_history[i]['total_loss'] for i in range(max(0, len(train_history)-4), len(train_history))]
+        stability_score = 1.0 / (1.0 + np.var(recent_losses)) if len(recent_losses) > 1 else 1.0
+        
+        # 组合分数：平衡训练效果和稳定性
+        combined_score = (
+            loss_weight * (1.0 / (1.0 + current_loss)) +  # 损失越低越好，转换为正向分数
+            acc_weight * (current_acc / 100.0) +           # 准确率越高越好
+            stability_weight * stability_score              # 稳定性越好越好
+        )
+        
+        # 检查是否是最佳模型
+        if combined_score > best_combined_score:
+            best_combined_score = combined_score
+            best_loss = current_loss  # 保持兼容性
+            patience_counter = 0
+            # 保存最佳模型
             save_checkpoint(
-                model, optimizer, scheduler, epoch, best_map, config,
+                model, optimizer, scheduler, epoch, current_loss, config,
+                os.path.join(save_dir, 'best_model.pth')
+            )
+            logging.info(f"新的最佳组合分数: {combined_score:.4f} (Loss: {current_loss:.4f}, Acc: {current_acc:.2f}%)，已保存最佳模型")
+        else:
+            patience_counter += 1
+        
+        # 定期保存检查点
+        save_freq = getattr(config, "save_freq", 20)
+        if epoch % save_freq == 0:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, current_loss, config,
                 os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
             )
+            logging.info(f"已保存第{epoch}轮检查点")
 
-        if scheduler:
+        # 过拟合检测
+        overfitting_warning = ""
+        if epoch > 10:  # 前10轮跳过检测
+            recent_acc = [train_history[i]['accuracy'] for i in range(max(0, len(train_history)-5), len(train_history))]
+            if len(recent_acc) >= 5 and current_acc > 95.0 and np.std(recent_acc) < 0.1:
+                overfitting_warning = " [可能过拟合]"
+        
+        logging.info(
+            f"Epoch {epoch}/{num_epochs} - "
+            f"Train Loss: {train_metrics['total_loss']:.4f} - "
+            f"Train ClsAcc: {train_metrics['accuracy']:.2f}% - "
+            f"ConLoss: {train_metrics['contrastive_loss']:.4f} - "
+            f"CombScore: {combined_score:.4f} - "
+            f"用时: {time.time() - start_time:.2f}s{overfitting_warning}"
+        )
+
+        # 只在warmup结束后使用学习率调度器
+        if scheduler and epoch > warmup_epochs:
             scheduler.step()
+            
+        # 记录当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        if epoch <= 5 or epoch % 10 == 0:  # 前5轮和每10轮记录学习率
+            logging.info(f"Epoch {epoch} - 当前学习率: {current_lr:.2e}")
+        
+        # 早停检查
+        if patience_counter >= patience:
+            logging.info(f"组合评估分数在 {patience} 轮内没有改善，触发早停")
+            logging.info(f"最佳组合分数: {best_combined_score:.4f}，对应训练损失: {best_loss:.4f}")
+            break
 
-    # 训练结束后进行完整评估（本地划分验证集）
-    logging.info("训练完成，开始本地划分验证集的完整评估...")
-    final_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0)
-    logging.info(f"本地划分验证集最终评估 - mAP(single/double/triple/quad/avg4): "
-                f"{final_metrics['map_single']:.4f}/"
-                f"{final_metrics['map_double']:.4f}/"
-                f"{final_metrics['map_triple']:.4f}/"
-                f"{final_metrics['map_quad']:.4f}/"
-                f"{final_metrics['map_avg4']:.4f}")
+    # 训练完成，保存最终模型
+    logging.info("训练完成，保存最终模型...")
+    save_checkpoint(
+        model, optimizer, scheduler, num_epochs, 0.0, config,
+        os.path.join(save_dir, 'final_model.pth')
+    )
 
     # 保存训练历史
     log_dir = getattr(config, "log_dir", "./logs")
     os.makedirs(log_dir, exist_ok=True)
     pd.DataFrame(train_history).to_csv(os.path.join(log_dir, 'train_history.csv'), index=False)
-    pd.DataFrame(val_history).to_csv(os.path.join(log_dir, 'local_val_history.csv'), index=False)
-    
-    # 保存最终评估结果
-    final_results = {'epoch': 'final', **final_metrics}
-    pd.DataFrame([final_results]).to_csv(os.path.join(log_dir, 'local_val_final_evaluation.csv'), index=False)
 
-    # 保存划分
-    split_info = {
-        'train_ids': train_ids,
-        'val_ids': val_ids,
-        'train_indices': train_indices,
-        'val_indices': val_indices
-    }
-    with open(os.path.join(save_dir, 'dataset_split.pkl'), 'wb') as f:
-        pickle.dump(split_info, f)
-
-    logging.info(f"训练完成. 本地划分验证集最佳(四类平均) mAP: {best_map:.4f}")
+    logging.info(f"训练完成. 最终模型已保存到: {os.path.join(save_dir, 'final_model.pth')}")
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, best_map, config, filename):

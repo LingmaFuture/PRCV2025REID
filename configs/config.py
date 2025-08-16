@@ -64,8 +64,11 @@ class TrainingConfig:
     save_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     save_freq: int = 20
-    eval_freq: int = 30  # 降低评估频率，从每10轮改为每20轮
-    eval_sample_ratio: float = 0.3  # 采样评估，只用30%数据进行快速mAP估算
+    eval_freq: int = 30  # 降低评估频率，从每10轮改为每20轮（训练时不再使用）
+    eval_sample_ratio: float = 0.3  # 采样评估，只用30%数据进行快速mAP估算（训练时不再使用）
+    
+    # 早停和优化参数  
+    patience: int = 15  # 早停耐心，组合分数15轮不改善就停止（防止过拟合）
     
     # 验证和推理相关配置
     inference_batch_size: int = 32
