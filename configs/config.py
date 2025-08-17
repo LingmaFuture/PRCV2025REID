@@ -28,32 +28,37 @@ class TrainingConfig:
     freeze_text: bool = False  # 启用文本编码器微调提升跨模态对齐
     
     image_size: int = 224  # 匹配ViT模型要求的输入尺寸
-    feature_dim: int = 2048  # ResNet50特征维度
+    feature_dim: int = 2048  # ResNet50特征维度（兼容保留）
     hidden_dim: int = 512  
-    num_classes: int = 999
+    # num_classes 将在训练时根据实际训练集ID数量动态设置
     dropout_rate: float = 0.5  # 增强dropout
     
     # 训练相关 - 预训练模型微调超参数 (优化后)
-    batch_size: int = 32  # 增大批次提升训练稳定性
+    batch_size: int = 32
     num_epochs: int = 150
-    learning_rate: float = 5e-4  # 提升学习率配合warmup加速收敛
-    weight_decay: float = 1e-4  # 降低正则化避免过度约束预训练特征
-    warmup_epochs: int = 15     # 延长warmup稳定大学习率训练
+    learning_rate: float = 3e-4  # 降低基础学习率以稳定对比学习
+    weight_decay: float = 1e-4
+    warmup_epochs: int = 15
     scheduler: str = "cosine"
     
-    # 损失权重 - 重新平衡 (优化后)
+    # 调度器与稳定性
+    conservative_factor: float = 0.7
+    adaptive_gradient_clip: bool = True
+    stability_monitoring: bool = True
+    
+    # 损失权重（进一步降低对比损失权重以提高稳定性）
     ce_weight: float = 1.0
-    contrastive_weight: float = 0.1  # 增加对比损失权重强化特征判别性
+    contrastive_weight: float = 0.02  # 进一步降低以避免后期不稳定
     
-    # 数据增强 - 适度增强（预训练模型更稳定）
+    # 数据增强
     random_flip: bool = True
-    random_crop: bool = True  # 重新启用随机裁剪
+    random_crop: bool = True
     color_jitter: bool = True
-    random_erase: float = 0.3  # 适度随机擦除
+    random_erase: float = 0.3
     
-    # 模态dropout - 适度泛化
-    modality_dropout: float = 0.3  # 适度dropout
-    min_modalities: int = 1  # 允许单模态训练
+    # 模态dropout（降低以提高特征稳定性）
+    modality_dropout: float = 0.15
+    min_modalities: int = 1
     
     # 设备和并行
     device: str = "cuda"
@@ -64,8 +69,8 @@ class TrainingConfig:
     save_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     save_freq: int = 20
-    eval_freq: int = 10  # 降低评估频率，从每10轮改为每20轮
-    eval_sample_ratio: float = 0.3  # 采样评估，只用30%数据进行快速mAP估算
+    eval_freq: int = 20  # 与注释一致：每20轮评估一次
+    eval_sample_ratio: float = 0.3  # 采样评估比例（mAP快速估算）
     
     # 验证和推理相关配置
     inference_batch_size: int = 32
