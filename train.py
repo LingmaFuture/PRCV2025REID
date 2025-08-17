@@ -530,8 +530,8 @@ def train_multimodal_reid():
 
     setup_logging(getattr(config, "log_dir", "./logs"))
 
-    # 先加载全量，只用于身份统计与划分  
-    logging.info("加载完整数据集用于身份划分...")
+    # 加载完整数据集并进行身份划分
+    logging.info("加载数据集并进行身份划分...")
     full_dataset = MultiModalDataset(config, split='train')
 
     train_indices, val_indices, train_ids, val_ids = split_train_dataset(
@@ -540,19 +540,24 @@ def train_multimodal_reid():
         seed=getattr(config, "seed", 42)
     )
 
-    # ☆ 修复：使用统一的person_ids确保标签映射一致
-    all_person_ids = sorted(train_ids + val_ids)  # 统一的person_id到label映射
-    logging.info("创建训练数据集...")
-    train_dataset = MultiModalDataset(config, split='train', person_ids=all_person_ids)
-    train_dataset._suppress_print = True  # 抑制重复打印
+    # 使用统一的person_ids确保标签映射一致
+    all_person_ids = sorted(train_ids + val_ids)
     
-    logging.info("创建本地划分验证数据集...")  
-    local_val_dataset = MultiModalDataset(config, split='train', person_ids=all_person_ids)  # 都用train split但不同person_ids
-    local_val_dataset._suppress_print = True  # 抑制重复打印
+    # 直接基于已加载的数据集创建训练和验证集，避免重复加载
+    logging.info("创建训练和验证数据集...")
     
-    # 手动过滤数据：只保留对应集合的样本
-    train_dataset.data_list = [item for item in train_dataset.data_list if item['person_id'] in train_ids]
-    local_val_dataset.data_list = [item for item in local_val_dataset.data_list if item['person_id'] in val_ids]
+    # 重新设置person_ids映射
+    full_dataset.person_ids = all_person_ids
+    full_dataset.pid2label = {pid: i for i, pid in enumerate(all_person_ids)}
+    
+    # 创建训练集：直接过滤数据
+    train_dataset = full_dataset
+    train_dataset.data_list = [item for item in full_dataset.data_list if item['person_id'] in train_ids]
+    
+    # 创建验证集：复制配置但使用不同的数据
+    from copy import deepcopy
+    local_val_dataset = deepcopy(full_dataset)
+    local_val_dataset.data_list = [item for item in full_dataset.data_list if item['person_id'] in val_ids]
     
     # 输出实际的样本统计
     logging.info(f"修复后 - 训练集: {len(train_ids)} 个身份, {len(train_dataset.data_list)} 个样本")
@@ -589,10 +594,34 @@ def train_multimodal_reid():
     # 模型
     model = MultiModalReIDModel(config).to(device)
 
-    # 优化器
-    optimizer = AdamW(model.parameters(),
-                      lr=getattr(config, "learning_rate", 3e-4),
-                      weight_decay=getattr(config, "weight_decay", 1e-4))
+    # 优化器 - 为文本编码器设置差异化学习率
+    base_lr = getattr(config, "learning_rate", 3e-4)
+    text_lr = base_lr * 0.1  # 文本编码器使用更小的学习率进行微调
+    
+    # 分组参数：文本编码器使用较小学习率
+    param_groups = []
+    
+    # 文本编码器参数
+    text_params = []
+    for name, param in model.named_parameters():
+        if 'text_encoder' in name:
+            text_params.append(param)
+    
+    # 其他参数  
+    other_params = []
+    for name, param in model.named_parameters():
+        if 'text_encoder' not in name:
+            other_params.append(param)
+    
+    if text_params:
+        param_groups.append({'params': text_params, 'lr': text_lr})
+        logging.info(f"文本编码器学习率: {text_lr}")
+    
+    if other_params:
+        param_groups.append({'params': other_params, 'lr': base_lr})
+        logging.info(f"其他模块学习率: {base_lr}")
+    
+    optimizer = AdamW(param_groups, weight_decay=getattr(config, "weight_decay", 1e-4))
     
     # 混合精度训练
     scaler = GradScaler('cuda') if device.type == 'cuda' else None
@@ -601,10 +630,20 @@ def train_multimodal_reid():
     else:
         logging.info("使用全精度训练")
 
-    # 学习率调度器
+    # 学习率调度器 - 添加warmup支持
+    warmup_epochs = getattr(config, "warmup_epochs", 0)
     scheduler_type = getattr(config, "scheduler", "cosine")
+    
     if scheduler_type == 'cosine':
-        scheduler = CosineAnnealingLR(optimizer, T_max=getattr(config, "num_epochs", 100), eta_min=1e-6)
+        # 带warmup的余弦退火调度器
+        from torch.optim.lr_scheduler import LinearLR, SequentialLR
+        if warmup_epochs > 0:
+            warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+            cosine_scheduler = CosineAnnealingLR(optimizer, T_max=getattr(config, "num_epochs", 100) - warmup_epochs, eta_min=1e-6)
+            scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+            logging.info(f"启用Warmup调度器: {warmup_epochs} epochs warmup + cosine annealing")
+        else:
+            scheduler = CosineAnnealingLR(optimizer, T_max=getattr(config, "num_epochs", 100), eta_min=1e-6)
     elif scheduler_type == 'step':
         scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
     elif scheduler_type == 'multistep':

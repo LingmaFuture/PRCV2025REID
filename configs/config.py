@@ -25,7 +25,7 @@ class TrainingConfig:
 
     # 文本模型配置
     text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
-    freeze_text: bool = True
+    freeze_text: bool = False  # 启用文本编码器微调提升跨模态对齐
     
     image_size: int = 224  # 匹配ViT模型要求的输入尺寸
     feature_dim: int = 2048  # ResNet50特征维度
@@ -33,17 +33,17 @@ class TrainingConfig:
     num_classes: int = 999
     dropout_rate: float = 0.5  # 增强dropout
     
-    # 训练相关 - 预训练模型微调超参数
-    batch_size: int = 16  # 降低批次大小，增加泛化
+    # 训练相关 - 预训练模型微调超参数 (优化后)
+    batch_size: int = 32  # 增大批次提升训练稳定性
     num_epochs: int = 150
-    learning_rate: float = 2e-5  # 预训练模型需要更小学习率
-    weight_decay: float = 5e-3  # 适度正则化
-    warmup_epochs: int = 5      # 预训练模型收敛更快，减少warmup
+    learning_rate: float = 5e-4  # 提升学习率配合warmup加速收敛
+    weight_decay: float = 1e-4  # 降低正则化避免过度约束预训练特征
+    warmup_epochs: int = 15     # 延长warmup稳定大学习率训练
     scheduler: str = "cosine"
     
-    # 损失权重 - 重新平衡 
+    # 损失权重 - 重新平衡 (优化后)
     ce_weight: float = 1.0
-    contrastive_weight: float = 0.05  # 预训练模型可以使用小权重对比损失
+    contrastive_weight: float = 0.1  # 增加对比损失权重强化特征判别性
     
     # 数据增强 - 适度增强（预训练模型更稳定）
     random_flip: bool = True
