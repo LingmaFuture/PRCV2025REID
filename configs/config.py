@@ -50,6 +50,11 @@ class TrainingConfig:
     ce_weight: float = 1.0
     contrastive_weight: float = 0.02  # 进一步降低以避免后期不稳定
     
+    # 特征范数正则化参数（控制融合特征范数，提高训练稳定性）
+    feature_target_norm: float = 10.0    # 目标特征范数
+    feature_norm_band: float = 4.0       # 容忍带宽
+    feature_norm_penalty: float = 1e-3   # 正则化权重（保守设置）
+    
     # 数据增强
     random_flip: bool = True
     random_crop: bool = True

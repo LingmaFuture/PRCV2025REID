@@ -130,8 +130,7 @@ def split_train_dataset(dataset, val_ratio=0.2, seed=42):
         else:
             val_indices.append(i)
 
-    logging.info(f"训练集: {len(train_ids)} 个身份, {len(train_indices)} 个索引")
-    logging.info(f"本地划分验证集: {len(val_ids)} 个身份, {len(val_indices)} 个索引")
+
     return train_indices, val_indices, train_ids, val_ids
 
 # ------------------------------
@@ -391,17 +390,25 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         labels = batch['person_id']
 
         optimizer.zero_grad(set_to_none=True)
-        # === 对比损失 warmup：前 warmup_epochs//2 直接置 0 ===
-        contrastive_warmup = max(1, getattr(model.config, "warmup_epochs", 15) // 2)
-        effective_cont_w = 0.0 if epoch <= contrastive_warmup else getattr(model.config, "contrastive_weight", 0.02)
+        # === 对比损失"真·关掉"更久 + 平滑拉起 ===
+        cont_max = getattr(model.config, "contrastive_weight", 0.02)
+        if epoch <= 10:
+            effective_cont_w = 0.0
+        elif 11 <= epoch <= 20:
+            # 线性升温：11->0.004, 20->cont_max
+            t = (epoch - 10) / 10.0
+            effective_cont_w = max(0.002, cont_max * t)
+        else:
+            effective_cont_w = cont_max
 
         with autocast(device_type='cuda', enabled=use_amp):
             outputs = model(batch)
             loss_dict = model.compute_loss(outputs, labels)
             
-            # 对比损失监控（数值稳定性检查）
+            # 对比损失监控（仅在实际参与训练时警告）
             cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
-            if cont_loss.item() > 1.5:  # 降低阈值，更早期检测异常
+            # 只有当对比损失真正参与训练时（权重>0）才显示警告
+            if effective_cont_w > 0.0 and cont_loss.item() > 1.5:  
                 original_cont = cont_loss.item()
                 if batch_idx < 5:  # 只在前几个batch报告，避免日志过多
                     logging.info(f"Epoch {epoch}, Batch {batch_idx}: 对比损失较高 {original_cont:.3f}")
@@ -433,127 +440,89 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         if batch_idx > 0 and current_loss > total_loss / batch_idx * 1.5:
             loss_spikes += 1
         
-    # 计算梯度
-    if use_amp:
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        # 计算梯度（移回循环内部）
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            _sanitize_grads(model)
 
-        # >>> PATCH: backward 之后、clip 之前 —— 净化并稳健统计 GradNorm
-        _sanitize_grads(model)
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.detach().data.norm(2)
+                    if torch.isfinite(param_norm):
+                        total_norm += param_norm.item() ** 2
+            total_norm = math.sqrt(total_norm)
+            grad_norms.append(float(total_norm))
 
-        total_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.detach().data.norm(2)
-                if torch.isfinite(param_norm):
-                    total_norm += param_norm.item() ** 2
-        total_norm = math.sqrt(total_norm)
-        grad_norms.append(float(total_norm))
-        # <<< PATCH END
-
-        # 原有的自适应裁剪逻辑照常
-        if adaptive_clip:
-            if len(grad_norms) > 10:
-                recent_norms = grad_norms[-10:]
-                adaptive_max_norm = min(5.0, max(0.5, np.percentile(recent_norms, 75) * 1.2))
+            # 自适应梯度裁剪（收紧上限提升稳定性）
+            if adaptive_clip:
+                if len(grad_norms) > 10:
+                    recent_norms = grad_norms[-10:]
+                    adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
+                else:
+                    adaptive_max_norm = 1.0
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
             else:
-                adaptive_max_norm = 1.0
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            loss.backward()
+            _sanitize_grads(model)
 
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        loss.backward()
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.detach().data.norm(2)
+                    if torch.isfinite(param_norm):
+                        total_norm += param_norm.item() ** 2
+            total_norm = math.sqrt(total_norm)
+            grad_norms.append(float(total_norm))
 
-        # >>> PATCH: backward 之后、clip 之前 —— 净化并稳健统计 GradNorm
-        _sanitize_grads(model)
-
-        total_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.detach().data.norm(2)
-                if torch.isfinite(param_norm):
-                    total_norm += param_norm.item() ** 2
-        total_norm = math.sqrt(total_norm)
-        grad_norms.append(float(total_norm))
-        # <<< PATCH END
-
-        if adaptive_clip:
-            if len(grad_norms) > 10:
-                recent_norms = grad_norms[-10:]
-                adaptive_max_norm = min(5.0, max(0.5, np.percentile(recent_norms, 75) * 1.2))
+            if adaptive_clip:
+                if len(grad_norms) > 10:
+                    recent_norms = grad_norms[-10:]
+                    adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
+                else:
+                    adaptive_max_norm = 1.0
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
             else:
-                adaptive_max_norm = 1.0
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+
+        # 统计信息更新（移回循环内部）
+        total_loss += current_loss
+        ce_loss_sum += float(ce_loss.item())
+        contrastive_loss_sum += float(cont_loss.item())
+
+        if isinstance(outputs, dict) and 'logits' in outputs:
+            _, predicted = outputs['logits'].max(1)
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        
+        if isinstance(outputs, dict) and 'reid_features_raw' in outputs:
+            norms = torch.norm(outputs['reid_features_raw'].detach(), p=2, dim=1)
+            feature_norms.extend(norms.cpu().numpy())
+        elif isinstance(outputs, dict) and 'features' in outputs:
+            norms = torch.norm(outputs['features'].detach(), p=2, dim=1)
+            feature_norms.extend(norms.cpu().numpy())
 
-        optimizer.step()
+        avg_norm = np.mean(feature_norms) if feature_norms else 0.0
+        avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
 
-
-    # >>> PATCH: backward 之后、clip 之前 —— 净化并稳健统计 GradNorm
-    _sanitize_grads(model)
-
-    total_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.detach().data.norm(2)
-            if torch.isfinite(param_norm):
-                total_norm += param_norm.item() ** 2
-    total_norm = math.sqrt(total_norm)
-    grad_norms.append(float(total_norm))
-    # <<< PATCH END
-
-    # 自适应梯度裁剪
-    if adaptive_clip:
-        if len(grad_norms) > 10:
-            recent_norms = grad_norms[-10:]
-            adaptive_max_norm = min(5.0, max(0.5, np.percentile(recent_norms, 75) * 1.2))
-        else:
-            adaptive_max_norm = 1.0
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
-    else:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-    # 更新参数
-    if use_amp:
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
-
-    # 统计信息更新
-    total_loss += current_loss
-    ce_loss_sum += float(ce_loss.item())
-    contrastive_loss_sum += float(cont_loss.item())
-
-    if isinstance(outputs, dict) and 'logits' in outputs:
-        _, predicted = outputs['logits'].max(1)
-    else:
-        _, predicted = outputs.max(1)
-    total += labels.size(0)
-    correct += predicted.eq(labels).sum().item()
-    
-    if isinstance(outputs, dict) and 'reid_features_raw' in outputs:
-        norms = torch.norm(outputs['reid_features_raw'].detach(), p=2, dim=1)
-        feature_norms.extend(norms.cpu().numpy())
-    elif isinstance(outputs, dict) and 'features' in outputs:
-        norms = torch.norm(outputs['features'].detach(), p=2, dim=1)
-        feature_norms.extend(norms.cpu().numpy())
-
-    avg_norm = np.mean(feature_norms) if feature_norms else 0.0
-    avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
-
-    pbar.set_postfix({
-        'Loss': f'{current_loss:.3f}',
-        'CE': f'{float(ce_loss.item()):.3f}',
-        'Cont': f'{float(cont_loss.item()):.3f}',
-        'FeatNorm': f'{avg_norm:.3f}',
-        'GradNorm': f'{avg_grad_norm:.2f}',
-        'Spikes': loss_spikes
-    })
+        pbar.set_postfix({
+            'Loss': f'{current_loss:.3f}',
+            'CE': f'{float(ce_loss.item()):.3f}',
+            'Cont': f'{float(cont_loss.item()):.3f}',
+            'FeatNorm': f'{avg_norm:.3f}',
+            'GradNorm': f'{avg_grad_norm:.2f}',
+            'Spikes': loss_spikes
+        })
 
     avg_loss = total_loss / max(1, len(dataloader))
     accuracy = 100. * correct / max(1, total)
@@ -636,8 +605,8 @@ def train_multimodal_reid():
     local_val_dataset.pid2label = pid2label
     local_val_dataset.data_list = [item for item in original_data_list if item['person_id'] in val_ids]
 
-    logging.info(f"修复后 - 训练集: {len(train_ids)} IDs, {len(train_dataset.data_list)} 样本")
-    logging.info(f"修复后 - 本地划分验证集: {len(val_ids)} IDs, {len(local_val_dataset.data_list)} 样本")
+    logging.info(f"数据集划分完成 - 训练集: {len(train_ids)} IDs, {len(train_dataset.data_list)} 样本")
+    logging.info(f"数据集划分完成 - 本地验证集: {len(val_ids)} IDs, {len(local_val_dataset.data_list)} 样本")
 
     # 分类头 num_classes（应该覆盖所有可能的person_id以避免标签超出范围）
     config.num_classes = len(all_person_ids)
@@ -755,6 +724,7 @@ def train_multimodal_reid():
                 config.contrastive_weight = new_weight
                 model.config.contrastive_weight = new_weight
                 logging.info(f"自动调整对比损失权重: {current_weight:.4f} -> {new_weight:.4f}")
+
 
         if epoch % eval_freq == 0:
             sample_ratio = getattr(config, "eval_sample_ratio", 0.3)

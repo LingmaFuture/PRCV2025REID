@@ -477,5 +477,19 @@ class MultiModalReIDModel(nn.Module):
             modal_masks=outputs.get('modality_masks', None)
         )
         contrastive_weight = getattr(self.config, 'contrastive_weight', 0.1)
-        total = ce + contrastive_weight * con
-        return {'total_loss': total, 'ce_loss': ce, 'contrastive_loss': con}
+
+        # --- 新增：特征范数正则（拉回到一个带宽内）---
+        feats = outputs['features']                      # [B, C] 这是融合后、进BNNeck前的向量
+        fn = feats.norm(p=2, dim=1)
+        target = getattr(self.config, 'feature_target_norm', 10.0)   # 可以在 config 里放个默认 10
+        band   = getattr(self.config, 'feature_norm_band', 4.0)      # 容忍带宽
+        lam    = getattr(self.config, 'feature_norm_penalty', 1e-3)  # 权重很小即可
+
+        # 只惩罚远离[target-band, target+band] 的样本（Huber-ish）
+        over = (fn - (target + band)).clamp_min(0)
+        under = ((target - band) - fn).clamp_min(0)
+        feat_penalty = (over**2 + under**2).mean() * lam
+        # -------------------------------------------
+
+        total = ce + contrastive_weight * con + feat_penalty
+        return {'total_loss': total, 'ce_loss': ce, 'contrastive_loss': con, 'feat_penalty': feat_penalty}
