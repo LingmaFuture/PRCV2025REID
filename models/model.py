@@ -1,4 +1,4 @@
-# model.py — 优化可运行版
+# models/model.py — 优化可运行版
 import math
 from typing import Dict, List, Optional, Tuple
 import contextlib

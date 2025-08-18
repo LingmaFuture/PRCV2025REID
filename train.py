@@ -365,7 +365,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
         'map_double': 0.0,  # 未测试，设为0
         'map_triple': 0.0,  # 未测试，设为0
         'map_quad': map_quad,
-        'map_avg4': map_avg2,  # 实际是single和quad的平均
+        'map_avg2': map_avg2,  # 实际是single和quad的平均
         'detail': detail,
         'cmc1': cmc1, 'cmc5': cmc5, 'cmc10': cmc10
     }
@@ -428,10 +428,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             
             loss = loss_dict['total_loss']
         
-        # 用 warmup 后的有效权重重算总损失
+        # 用 warmup 后的有效权重重算总损失（包含特征范数正则项）
         ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
         cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
-        loss = ce_loss + effective_cont_w * cont_loss
+        feat_penalty = loss_dict.get('feat_penalty', torch.tensor(0.0, device=device))
+        loss = ce_loss + effective_cont_w * cont_loss + feat_penalty
         loss_dict['total_loss'] = loss
 
         current_loss = float(loss.item())
@@ -509,21 +510,30 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         
-        if isinstance(outputs, dict) and 'reid_features_raw' in outputs:
-            norms = torch.norm(outputs['reid_features_raw'].detach(), p=2, dim=1)
-            feature_norms.extend(norms.cpu().numpy())
-        elif isinstance(outputs, dict) and 'features' in outputs:
-            norms = torch.norm(outputs['features'].detach(), p=2, dim=1)
-            feature_norms.extend(norms.cpu().numpy())
+        # 建议：同时记录两种特征范数以更好地监控训练
+        fused_norms = None
+        reid_raw_norms = None
+        if isinstance(outputs, dict):
+            if 'features' in outputs:
+                fused_norms = torch.norm(outputs['features'].detach(), p=2, dim=1)  # 被feat_penalty约束的量
+            if 'reid_features_raw' in outputs:
+                reid_raw_norms = torch.norm(outputs['reid_features_raw'].detach(), p=2, dim=1)  # 受LayerNorm影响
 
-        avg_norm = np.mean(feature_norms) if feature_norms else 0.0
+        # 使用融合特征范数更新累积统计（因为这是正则化目标）
+        if fused_norms is not None:
+            feature_norms.extend(fused_norms.cpu().numpy())
+
+        # 进度条里分两栏看更直观（显示当前batch的均值）
+        avg_fused = float(fused_norms.mean().item()) if fused_norms is not None else 0.0
+        avg_reid  = float(reid_raw_norms.mean().item()) if reid_raw_norms is not None else 0.0
         avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
 
         pbar.set_postfix({
             'Loss': f'{current_loss:.3f}',
             'CE': f'{float(ce_loss.item()):.3f}',
             'Cont': f'{float(cont_loss.item()):.3f}',
-            'FeatNorm': f'{avg_norm:.3f}',
+            'Feat(Fused)': f'{avg_fused:.2f}',
+            #'Feat(ReID)': f'{avg_reid:.2f}',
             'GradNorm': f'{avg_grad_norm:.2f}',
             'Spikes': loss_spikes
         })
