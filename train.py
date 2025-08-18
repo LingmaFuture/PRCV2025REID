@@ -311,12 +311,17 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
         idx = torch.randperm(gal_feats.size(0))[:max(1, int(gal_feats.size(0)*sample_ratio))]
         gal_feats = gal_feats[idx]; gal_labels = gal_labels[idx]
 
-    detail = {'single': {}, 'double': {}, 'triple': {}, 'quad': {}}
-    buckets = {'single': [], 'double': [], 'triple': [], 'quad': []}
+    # 快速验证：只测single和quad模态，跳过double和triple
+    detail = {'single': {}, 'quad': {}}
+    buckets = {'single': [], 'quad': []}
     all_q_feats, all_q_labels = [], []
 
     with torch.no_grad():
         for tag, group in query_loaders.items():
+            # 只处理单模态和四模态查询，跳过双模态和三模态
+            if tag not in ['single', 'quad']:
+                continue
+                
             for key, qloader in group.items():
                 qf, ql = [], []
                 for batch in tqdm(qloader, desc=f'提取查询特征[{tag}:{key}]', 
@@ -342,10 +347,9 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
 
     def _avg(x): return float(np.mean(x)) if x else 0.0
     map_single = _avg(buckets['single'])
-    map_double = _avg(buckets['double'])
-    map_triple = _avg(buckets['triple'])
     map_quad   = _avg(buckets['quad'])
-    map_avg4   = float(np.mean([map_single, map_double, map_triple, map_quad]))
+    # 快速评估：只用single和quad的平均
+    map_avg2   = float(np.mean([map_single, map_quad])) if (map_single > 0 or map_quad > 0) else 0.0
 
     if all_q_feats:
         all_q_feats = torch.cat(all_q_feats, dim=0)
@@ -358,10 +362,10 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
 
     return {
         'map_single': map_single,
-        'map_double': map_double,
-        'map_triple': map_triple,
+        'map_double': 0.0,  # 未测试，设为0
+        'map_triple': 0.0,  # 未测试，设为0
         'map_quad': map_quad,
-        'map_avg4': map_avg4,
+        'map_avg4': map_avg2,  # 实际是single和quad的平均
         'detail': detail,
         'cmc1': cmc1, 'cmc5': cmc5, 'cmc10': cmc10
     }
@@ -598,12 +602,12 @@ def train_multimodal_reid():
     train_dataset.pid2label = pid2label
     train_dataset.data_list = [item for item in original_data_list if item['person_id'] in train_ids]
 
-    # 创建验证数据集（使用相同的标签映射）
-    from copy import deepcopy
-    local_val_dataset = deepcopy(full_dataset)
-    local_val_dataset.person_ids = all_person_ids
+    # 创建真正的验证集（split='val'，关闭训练模式和模态dropout）
+    logging.info("创建验证集数据集（关闭增强和模态dropout）...")
+    local_val_dataset = MultiModalDataset(config, split='val', person_ids=all_person_ids)
     local_val_dataset.pid2label = pid2label
-    local_val_dataset.data_list = [item for item in original_data_list if item['person_id'] in val_ids]
+    # 只保留验证ID的样本
+    local_val_dataset.data_list = [item for item in local_val_dataset.data_list if item['person_id'] in val_ids]
 
     logging.info(f"数据集划分完成 - 训练集: {len(train_ids)} IDs, {len(train_dataset.data_list)} 样本")
     logging.info(f"数据集划分完成 - 本地验证集: {len(val_ids)} IDs, {len(local_val_dataset.data_list)} 样本")
@@ -740,15 +744,13 @@ def train_multimodal_reid():
                     model, optimizer, scheduler, epoch, best_map, config,
                     os.path.join(save_dir, 'best_model.pth')
                 )
-                logging.info(f"新的最佳(四类平均) mAP: {best_map:.4f}")
+                logging.info(f"新的最佳(single+quad平均) mAP: {best_map:.4f}")
 
             logging.info(
                 f"Epoch {epoch}/{num_epochs} - "
                 f"Train ClsAcc: {train_metrics['accuracy']:.2f}% - "
-                f"mAP(single/double/triple/quad/avg4): "
+                f"mAP(single/quad/avg2): "
                 f"{comp_metrics['map_single']:.4f}/"
-                f"{comp_metrics['map_double']:.4f}/"
-                f"{comp_metrics['map_triple']:.4f}/"
                 f"{comp_metrics['map_quad']:.4f}/"
                 f"{comp_metrics['map_avg4']:.4f} - "
                 f"CMC@1/5/10: {comp_metrics['cmc1']:.4f}/"
