@@ -74,7 +74,7 @@ class TrainingConfig:
     save_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     save_freq: int = 20
-    eval_freq: int = 20  # 与注释一致：每20轮评估一次
+    eval_freq: int = 15  # 与注释一致：每20轮评估一次
     eval_sample_ratio: float = 0.3  # 采样评估比例（mAP快速估算）
     
     # 验证和推理相关配置

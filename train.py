@@ -362,10 +362,8 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
 
     return {
         'map_single': map_single,
-        'map_double': 0.0,  # 未测试，设为0
-        'map_triple': 0.0,  # 未测试，设为0
         'map_quad': map_quad,
-        'map_avg2': map_avg2,  # 实际是single和quad的平均
+        'map_avg2': map_avg2,  # single和quad的平均
         'detail': detail,
         'cmc1': cmc1, 'cmc5': cmc5, 'cmc10': cmc10
     }
@@ -747,7 +745,7 @@ def train_multimodal_reid():
             train_history.append({'epoch': epoch, **train_metrics})
             val_history.append({'epoch': epoch, **comp_metrics})
 
-            score = comp_metrics['map_avg4']
+            score = comp_metrics['map_avg2']
             if score > best_map:
                 best_map = score
                 save_checkpoint(
@@ -762,7 +760,7 @@ def train_multimodal_reid():
                 f"mAP(single/quad/avg2): "
                 f"{comp_metrics['map_single']:.4f}/"
                 f"{comp_metrics['map_quad']:.4f}/"
-                f"{comp_metrics['map_avg4']:.4f} - "
+                f"{comp_metrics['map_avg2']:.4f} - "
                 f"CMC@1/5/10: {comp_metrics['cmc1']:.4f}/"
                 f"{comp_metrics['cmc5']:.4f}/"
                 f"{comp_metrics['cmc10']:.4f} - "
@@ -780,7 +778,7 @@ def train_multimodal_reid():
         if scheduler:
             if isinstance(scheduler, ReduceLROnPlateau):
                 if epoch % eval_freq == 0:
-                    current_map = comp_metrics['map_avg4'] if 'comp_metrics' in locals() else 0.0
+                    current_map = comp_metrics['map_avg2'] if 'comp_metrics' in locals() else 0.0
                     scheduler.step(current_map)
             else:
                 scheduler.step()
@@ -792,12 +790,10 @@ def train_multimodal_reid():
     # 训练完成后全量评估
     logging.info("训练完成，开始本地划分验证集的完整评估...")
     final_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0)
-    logging.info(f"最终评估 - mAP(single/double/triple/quad/avg4): "
+    logging.info(f"最终评估 - mAP(single/quad/avg2): "
                 f"{final_metrics['map_single']:.4f}/"
-                f"{final_metrics['map_double']:.4f}/"
-                f"{final_metrics['map_triple']:.4f}/"
                 f"{final_metrics['map_quad']:.4f}/"
-                f"{final_metrics['map_avg4']:.4f}")
+                f"{final_metrics['map_avg2']:.4f}")
 
     # 保存历史
     log_dir = getattr(config, "log_dir", "./logs")
