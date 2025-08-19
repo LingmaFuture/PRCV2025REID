@@ -75,12 +75,38 @@ class PRCV2025SubmissionGenerator:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"模型文件不存在: {model_path}")
         
-        # 创建模型
-        model = MultiModalReIDModel(self.config).to(self.device)
-        
-        # 加载权重
+        # 先加载权重与训练时配置，以便构建与训练一致的模型结构
         checkpoint = torch.load(model_path, map_location=self.device)
-        
+
+        # 使用训练时的配置覆盖当前配置的关键字段（以保证结构一致）
+        ckpt_cfg = checkpoint.get('config', None)
+        if isinstance(ckpt_cfg, dict):
+            for k, v in ckpt_cfg.items():
+                try:
+                    setattr(self.config, k, v)
+                except Exception:
+                    pass
+
+        # 推断类别数：优先使用checkpoint中保存的num_classes；若缺失则从分类器权重形状推断；再不行用保守默认值
+        inferred_num_classes: Optional[int] = None
+        if 'num_classes' in checkpoint and isinstance(checkpoint['num_classes'], int):
+            inferred_num_classes = int(checkpoint['num_classes'])
+        else:
+            sd_for_probe = checkpoint.get('model_state_dict', checkpoint)
+            cls_w = sd_for_probe.get('classifier.weight', None)
+            if isinstance(cls_w, torch.Tensor) and cls_w.ndim == 2:
+                inferred_num_classes = int(cls_w.size(0))
+        if inferred_num_classes is None:
+            # 不依赖分类器进行推理，但构造模型需要一个数值；给一个安全缺省
+            inferred_num_classes = getattr(self.config, 'num_classes', None) or 1000
+
+        # 将推断的类别数写回配置（用于构建分类器层形状）
+        self.config.num_classes = inferred_num_classes
+
+        # 创建模型（此时结构与训练时一致，包含正确的分类器输出维度）
+        model = MultiModalReIDModel(self.config).to(self.device)
+
+        # 解析权重字典
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
             print(f"加载模型权重: {model_path}")
@@ -92,16 +118,13 @@ class PRCV2025SubmissionGenerator:
         # 处理类别数量不匹配的问题
         model_state_dict = model.state_dict()
         
-        # 检查分类器权重尺寸是否匹配
+        # 检查分类器权重尺寸是否匹配（虽推理不使用，但为保险起见保持兼容）
         if 'classifier.weight' in state_dict and 'classifier.weight' in model_state_dict:
             checkpoint_num_classes = state_dict['classifier.weight'].size(0)
             current_num_classes = model_state_dict['classifier.weight'].size(0)
-            
             if checkpoint_num_classes != current_num_classes:
                 print(f"警告: 检查点中的类别数量 ({checkpoint_num_classes}) 与当前配置 ({current_num_classes}) 不匹配")
                 print("将跳过分类器权重的加载，使用随机初始化的分类器")
-                
-                # 移除分类器权重，只加载其他层
                 state_dict.pop('classifier.weight', None)
                 state_dict.pop('classifier.bias', None)
         
@@ -114,6 +137,9 @@ class PRCV2025SubmissionGenerator:
             print("将使用部分加载的权重继续")
         
         model.eval()
+        # 推理阶段：确保文本编码器处于推理/无梯度状态以节省显存
+        if hasattr(model, 'freeze_text'):
+            model.freeze_text = True
         return model
     
     def _load_query_list(self) -> pd.DataFrame:
@@ -182,13 +208,11 @@ class PRCV2025SubmissionGenerator:
         gallery_features = []
         
         with torch.no_grad():
-             for batch in tqdm(gallery_loader, desc="提取画廊特征"):
-                 batch = self._move_to_device(batch)
-                 
-                 with autocast('cuda', enabled=self.device.type == 'cuda'):
-                     features = self.model(batch, return_features=True)
-                 
-                 gallery_features.append(features.cpu())
+            for batch in tqdm(gallery_loader, desc="提取画廊特征"):
+                batch = self._move_to_device(batch)
+                with autocast(device_type='cuda', enabled=self.device.type == 'cuda'):
+                    features = self.model(batch, return_features=True)
+                gallery_features.append(features.cpu())
         
         gallery_features = torch.cat(gallery_features, dim=0)
         gallery_features = F.normalize(gallery_features, p=2, dim=1)
@@ -223,10 +247,8 @@ class PRCV2025SubmissionGenerator:
             with torch.no_grad():
                 for batch in tqdm(query_loader, desc=f"提取{query_type}特征"):
                     batch = self._move_to_device(batch)
-                    
-                    with autocast('cuda', enabled=self.device.type == 'cuda'):
+                    with autocast(device_type='cuda', enabled=self.device.type == 'cuda'):
                         features = self.model(batch, return_features=True)
-                    
                     type_features.append(features.cpu())
             
             if type_features:
