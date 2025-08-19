@@ -171,6 +171,9 @@ class CLIPUnifiedEncoder(nn.Module):
         self.clip_model = CLIPModel.from_pretrained(clip_model_name)
         self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
         
+        # 文本分词缓存机制（加速优化）
+        self.text_cache = {}  # 缓存文本分词结果
+        
         # 多模态非共享patch embeddings
         self.patch_embeds = MultiModalPatchEmbeds(
             embed_dim=vision_hidden_dim,

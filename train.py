@@ -37,6 +37,10 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
+    
+    # 加速优化：启用TF32和优化CUDA操作
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
@@ -313,6 +317,8 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=True,
+        prefetch_factor=2,
         collate_fn=compatible_collate_fn
     )
     non_vis = ['nir', 'sk', 'cp', 'text']
@@ -337,6 +343,8 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
+                persistent_workers=True,
+                prefetch_factor=2,
                 collate_fn=compatible_collate_fn
             )
             query_loaders['single'][m] = loader
@@ -355,6 +363,8 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
                     shuffle=False,
                     num_workers=num_workers,
                     pin_memory=pin_memory,
+                    persistent_workers=True,
+                    prefetch_factor=2,
                     collate_fn=compatible_collate_fn
                 )
                 query_loaders[tag][key] = loader
@@ -381,7 +391,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
         for batch in tqdm(gallery_loader, desc=f'提取画廊特征(全量)', 
                           leave=False, ncols=100, mininterval=0.5):
             batch = move_batch_to_device(batch, device)
-            with autocast(device_type='cuda', enabled=device.type == 'cuda'):
+            with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
                 outputs = call_model_with_batch(model, batch, return_features=True)
                 feats = outputs['features']  # 提取融合后的特征用于ReID
             labels = batch['person_id']
@@ -410,7 +420,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                 for batch in tqdm(qloader, desc=f'提取查询特征[{tag}:{key}]', 
                                   leave=False, ncols=100, mininterval=0.5):
                     batch = move_batch_to_device(batch, device)
-                    with autocast(device_type='cuda', enabled=device.type == 'cuda'):
+                    with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
                         outputs = call_model_with_batch(model, batch, return_features=True)
                         feats = outputs['features']  # 提取融合后的特征用于ReID
                     labels = batch['person_id']
@@ -470,7 +480,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     use_amp = (scaler is not None and getattr(scaler, "is_enabled", lambda: True)())
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', 
-                leave=True, ncols=120, mininterval=1.0, maxinterval=2.0)
+                leave=True, ncols=120, mininterval=2.0, maxinterval=5.0)
     
     # 添加批次构成监控（前3个batch）
     if epoch <= 3:
@@ -503,7 +513,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         if batch_idx == 0:
             logging.info(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
 
-        with autocast(device_type='cuda', enabled=use_amp):
+        with autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
             outputs = call_model_with_batch(model, batch, return_features=False)
             loss_dict = model.compute_loss(outputs, labels)
             
@@ -631,15 +641,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         avg_reid  = float(reid_raw_norms.mean().item()) if reid_raw_norms is not None else 0.0
         avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
 
-        pbar.set_postfix({
-            'Loss': f'{current_loss:.3f}',
-            'CE': f'{float(ce_loss.item()):.3f}',
-            'SDM': f'{float(sdm_loss.item()):.3f}',  # 显示SDM对齐损失
-            'Feat(Fused)': f'{avg_fused:.2f}',
-            #'Feat(ReID)': f'{avg_reid:.2f}',
-            'GradNorm': f'{avg_grad_norm:.2f}',
-            'Spikes': loss_spikes
-        })
+        # 优化：每5个batch更新一次进度条，避免频繁GPU-CPU同步
+        if batch_idx % 5 == 0:
+            pbar.set_postfix({
+                'Loss': f'{current_loss:.3f}',
+                'CE': f'{float(ce_loss.item()):.3f}',
+                'SDM': f'{float(sdm_loss.item()):.3f}',  # 显示SDM对齐损失
+                'Feat(Fused)': f'{avg_fused:.2f}',
+                'GradNorm': f'{avg_grad_norm:.2f}',
+                'Spikes': loss_spikes
+            })
 
     avg_loss = total_loss / max(1, len(dataloader))
     accuracy = 100. * correct / max(1, total)
@@ -747,6 +758,8 @@ def train_multimodal_reid():
         batch_sampler=train_sampler,
         num_workers=getattr(config, "num_workers", 4),
         pin_memory=getattr(config, "pin_memory", True),
+        persistent_workers=True,  # 保持工作进程持续运行
+        prefetch_factor=2,        # 预取因子提升IO效率
         collate_fn=compatible_collate_fn
     )
 
@@ -924,7 +937,7 @@ def train_multimodal_reid():
             else:
                 scheduler.step()
 
-            if epoch % 10 == 0:
+            if epoch % 20 == 0:  # 减少查询频率：10->20
                 lrs = [pg['lr'] for pg in optimizer.param_groups]
                 logging.info(f"Epoch {epoch}: 当前学习率 = {', '.join([f'{lr:.2e}' for lr in lrs])}")
 
