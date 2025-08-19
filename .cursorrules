@@ -1,1 +1,3 @@
 重点关注config/config.py,datasets/dataset.py,models/model.py,train.py四个文件
+
+终端执行任何执行务必先激活虚拟环境：conda activate prvc。

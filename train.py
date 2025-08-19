@@ -20,10 +20,11 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR, LambdaLR, ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
 from sklearn.model_selection import train_test_split
+import torchvision.transforms as transforms
 
 # === 你项目里的数据与模型 ===
 from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn
-from models.model import MultiModalReIDModel  
+from models.model import CLIPBasedMultiModalReIDModel  
 from configs.config import TrainingConfig
 
 # ------------------------------
@@ -137,6 +138,87 @@ def split_train_dataset(dataset, val_ratio=0.2, seed=42):
 # 赛制对齐数据构建
 # ------------------------------
 MODALITIES = ['vis', 'nir', 'sk', 'cp', 'text']
+
+# 模态名称映射：兼容新CLIP+MER架构
+MODALITY_MAPPING = {
+    'vis': 'rgb',      # 可见光 -> RGB
+    'nir': 'ir',       # 近红外 -> IR
+    'sk': 'sketch',    # 素描 -> sketch
+    'cp': 'cpencil',   # 彩铅 -> cpencil
+    'text': 'text'     # 文本保持不变
+}
+
+def map_modality_name(old_name: str) -> str:
+    """将数据集的模态名称映射到新架构的模态名称"""
+    return MODALITY_MAPPING.get(old_name, old_name)
+
+
+def move_batch_to_device(batch, device):
+    """将batch数据移动到指定设备"""
+    def _move_to_device(obj):
+        if torch.is_tensor(obj):
+            return obj.to(device)
+        elif isinstance(obj, dict):
+            return {k: _move_to_device(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_move_to_device(item) for item in obj]
+        else:
+            return obj
+    
+    return _move_to_device(batch)
+
+
+def convert_batch_for_clip_model(batch):
+    """
+    将数据集的batch格式转换为CLIP+MER模型的输入格式
+    Args:
+        batch: 数据集返回的batch，格式为 {'images': {...}, 'text_description': [...], ...}
+    Returns:
+        images: {modality: tensor} 图像字典，模态名称已映射
+        texts: List[str] 文本列表
+    """
+    images = {}
+    texts = None
+    
+    # 处理图像数据
+    if 'images' in batch:
+        for old_modality, image_tensor in batch['images'].items():
+            if torch.is_tensor(image_tensor) and image_tensor.numel() > 0:
+                new_modality = map_modality_name(old_modality)
+                images[new_modality] = image_tensor
+    
+    # 处理文本数据
+    if 'text_description' in batch:
+        text_descriptions = batch['text_description']
+        if isinstance(text_descriptions, list) and len(text_descriptions) > 0:
+            # 过滤空文本
+            texts = [text for text in text_descriptions if text and text.strip()]
+            if not texts:  # 如果所有文本都是空的
+                texts = None
+    
+    return images, texts
+
+
+def call_model_with_batch(model, batch, return_features=False):
+    """
+    使用batch数据调用CLIP+MER模型
+    Args:
+        model: CLIP+MER模型
+        batch: 数据集batch
+        return_features: 是否返回特征
+    Returns:
+        模型输出
+    """
+    images, texts = convert_batch_for_clip_model(batch)
+    
+    # 确保至少有一种模态的输入
+    if not images and not texts:
+        raise ValueError("Batch中没有有效的图像或文本数据")
+    
+    # 调用模型
+    return model(images=images if images else None, 
+                texts=texts if texts else None, 
+                return_features=return_features)
 
 def build_val_presence_table(dataset, val_indices):
     presence = {}
@@ -300,7 +382,8 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                           leave=False, ncols=100, mininterval=0.5):
             batch = move_batch_to_device(batch, device)
             with autocast(device_type='cuda', enabled=device.type == 'cuda'):
-                feats = model(batch, return_features=True)
+                outputs = call_model_with_batch(model, batch, return_features=True)
+                feats = outputs['features']  # 提取融合后的特征用于ReID
             labels = batch['person_id']
             gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
         gal_feats = torch.cat(gal_feats, dim=0)
@@ -328,7 +411,8 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                                   leave=False, ncols=100, mininterval=0.5):
                     batch = move_batch_to_device(batch, device)
                     with autocast(device_type='cuda', enabled=device.type == 'cuda'):
-                        feats = model(batch, return_features=True)
+                        outputs = call_model_with_batch(model, batch, return_features=True)
+                        feats = outputs['features']  # 提取融合后的特征用于ReID
                     labels = batch['person_id']
                     qf.append(feats.cpu()); ql.append(labels.cpu())
                 if not qf:
@@ -387,50 +471,71 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', 
                 leave=True, ncols=120, mininterval=1.0, maxinterval=2.0)
+    
+    # 添加批次构成监控（前3个batch）
+    if epoch <= 3:
+        logging.info(f"=== Epoch {epoch} 批次构成监控 ===")
+    
     for batch_idx, batch in enumerate(pbar):
         batch = move_batch_to_device(batch, device)
         labels = batch['person_id']
+        
+        # 批次构成监控（前3个epoch的前3个batch）
+        if epoch <= 3 and batch_idx < 3:
+            unique_ids, counts = torch.unique(labels, return_counts=True)
+            num_ids_per_batch = len(unique_ids)
+            avg_instances_per_id = float(counts.float().mean().item())  # 转换为浮点数再计算均值
+            logging.info(f"Batch {batch_idx}: {num_ids_per_batch} IDs, 平均每ID {avg_instances_per_id:.1f} 样本 (K-1正样本数≈{avg_instances_per_id-1:.1f})")
 
         optimizer.zero_grad(set_to_none=True)
-        # === 对比损失"真·关掉"更久 + 平滑拉起 ===
-        cont_max = getattr(model.config, "contrastive_weight", 0.02)
-        if epoch <= 10:
+        # === 对比损失提前升温 + 加长升温期 ===
+        cont_max = getattr(model.config, "contrastive_weight", 0.05)
+        if epoch <= 5:
             effective_cont_w = 0.0
-        elif 11 <= epoch <= 20:
-            # 线性升温：11->0.004, 20->cont_max
-            t = (epoch - 10) / 10.0
-            effective_cont_w = max(0.002, cont_max * t)
+        elif 6 <= epoch <= 25:
+            # 线性升温：6->0.004, 25->cont_max
+            t = (epoch - 5) / 20.0
+            effective_cont_w = max(0.004, cont_max * t)
         else:
             effective_cont_w = cont_max
+            
+        # 每个epoch的第一个batch输出有效对比权重
+        if batch_idx == 0:
+            logging.info(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
 
         with autocast(device_type='cuda', enabled=use_amp):
-            outputs = model(batch)
+            outputs = call_model_with_batch(model, batch, return_features=False)
             loss_dict = model.compute_loss(outputs, labels)
             
-            # 对比损失监控（仅在实际参与训练时警告）
-            cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
-            # 只有当对比损失真正参与训练时（权重>0）才显示警告
-            if effective_cont_w > 0.0 and cont_loss.item() > 1.5:  
-                original_cont = cont_loss.item()
+            # SDM对比损失监控（仅在实际参与训练时警告）
+            sdm_loss = loss_dict.get('sdm_loss', torch.tensor(0.0, device=device))
+            cont_loss = loss_dict.get('contrastive_loss', sdm_loss)  # 兼容性：用sdm_loss作为contrastive_loss
+            
+            # 只有当SDM损失真正参与训练时（权重>0）才显示警告
+            if effective_cont_w > 0.0 and sdm_loss.item() > 1.5:  
+                original_sdm = sdm_loss.item()
                 if batch_idx < 5:  # 只在前几个batch报告，避免日志过多
-                    logging.info(f"Epoch {epoch}, Batch {batch_idx}: 对比损失较高 {original_cont:.3f}")
+                    logging.info(f"Epoch {epoch}, Batch {batch_idx}: SDM对齐损失较高 {original_sdm:.3f}")
             
             # 检查是否有NaN或Inf
-            if not torch.isfinite(cont_loss):
-                logging.error(f"Epoch {epoch}, Batch {batch_idx}: 对比损失出现NaN/Inf, 重置为0")
+            if not torch.isfinite(sdm_loss):
+                logging.error(f"Epoch {epoch}, Batch {batch_idx}: SDM损失出现NaN/Inf, 重置为0")
+                loss_dict['sdm_loss'] = torch.tensor(0.0, device=device)
                 loss_dict['contrastive_loss'] = torch.tensor(0.0, device=device)
                 # 重新计算总损失
                 ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
-                contrastive_weight = getattr(model.config, 'contrastive_weight', 0.02)
-                loss_dict['total_loss'] = ce_loss + contrastive_weight * loss_dict['contrastive_loss']
+                feat_penalty = loss_dict.get('feat_penalty', torch.tensor(0.0, device=device))
+                sdm_weight = getattr(model.config, 'contrastive_weight', 0.1)
+                loss_dict['total_loss'] = ce_loss + sdm_weight * loss_dict['sdm_loss'] + feat_penalty
             
             loss = loss_dict['total_loss']
         
         # 用 warmup 后的有效权重重算总损失（包含特征范数正则项）
         ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
-        cont_loss = loss_dict.get('contrastive_loss', torch.tensor(0.0, device=device))
+        sdm_loss = loss_dict.get('sdm_loss', torch.tensor(0.0, device=device))
+        cont_loss = loss_dict.get('contrastive_loss', sdm_loss)  # 兼容性
         feat_penalty = loss_dict.get('feat_penalty', torch.tensor(0.0, device=device))
-        loss = ce_loss + effective_cont_w * cont_loss + feat_penalty
+        loss = ce_loss + effective_cont_w * sdm_loss + feat_penalty  # 使用SDM损失
         loss_dict['total_loss'] = loss
 
         current_loss = float(loss.item())
@@ -499,7 +604,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         # 统计信息更新（移回循环内部）
         total_loss += current_loss
         ce_loss_sum += float(ce_loss.item())
-        contrastive_loss_sum += float(cont_loss.item())
+        contrastive_loss_sum += float(sdm_loss.item())  # 累计SDM损失
 
         if isinstance(outputs, dict) and 'logits' in outputs:
             _, predicted = outputs['logits'].max(1)
@@ -529,7 +634,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         pbar.set_postfix({
             'Loss': f'{current_loss:.3f}',
             'CE': f'{float(ce_loss.item()):.3f}',
-            'Cont': f'{float(cont_loss.item()):.3f}',
+            'SDM': f'{float(sdm_loss.item()):.3f}',  # 显示SDM对齐损失
             'Feat(Fused)': f'{avg_fused:.2f}',
             #'Feat(ReID)': f'{avg_reid:.2f}',
             'GradNorm': f'{avg_grad_norm:.2f}',
@@ -549,7 +654,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     return {
         'total_loss': avg_loss,
         'ce_loss': ce_loss_sum / max(1, len(dataloader)),
-        'contrastive_loss': contrastive_loss_sum / max(1, len(dataloader)),
+        'contrastive_loss': contrastive_loss_sum / max(1, len(dataloader)),  # 兼容性：实际为SDM损失
+        'sdm_loss': contrastive_loss_sum / max(1, len(dataloader)),  # 明确的SDM损失
         'accuracy': accuracy,
         'feature_norm': avg_feat_norm,
         'grad_norm': avg_grad_norm,
@@ -628,10 +734,13 @@ def train_multimodal_reid():
     val_labels = [pid2label[pid] for pid in val_ids]
     logging.info(f"训练集标签范围: {min(train_labels)}-{max(train_labels)}, 验证集标签范围: {min(val_labels)}-{max(val_labels)}")
 
-    # 训练 DataLoader（Balanced PK 采样）
-    num_instances = 4
-    effective_batch_size = max(getattr(config, "batch_size", 32), 16)
-    effective_batch_size = max(num_instances, (effective_batch_size // num_instances) * num_instances)
+    # 训练 DataLoader（确保 P×K 采样，K≥4 保证对比学习有效）
+    num_instances = 4  # K=4，每个身份4个样本，确保每个锚有K-1=3个正样本
+    effective_batch_size = 32  # 固定batch_size=32，确保P=8
+    num_pids_per_batch = effective_batch_size // num_instances  # P=8
+    logging.info(f"采样策略: P×K = {num_pids_per_batch}×{num_instances} = {effective_batch_size}")
+    logging.info(f"每个锚的正样本数: {num_instances-1}")
+    
     train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
     train_loader = DataLoader(
         train_dataset,
@@ -649,27 +758,27 @@ def train_multimodal_reid():
         pin_memory=getattr(config, "pin_memory", True)
     )
 
-    # 模型
-    model = MultiModalReIDModel(config).to(device)
+    # 模型：CLIP+MER架构
+    model = CLIPBasedMultiModalReIDModel(config).to(device)
+    
+    # 设置分类器（动态设置ID类别数）
+    num_classes = getattr(config, 'num_classes', None)
+    if num_classes is not None:
+        model.set_num_classes(num_classes)
+        logging.info(f"✅ 设置分类器：{num_classes} 个ID类别")
+    else:
+        logging.warning("⚠️ config中未找到num_classes，请确保在数据加载后设置")
 
-    # 优化器 - 为文本编码器设置差异化学习率
-    base_lr = getattr(config, "learning_rate", 3e-4)
-    text_lr = base_lr * 0.1
-    param_groups = []
-    text_params, other_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'text_encoder' in name:
-            text_params.append(param)
-        else:
-            other_params.append(param)
-    if text_params:
-        param_groups.append({'params': text_params, 'lr': text_lr})
-        logging.info(f"文本编码器学习率: {text_lr:.2e}")
-    if other_params:
-        param_groups.append({'params': other_params, 'lr': base_lr})
-        logging.info(f"其他模块学习率: {base_lr:.2e}")
+    # 优化器 - 支持CLIP+MER分层学习率
+    param_groups = model.get_learnable_params()
+    
+    # 日志输出各参数组的学习率
+    for group in param_groups:
+        group_name = group.get('name', 'unknown')
+        group_lr = group['lr']
+        num_params = len(group['params'])
+        logging.info(f"{group_name}: {num_params} 参数, 学习率: {group_lr:.2e}")
+    
     optimizer = AdamW(param_groups, weight_decay=getattr(config, "weight_decay", 1e-4))
 
     # AMP（修复：正确初始化）
@@ -720,22 +829,44 @@ def train_multimodal_reid():
 
     for epoch in range(1, num_epochs + 1):
         start_time = time.time()
+        
+        # 每个epoch开始前清除文本缓存（仅在微调文本时清除，冻结时保持缓存）
+        if hasattr(model, "text_cache") and not getattr(model, "freeze_text", True):
+            model.text_cache.clear()
+            if epoch == 1:  # 第一个epoch提醒
+                logging.info("文本编码器微调模式：每epoch清除缓存")
 
         adaptive_clip = getattr(config, "adaptive_gradient_clip", True)
         train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler, adaptive_clip)
         
-        # 监控对比损失异常并自动调整
-        current_cont_loss = train_metrics['contrastive_loss']
+        # 监控SDM对齐损失异常并自动调整
+        current_sdm_loss = train_metrics.get('sdm_loss', train_metrics['contrastive_loss'])
         if epoch > 5 and len(train_history) >= 2:
-            prev_cont_loss = train_history[-1]['contrastive_loss']
-            if current_cont_loss > prev_cont_loss * 1.8:
-                logging.warning(f"Epoch {epoch}: 对比损失异常上升 {prev_cont_loss:.4f} -> {current_cont_loss:.4f}")
-                # 自动降低对比损失权重
-                current_weight = getattr(config, 'contrastive_weight', 0.02)
+            prev_sdm_loss = train_history[-1].get('sdm_loss', train_history[-1]['contrastive_loss'])
+            if current_sdm_loss > prev_sdm_loss * 1.8:
+                logging.warning(f"Epoch {epoch}: SDM对齐损失异常上升 {prev_sdm_loss:.4f} -> {current_sdm_loss:.4f}")
+                # 自动降低SDM损失权重
+                current_weight = getattr(config, 'contrastive_weight', 0.1)
                 new_weight = max(0.001, current_weight * 0.5)
                 config.contrastive_weight = new_weight
                 model.config.contrastive_weight = new_weight
-                logging.info(f"自动调整对比损失权重: {current_weight:.4f} -> {new_weight:.4f}")
+                logging.info(f"自动调整SDM损失权重: {current_weight:.4f} -> {new_weight:.4f}")
+        
+        # 自适应增强强度：5个epoch后如果训练稳定，放宽裁剪强度
+        if epoch == 5 and train_metrics['stability_score'] > 0.8:
+            logging.info("训练稳定，放宽数据增强强度：裁剪 scale (0.8,1.0) -> (0.6,1.0)")
+            # 更新数据增强变换
+            new_transform = transforms.Compose([
+                transforms.RandomResizedCrop(config.image_size, scale=(0.6, 1.0)),  # 放宽裁剪
+                transforms.RandomHorizontalFlip(0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2) if config.color_jitter else transforms.Lambda(lambda x: x),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.RandomErasing(p=config.random_erase, scale=(0.02, 0.2)) if config.random_erase > 0 else transforms.Lambda(lambda x: x)
+            ])
+            # 更新训练数据集的变换
+            if hasattr(train_dataset, 'transform'):
+                train_dataset.transform = new_transform
 
 
         if epoch % eval_freq == 0:
@@ -754,6 +885,15 @@ def train_multimodal_reid():
                 )
                 logging.info(f"新的最佳(single+quad平均) mAP: {best_map:.4f}")
 
+            # 输出分模态mAP详情，快速定位拖后腿的模态
+            single_detail = comp_metrics.get('detail', {}).get('single', {})
+            single_maps = []
+            for modality in ['text', 'nir', 'sk', 'cp']:
+                if modality in single_detail:
+                    single_maps.append(f"{modality}:{single_detail[modality]:.3f}")
+                    
+            single_detail_str = " | ".join(single_maps) if single_maps else "N/A"
+            
             logging.info(
                 f"Epoch {epoch}/{num_epochs} - "
                 f"Train ClsAcc: {train_metrics['accuracy']:.2f}% - "
@@ -766,6 +906,7 @@ def train_multimodal_reid():
                 f"{comp_metrics['cmc10']:.4f} - "
                 f"用时: {time.time() - start_time:.2f}s"
             )
+            logging.info(f"分模态mAP详情: {single_detail_str}")
 
         # 保存 checkpoint
         if epoch % getattr(config, "save_freq", 20) == 0:
@@ -790,10 +931,25 @@ def train_multimodal_reid():
     # 训练完成后全量评估
     logging.info("训练完成，开始本地划分验证集的完整评估...")
     final_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0)
+    # 最终评估的分模态mAP详情
+    final_single_detail = final_metrics.get('detail', {}).get('single', {})
+    final_single_maps = []
+    for modality in ['text', 'nir', 'sk', 'cp']:
+        if modality in final_single_detail:
+            final_single_maps.append(f"{modality}:{final_single_detail[modality]:.3f}")
+    final_single_detail_str = " | ".join(final_single_maps) if final_single_maps else "N/A"
+    
     logging.info(f"最终评估 - mAP(single/quad/avg2): "
                 f"{final_metrics['map_single']:.4f}/"
                 f"{final_metrics['map_quad']:.4f}/"
                 f"{final_metrics['map_avg2']:.4f}")
+    logging.info(f"最终分模态mAP详情: {final_single_detail_str}")
+    
+    # 找出拖后腿的模态
+    if final_single_detail:
+        min_modality = min(final_single_detail.items(), key=lambda x: x[1])
+        max_modality = max(final_single_detail.items(), key=lambda x: x[1])
+        logging.info(f"性能最差模态: {min_modality[0]}({min_modality[1]:.3f}), 最佳模态: {max_modality[0]}({max_modality[1]:.3f})")
 
     # 保存历史
     log_dir = getattr(config, "log_dir", "./logs")

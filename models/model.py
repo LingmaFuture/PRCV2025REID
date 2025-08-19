@@ -1,495 +1,609 @@
-# models/model.py — 优化可运行版
-import math
-from typing import Dict, List, Optional, Tuple
-import contextlib
+# models/model.py
+"""
+重构后的多模态ReID模型：CLIP-B/16统一编码器 + MER模态路由 + SDM语义分离
+保持与原架构的兼容性，同时集成新的设计理念
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
-from transformers import AutoModel, AutoTokenizer
+import logging
+import numpy as np
+from typing import Dict, List, Optional, Union, Tuple, Any
 
-# -------------------------
-# 基础组件
-# -------------------------
-class LayerScale(nn.Module):
-    """LayerScale for better training stability"""
-    def __init__(self, dim, init_values=1e-5):
-        super().__init__()
-        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+from .clip_backbone import CLIPUnifiedEncoder
+from .patch_embeds import MultiModalPatchEmbeds
+from .mer_lora import MERLinear, MERMultiheadAttention, MERMLP
 
-    def forward(self, x):
-        return self.gamma * x
 
-class VectorModalityAdapter(nn.Module):
+# 导入原有的SDM和损失函数组件
+class SemanticDisentanglementModule(nn.Module):
     """
-    向量级 FiLM 适配器：输入 (B, C)，输出 (B, C)
-    学到逐通道的 scale/bias：y = x * (1 + gamma) + beta
+    语义分离模块：将各模态特征投影到语义空间，便于与RGB对齐
+    保持原有实现，与新架构兼容
     """
-    def __init__(self, dim: int, hidden: int = 256):
+    def __init__(self, input_dim: int = 512, semantic_dim: int = 512, num_heads: int = 8):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, dim * 2)  # -> [gamma, beta]
+        
+        self.input_dim = input_dim
+        self.semantic_dim = semantic_dim
+        
+        # 语义分离的多头注意力
+        self.semantic_attn = nn.MultiheadAttention(
+            embed_dim=input_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.1
         )
-
+        
+        # 投影到语义空间
+        self.semantic_proj = nn.Sequential(
+            nn.Linear(input_dim, semantic_dim),
+            nn.LayerNorm(semantic_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(semantic_dim, semantic_dim)
+        )
+        
+        # 初始化
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gb = self.net(x)                 # (B, 2C)
-        gamma, beta = torch.chunk(gb, 2, dim=-1)
-        return x * (1.0 + gamma) + beta
+        """
+        Args:
+            x: [B, input_dim] 输入特征
+        Returns:
+            [B, semantic_dim] 语义分离后的特征
+        """
+        # 为注意力机制添加序列维度
+        x_seq = x.unsqueeze(1)  # [B, 1, input_dim]
+        
+        # 自注意力语义分离
+        attn_out, _ = self.semantic_attn(x_seq, x_seq, x_seq)  # [B, 1, input_dim]
+        attn_out = attn_out.squeeze(1)  # [B, input_dim]
+        
+        # 残差连接
+        x = x + attn_out
+        
+        # 投影到语义空间
+        semantic_features = self.semantic_proj(x)  # [B, semantic_dim]
+        
+        return semantic_features
 
-class ModalityAdapter(nn.Module):
-    """
-    模态适配器（FiLM式）：不改变序列长度，避免 ViT pos_embed 尺寸问题。
-    给定 token 序列，基于 patch 的全局统计，学习到逐通道的 scale/bias。
-    """
-    def __init__(self, embed_dim: int, hidden: int = 256):
+
+class RGBAnchoredAlignmentLoss(nn.Module):
+    """RGB锚定对齐损失：推动所有查询模态对齐到RGB目标表征"""
+    
+    def __init__(self, temperature: float = 0.1, margin: float = 0.3, alpha: float = 1.0):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, embed_dim * 2),
-        )
-        self.ln = nn.LayerNorm(embed_dim)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        # tokens: (B, 1+N, C) ; 只基于 patch token 做统计
-        patch = tokens[:, 1:, :] if tokens.size(1) > 1 else tokens  # 防卫
-        pooled = patch.mean(dim=1)  # (B, C)
-        gamma_beta = self.mlp(self.ln(pooled))  # (B, 2C)
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)  # (B, C), (B, C)
-        return tokens * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-
-class CrossModalTransformerBlock(nn.Module):
-    """跨模态 Transformer 块（Post-LN 风格，小数据集更优）"""
-    def __init__(self, embed_dim, num_heads=8, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
-        super().__init__()
-        self.embed_dim = embed_dim
-
-        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
-        self.cross_norm = nn.LayerNorm(embed_dim)
-        self.cross_scale = LayerScale(embed_dim)
-
-        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=attn_drop)
-        self.self_norm = nn.LayerNorm(embed_dim)
-        self.self_scale = LayerScale(embed_dim)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(proj_drop),
-            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
-            nn.Dropout(proj_drop),
-        )
-        self.ffn_norm = nn.LayerNorm(embed_dim)
-        self.ffn_scale = LayerScale(embed_dim)
-
-    def forward(self, query, key_value, key_padding_mask: Optional[torch.Tensor] = None):
-        # Cross-Attn: Attention → Add → LayerNorm
-        cross_out, _ = self.cross_attn(query, key_value, key_value, key_padding_mask=key_padding_mask)
-        x = self.cross_norm(query + self.cross_scale(cross_out))
-
-        # Self-Attn: Attention → Add → LayerNorm  
-        self_out, _ = self.self_attn(x, x, x)
-        x = self.self_norm(x + self.self_scale(self_out))
-
-        # FFN: MLP → Add → LayerNorm
-        x = self.ffn_norm(x + self.ffn_scale(self.mlp(x)))
-        return x
-
-class HierarchicalMultiModalFusion(nn.Module):
-    """层次化多模态融合（晚期+全局token）——每模态输入为一个向量"""
-    def __init__(self, embed_dim, num_layers=3, num_heads=8):
-        super().__init__()
-        self.embed_dim = embed_dim
-
-        self.modality_tokens = nn.ParameterDict({
-            'vis': nn.Parameter(torch.randn(1, embed_dim)),
-            'nir': nn.Parameter(torch.randn(1, embed_dim)),
-            'sk': nn.Parameter(torch.randn(1, embed_dim)),
-            'cp': nn.Parameter(torch.randn(1, embed_dim)),
-            'text': nn.Parameter(torch.randn(1, embed_dim)),
-        })
-
-        self.fusion_layers = nn.ModuleList([
-            CrossModalTransformerBlock(embed_dim, num_heads=num_heads) for _ in range(num_layers)
-        ])
-
-        self.global_token = nn.Parameter(torch.randn(1, embed_dim))
-        self.final_projection = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-
-    def forward(self, modality_features: Dict[str, torch.Tensor], modality_mask: Optional[Dict[str, bool]] = None):
-        # modality_features[k]: (B, C)
-        ref = next(iter(modality_features.values()))
-        device = ref.device
-        batch = ref.size(0)
-
-        sequences = []
-        for m, feat in modality_features.items():
-            if modality_mask is not None and not modality_mask.get(m, True):
+        self.temperature = temperature
+        self.margin = margin 
+        self.alpha = alpha
+        
+    def forward(self, 
+                modality_features: Dict[str, torch.Tensor],
+                fused_features: torch.Tensor,
+                labels: torch.Tensor) -> torch.Tensor:
+        """
+        计算RGB锚定对齐损失
+        Args:
+            modality_features: 各模态原始特征字典
+            fused_features: 融合后特征
+            labels: ID标签
+        Returns:
+            对齐损失
+        """
+        if 'rgb' not in modality_features:
+            return torch.tensor(0.0, device=fused_features.device, requires_grad=True)
+        
+        rgb_features = modality_features['rgb']  # [B, D] RGB目标特征
+        total_loss = torch.tensor(0.0, device=fused_features.device, requires_grad=True)
+        num_modalities = 0
+        
+        # 计算每个非RGB模态与RGB的对齐损失
+        for modality, features in modality_features.items():
+            if modality == 'rgb':
                 continue
-            token = self.modality_tokens[m].unsqueeze(0).expand(batch, -1, -1)  # (B, 1, C)
-            feat = feat.unsqueeze(1)  # (B, 1, C)
-            sequences.append(torch.cat([token, feat], dim=1))  # (B, 2, C)
-
-        if not sequences:
-            return torch.zeros(batch, self.embed_dim, device=device)
-
-        all_seq = torch.cat(sequences, dim=1)  # (B, 2*M, C)
-        global_q = self.global_token.unsqueeze(0).expand(batch, 1, -1)  # (B, 1, C)
-
-        # 这里不需要 padding mask（全是有效 token）
-        for layer in self.fusion_layers:
-            global_q = layer(global_q, all_seq, key_padding_mask=None)
-
-        fused = self.final_projection(global_q.squeeze(1))  # (B, C)
-        return fused
-
-# -------------------------
-# 损失函数
-# -------------------------
-class AdvancedContrastiveLoss(nn.Module):
-    """
-    稳定的 SupCon +（可选）跨模态 InfoNCE，并带 top-k 硬负样本正则
-    当前默认仅启用 SupCon（与训练稳定性优先策略一致）
-    """
-    def __init__(self, temperature: float = 0.5, margin: float = 0.2, topk: int = 5,
-                 w_fused: float = 1.0, w_xmodal: float = 0.0, anchor_modal: str = 'vis'):
-        super().__init__()
-        self.tau = temperature
-        self.margin = margin
-        self.topk = topk
-        self.w_fused = w_fused
-        self.w_xmodal = w_xmodal
-        self.anchor_modal = anchor_modal
-
-    #@staticmethod
-    # def _norm(x):
-    #     return F.normalize(x, dim=-1)
-    @staticmethod
-    def _norm(x):
-        # 显式 eps，避免零向量导致 NaN 梯度
-        return F.normalize(x, dim=-1, eps=1e-6)
-
-    def _supcon(self, feats: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        B = feats.size(0)
-        feats = self._norm(feats)
-
-        # 数值稳定：用 logsumexp 公式，不手写 exp 再求和
-        # sim 范围控制在 [-10, 10] 后再除以 tau，避免 tau 很小造成放大
-        raw = torch.matmul(feats, feats.t())
-        raw = torch.clamp(raw, min=-10.0, max=10.0)
-        sim = raw / max(self.tau, 1e-3)  # 防止 tau 过小
-        labels = labels.view(-1, 1)
-        pos_mask = labels.eq(labels.t())
-        eye = torch.eye(B, device=feats.device, dtype=torch.bool)
-        pos_mask = pos_mask & (~eye)
-
-        # 以行为单位做 logsumexp
-        # logits_ij = sim_ij
-        # denominator = logsumexp_j(sim_ij, j!=i)
-        # numerator   = logsumexp_j(sim_ij, j in P(i))
-        # loss_i = -(numerator - denominator)
-        sim = sim.masked_fill(eye, float('-inf'))  # 排除自身
-        denom_lse = torch.logsumexp(sim, dim=1)    # (B,)
-
-        # 若某行没有正样本，跳过
-        has_pos = pos_mask.any(dim=1)
-        if has_pos.any():
-            pos_sim = sim.masked_fill(~pos_mask, float('-inf'))
-            nume_lse = torch.logsumexp(pos_sim, dim=1)  # (B,)
-            loss_vec = -(nume_lse - denom_lse)
-            loss = loss_vec[has_pos].mean()
-            # 末端再做一次合理截断，防极端 outlier
-            loss = torch.clamp(loss, 0.0, 10.0)
+                
+            # 归一化特征以稳定相似度计算
+            features_norm = F.normalize(features, p=2, dim=1)
+            rgb_features_norm = F.normalize(rgb_features, p=2, dim=1)
+            
+            # 对比损失：相同ID拉近，不同ID推远
+            sim_matrix = torch.matmul(features_norm, rgb_features_norm.T) / self.temperature
+            
+            # 构建正负样本掩码
+            batch_size = features.shape[0]
+            labels_expand = labels.unsqueeze(1).expand(batch_size, batch_size)
+            pos_mask = (labels_expand == labels_expand.T).float()
+            neg_mask = 1.0 - pos_mask
+            
+            # 避免对角线上的自相似
+            eye_mask = torch.eye(batch_size, device=features.device)
+            pos_mask = pos_mask * (1.0 - eye_mask)  # 移除对角线
+            
+            # 正样本损失（相同ID应该相似）
+            if pos_mask.sum() > 0:
+                pos_sim = sim_matrix * pos_mask
+                pos_exp = torch.exp(pos_sim)
+                pos_exp_sum = pos_exp.sum(dim=1)
+                pos_loss = -torch.log(pos_exp_sum + 1e-8).mean()
+            else:
+                pos_loss = torch.tensor(0.0, device=features.device)
+            
+            # 负样本损失（不同ID应该不相似）
+            if neg_mask.sum() > 0:
+                neg_sim = sim_matrix * neg_mask - self.margin
+                neg_exp = torch.exp(neg_sim)
+                neg_exp_sum = neg_exp.sum(dim=1)
+                neg_loss = torch.log(neg_exp_sum + 1e-8).mean()
+            else:
+                neg_loss = torch.tensor(0.0, device=features.device)
+            
+            modality_loss = pos_loss + neg_loss
+            
+            # 检查是否为NaN
+            if torch.isnan(modality_loss):
+                continue
+                
+            total_loss = total_loss + modality_loss
+            num_modalities += 1
+        
+        if num_modalities > 0:
+            return total_loss / num_modalities
         else:
-            loss = torch.tensor(0.0, device=feats.device)
-        return loss
+            return torch.tensor(0.0, device=fused_features.device, requires_grad=True)
 
-    def forward(self, fused, labels, modal_dict=None, modal_masks=None):
-        main_loss = self._supcon(fused, labels)
-        return self.w_fused * main_loss
 
-# -------------------------
-# 模型主体
-# -------------------------
-class MultiModalReIDModel(nn.Module):
+class SDMContrastiveLoss(nn.Module):
+    """SDM对比损失：结合语义分离和RGB锚定对齐"""
+    
+    def __init__(self, temperature: float = 0.1, margin: float = 0.3, alpha: float = 1.0):
+        super().__init__()
+        self.rgb_alignment = RGBAnchoredAlignmentLoss(temperature, margin, alpha)
+        
+    def forward(self, 
+                modality_features: Dict[str, torch.Tensor],
+                fused_features: torch.Tensor,
+                labels: torch.Tensor) -> torch.Tensor:
+        """计算SDM对比损失"""
+        alignment_loss = self.rgb_alignment(modality_features, fused_features, labels)
+        return alignment_loss
+
+
+class FeatureFusion(nn.Module):
+    """轻量特征融合器：多头注意力 + MLP混合器"""
+    
+    def __init__(self, feature_dim: int = 512, num_heads: int = 8, mlp_ratio: float = 2.0, dropout: float = 0.1):
+        super().__init__()
+        
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        mlp_hidden_dim = int(feature_dim * mlp_ratio)
+        
+        # 多头注意力
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=feature_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # MLP混合器
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, feature_dim),
+            nn.Dropout(dropout)
+        )
+        
+        # 层归一化
+        self.norm1 = nn.LayerNorm(feature_dim)
+        self.norm2 = nn.LayerNorm(feature_dim)
+        
+    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        融合多个模态特征
+        Args:
+            features: 特征列表，每个特征shape为[B, feature_dim]
+        Returns:
+            [B, feature_dim] 融合后特征
+        """
+        if len(features) == 0:
+            raise ValueError("No features to fuse")
+        
+        if len(features) == 1:
+            return features[0]
+        
+        # 堆叠特征：[B, num_modalities, feature_dim]
+        stacked_features = torch.stack(features, dim=1)
+        B, M, D = stacked_features.shape
+        
+        # 多头注意力融合
+        attn_out, _ = self.multihead_attn(
+            stacked_features, stacked_features, stacked_features
+        )  # [B, M, D]
+        
+        # 残差连接 + 层归一化
+        attn_out = self.norm1(stacked_features + attn_out)
+        
+        # MLP混合器 + 残差连接
+        mlp_out = self.mlp(attn_out)
+        fused_features = self.norm2(attn_out + mlp_out)
+        
+        # 全局平均池化得到最终融合特征
+        final_features = fused_features.mean(dim=1)  # [B, D]
+        
+        return final_features
+
+
+class BNNeck(nn.Module):
+    """BatchNorm Neck：在特征和分类器之间的BN层"""
+    
+    def __init__(self, in_dim: int, num_classes: int, dropout: float = 0.5):
+        super().__init__()
+        
+        self.in_dim = in_dim
+        self.num_classes = num_classes
+        
+        # BN层
+        self.bn = nn.BatchNorm1d(in_dim)
+        self.bn.bias.requires_grad_(False)  # 禁用bias
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        # 分类器
+        self.classifier = nn.Linear(in_dim, num_classes, bias=False)
+        
+        # 初始化
+        nn.init.normal_(self.classifier.weight, std=0.001)
+    
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            features: [B, in_dim] 输入特征
+        Returns:
+            bn_features: [B, in_dim] BN后特征（用于ReID）
+            logits: [B, num_classes] 分类logits
+        """
+        bn_features = self.bn(features)
+        dropped_features = self.dropout(bn_features)
+        logits = self.classifier(dropped_features)
+        
+        return bn_features, logits
+
+
+class CLIPBasedMultiModalReIDModel(nn.Module):
+    """
+    基于CLIP-B/16的多模态ReID模型
+    架构：CLIP统一编码器 + MER模态路由 + SDM语义分离 + 特征融合 + ID分类
+    """
+    
     def __init__(self, config):
         super().__init__()
+        
         self.config = config
-
-        # 统一的融合维度
-        self.fusion_dim = getattr(config, "fusion_dim", 768)
-
-        # ===== 视觉骨干：支持 ViT 或 ResNet =====
-        self.backbone_name = getattr(config, "backbone", "resnet50")
-        use_pretrained = getattr(config, "use_pretrained_vision", False)
-
-        if self.backbone_name.startswith("vit"):
-            # ViT 分支
-            self.backbone_type = "vit"
-            self.vision_backbone = timm.create_model(
-                self.backbone_name,
-                pretrained=use_pretrained,
-                num_classes=0,
-            )
-            self.vision_out_dim = self.vision_backbone.num_features  # 通常 768
-
-            # Token 级模态适配器
-            self.modality_adapters = nn.ModuleDict({
-                'vis': ModalityAdapter(self.vision_out_dim),
-                'nir': ModalityAdapter(self.vision_out_dim),
-                'sk':  ModalityAdapter(self.vision_out_dim),
-                'cp':  ModalityAdapter(self.vision_out_dim),
-            })
-
-        else:
-            # ResNet / CNN 分支
-            self.backbone_type = "cnn"
-            self.vision_backbone = timm.create_model(
-                self.backbone_name,
-                pretrained=use_pretrained,
-                num_classes=0,
-                global_pool='avg'
-            )
-            self.vision_out_dim = self.vision_backbone.num_features  # resnet50 通常 2048
-
-            # 向量级模态适配器
-            self.modality_vec_adapters = nn.ModuleDict({
-                'vis': VectorModalityAdapter(self.vision_out_dim),
-                'nir': VectorModalityAdapter(self.vision_out_dim),
-                'sk':  VectorModalityAdapter(self.vision_out_dim),
-                'cp':  VectorModalityAdapter(self.vision_out_dim),
-            })
-
-        # 统一视觉输出到 fusion_dim
-        self.visual_projection = (
-            nn.Identity() if self.vision_out_dim == self.fusion_dim
-            else nn.Sequential(
-                nn.Linear(self.vision_out_dim, self.fusion_dim),
-                nn.LayerNorm(self.fusion_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-            )
+        self.device = getattr(config, 'device', 'cuda')
+        
+        # 模态配置
+        self.modalities = getattr(config, 'modalities', ['rgb', 'ir', 'cpencil', 'sketch', 'text'])
+        self.vision_modalities = [m for m in self.modalities if m != 'text']
+        
+        # 特征维度配置
+        self.fusion_dim = getattr(config, 'fusion_dim', 512)
+        self.vision_hidden_dim = getattr(config, 'vision_hidden_dim', 768)
+        
+        # ===== CLIP统一编码器 + MER路由 =====
+        self.clip_encoder = CLIPUnifiedEncoder(
+            clip_model_name=getattr(config, 'clip_model_name', 'openai/clip-vit-base-patch16'),
+            modalities=self.modalities,
+            vision_hidden_dim=self.vision_hidden_dim,
+            text_hidden_dim=512,  # CLIP text hidden dim
+            fusion_dim=self.fusion_dim,
+            lora_rank=getattr(config, 'mer_lora_rank', 4),
+            lora_alpha=getattr(config, 'mer_lora_alpha', 1.0),
+            drop_path=getattr(config, 'drop_path', 0.0),
+            freeze_text_backbone=getattr(config, 'freeze_text_backbone', False)
         )
-
-        # ===== 文本编码器 =====
-        txt_name = getattr(config, "text_model_name", "sentence-transformers/all-MiniLM-L6-v2")
-        self.text_tokenizer = AutoTokenizer.from_pretrained(txt_name)
-        self.text_encoder  = AutoModel.from_pretrained(txt_name)
-        self.freeze_text = getattr(config, "freeze_text", True)
-        if self.freeze_text:
-            for p in self.text_encoder.parameters():
-                p.requires_grad = False
-
-        self.text_in_dim = self.text_encoder.config.hidden_size
-        self.text_projection = nn.Sequential(
-            nn.Linear(self.text_in_dim, self.fusion_dim),
-            nn.LayerNorm(self.fusion_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
+        
+        # ===== SDM语义分离模块 =====
+        self.sdm_module = SemanticDisentanglementModule(
+            input_dim=self.fusion_dim,
+            semantic_dim=getattr(config, "sdm_semantic_dim", 512),
+            num_heads=getattr(config, "sdm_num_heads", 8)
         )
-
-        # ===== 融合/分类/检索 =====
-        self.fusion_module = HierarchicalMultiModalFusion(self.fusion_dim, num_layers=3, num_heads=8)
-
-        self.bnneck = nn.BatchNorm1d(self.fusion_dim)
-        self.classifier = nn.Linear(self.fusion_dim, self.config.num_classes, bias=False)
-
-        self.feature_projection = nn.Sequential(
-            nn.Linear(self.fusion_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.2),
-            nn.LayerNorm(512),
+        
+        # ===== 特征融合器 =====
+        self.feature_fusion = FeatureFusion(
+            feature_dim=self.fusion_dim,
+            num_heads=getattr(config, "fusion_num_heads", 8),
+            mlp_ratio=getattr(config, "fusion_mlp_ratio", 2.0),
+            dropout=getattr(config, "fusion_dropout", 0.1)
         )
-
-        self.contrastive_loss = AdvancedContrastiveLoss(
-            temperature=getattr(config, "contrastive_tau", 0.1),
-            margin=getattr(config, "contrastive_margin", 0.2),
-            topk=getattr(config, "hard_topk", 5),
-            w_fused=1.0, w_xmodal=0.0, anchor_modal='vis'  # 先只用 SupCon
+        
+        # ===== BN Neck + 分类器 =====
+        # num_classes将在训练时动态设置
+        self.num_classes = None
+        self.bn_neck = None
+        
+        # ===== 损失函数 =====
+        self.sdm_contrastive_loss = SDMContrastiveLoss(
+            temperature=getattr(config, "sdm_temperature", 0.1),
+            margin=getattr(config, "sdm_margin", 0.3),
+            alpha=1.0
         )
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.05)
         
-        # 文本特征缓存
-        self.text_cache = {}  # {text_str: encoded_feature_cpu}
-        self.cache_enabled = True
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-
-    def _vit_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """返回 ViT 的完整 token 序列（含 CLS），形状 (B, 1+N, C)"""
-        assert self.backbone_type == "vit", "Only ViT backbone uses _vit_tokens()"
-        m = self.vision_backbone
-        x = m.patch_embed(x)  # (B, N, C)
-        cls = m.cls_token.expand(x.size(0), -1, -1)  # (B, 1, C)
-        x = torch.cat((cls, x), dim=1)  # (B, 1+N, C)
-
-        pos_embed = m.pos_embed[:, :x.size(1), :]
-        x = x + pos_embed
-        x = m.pos_drop(x)
-
-        for blk in m.blocks:
-            x = blk(x)
-        x = m.norm(x)
-        return x
-
-    def encode_image(self, image: torch.Tensor, modality_type: str) -> torch.Tensor:
-        """返回 (B, fusion_dim)"""
-        if self.backbone_type == "vit":
-            tokens = self._vit_tokens(image)
-            if modality_type in getattr(self, 'modality_adapters', {}):
-                tokens = self.modality_adapters[modality_type](tokens)
-            feats = tokens[:, 1:, :].mean(dim=1) if tokens.size(1) > 1 else tokens.squeeze(1)
-        else:
-            feats = self.vision_backbone(image)  # (B, vision_out_dim)
-            if modality_type in getattr(self, 'modality_vec_adapters', {}):
-                feats = self.modality_vec_adapters[modality_type](feats)
-        feats = self.visual_projection(feats)
-        return feats
-
-    def encode_text(self, text_descriptions: List[str]) -> torch.Tensor:
-        batch_size = len(text_descriptions)
-        if batch_size == 0:
-            return torch.zeros(0, self.fusion_dim, device=self.device)
-
-        valid_texts = [t if isinstance(t, str) and len(t) > 0 else "[UNK]" for t in text_descriptions]
+        # 损失权重
+        self.ce_weight = getattr(config, 'ce_weight', 1.0)
+        self.contrastive_weight = getattr(config, 'contrastive_weight', 0.1)
         
-        if self.cache_enabled:
-            cached_features, uncached_texts, uncached_indices = [], [], []
-            for i, text in enumerate(valid_texts):
-                if text in self.text_cache:
-                    cached_features.append(self.text_cache[text])
-                else:
-                    uncached_texts.append(text); uncached_indices.append(i)
-            if len(uncached_texts) == 0:
-                return torch.stack(cached_features).to(self.device)
-
-            enc = self.text_tokenizer(uncached_texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
-            enc = {k: v.to(self.device) for k, v in enc.items()}
-            ctx = torch.no_grad() if self.freeze_text else contextlib.nullcontext()
-            with ctx:
-                out = self.text_encoder(**enc, return_dict=True)
-                token = out.last_hidden_state  # (B, L, H)
-            mask = enc['attention_mask'].unsqueeze(-1).float()
-            text_vec = (token * mask).sum(1) / mask.sum(1).clamp_min(1e-6)
-            text_vec = self.text_projection(text_vec)
-
-            for i, text in enumerate(uncached_texts):
-                self.text_cache[text] = text_vec[i].detach().cpu()
+        # 特征范数正则化参数
+        self.feature_target_norm = getattr(config, 'feature_target_norm', 10.0)
+        self.feature_norm_band = getattr(config, 'feature_norm_band', 3.0)
+        self.feature_norm_penalty = getattr(config, 'feature_norm_penalty', 2e-3)
+        
+        logging.info(f"✅ 初始化CLIP+MER多模态ReID模型完成")
+        logging.info(f"   - 支持模态: {self.modalities}")
+        logging.info(f"   - 融合维度: {self.fusion_dim}")
+        logging.info(f"   - MER LoRA rank: {getattr(config, 'mer_lora_rank', 4)}")
+    
+    def set_num_classes(self, num_classes: int):
+        """动态设置类别数并初始化分类器"""
+        self.num_classes = num_classes
+        self.bn_neck = BNNeck(
+            in_dim=self.fusion_dim,
+            num_classes=num_classes,
+            dropout=getattr(self.config, 'dropout_rate', 0.5)
+        ).to(self.device)
+        
+        logging.info(f"设置分类器：{num_classes} 个ID类别")
+    
+    def forward(self, 
+                images: Optional[Dict[str, torch.Tensor]] = None,
+                texts: Optional[List[str]] = None,
+                return_features: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        模型前向传播
+        Args:
+            images: 图像字典 {modality: [B,C,H,W]}
+            texts: 文本列表
+            return_features: 是否返回中间特征
+        Returns:
+            输出字典，包含logits、features等
+        """
+        modality_features = {}
+        raw_modality_features = {}  # 保存原始特征用于SDM损失
+        
+        # ===== 视觉模态编码 =====
+        if images is not None:
+            for modality, img_tensor in images.items():
+                if modality in self.vision_modalities:
+                    # CLIP+MER编码
+                    visual_features = self.clip_encoder.encode_vision(
+                        img_tensor.to(self.device), modality
+                    )  # [B, fusion_dim]
+                    
+                    raw_modality_features[modality] = visual_features
+                    
+                    # SDM语义分离（仅训练时）
+                    if self.training:
+                        semantic_features = self.sdm_module(visual_features)
+                        modality_features[modality] = semantic_features
+                    else:
+                        modality_features[modality] = visual_features
+        
+        # ===== 文本模态编码 =====
+        if texts is not None:
+            text_features = self.clip_encoder.encode_text(texts)  # [B, fusion_dim]
+            raw_modality_features['text'] = text_features
             
-            result_features = [None] * batch_size
-            cached_idx = 0
-            for i in range(batch_size):
-                if i not in uncached_indices:
-                    result_features[i] = cached_features[cached_idx].to(self.device); cached_idx += 1
-            for i, orig_idx in enumerate(uncached_indices):
-                result_features[orig_idx] = text_vec[i]
-            return torch.stack(result_features)
-        else:
-            enc = self.text_tokenizer(valid_texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
-            enc = {k: v.to(self.device) for k, v in enc.items()}
-            ctx = torch.no_grad() if self.freeze_text else contextlib.nullcontext()
-            with ctx:
-                out = self.text_encoder(**enc, return_dict=True)
-                token = out.last_hidden_state
-            mask = enc['attention_mask'].unsqueeze(-1).float()
-            text_vec = (token * mask).sum(1) / mask.sum(1).clamp_min(1e-6)
-            text_vec = self.text_projection(text_vec)
-            return text_vec
-
-    def forward(self, batch: Dict, return_features: bool = False):
-        images: Dict[str, torch.Tensor] = batch['images']
-        text_descriptions: List[str] = batch.get('text_description', [])
-        raw_mm = batch.get('modality_mask', {})
-
-        B = next(iter(images.values())).size(0)
-        modality_features, modality_masks = {}, {}
-
-        def _mask_vec(name):
-            v = raw_mm.get(name, None)
-            if isinstance(v, torch.Tensor):
-                return v.to(self.device).float().view(-1, 1)
-            elif isinstance(v, (list, tuple)):
-                return torch.tensor(v, device=self.device, dtype=torch.float32).view(-1,1)
-            return torch.ones(B, 1, device=self.device)
-
-        # 图像模态
-        for m in ['vis','nir','sk','cp']:
-            if m in images:
-                feats = self.encode_image(images[m].to(self.device), m)
-                mvec  = _mask_vec(m)
-                feats = feats * mvec
-                modality_features[m] = feats
-                modality_masks[m]    = mvec.squeeze(1)
-
-        # 文本模态
-        add_text = any((isinstance(t, str) and t.strip()) for t in text_descriptions)
-        if add_text and 'text' in raw_mm:
-            tfeat = self.encode_text(text_descriptions)
-            tvec  = _mask_vec('text')
-            modality_features['text'] = tfeat * tvec
-            modality_masks['text']    = tvec.squeeze(1)
-
-        # 融合
-        mask_for_fusion = {m: bool(modality_masks.get(m, torch.zeros(B, device=self.device)).any().item())
-                        for m in modality_features.keys()}
-
-        fused_features = self.fusion_module(modality_features, mask_for_fusion)  # [B,C]
-        reid = self.feature_projection(fused_features)
-        # 防御：极小范数样本加微噪，避免梯度不稳定
+            # SDM语义分离（仅训练时）
+            if self.training:
+                semantic_text_features = self.sdm_module(text_features)
+                modality_features['text'] = semantic_text_features
+            else:
+                modality_features['text'] = text_features
+        
+        # ===== 特征融合 =====
+        if len(modality_features) == 0:
+            raise ValueError("至少需要提供一种模态的输入")
+        
+        # 模态dropout（训练时随机丢弃部分模态）
         if self.training:
-            eps_mask = (fused_features.norm(p=2, dim=1, keepdim=True) < 1e-6)
-            if eps_mask.any():
-                fused_features = fused_features + eps_mask.float() * torch.randn_like(fused_features) * 1e-5
-
-        reid_norm = F.normalize(reid, p=2, dim=1)
-
-        if return_features:
-            return reid_norm
-
-        neck = self.bnneck(fused_features)
-        logits = self.classifier(neck)
-
-        return {
-            'logits': logits,
+            modality_dropout = getattr(self.config, 'modality_dropout', 0.0)
+            min_modalities = getattr(self.config, 'min_modalities', 1)
+            
+            if modality_dropout > 0 and len(modality_features) > min_modalities:
+                keep_modalities = []
+                for mod, feat in modality_features.items():
+                    if torch.rand(1).item() > modality_dropout:
+                        keep_modalities.append((mod, feat))
+                
+                if len(keep_modalities) >= min_modalities:
+                    modality_features = dict(keep_modalities)
+        
+        # 融合多模态特征
+        feature_list = list(modality_features.values())
+        if len(feature_list) == 1:
+            fused_features = feature_list[0]
+        else:
+            fused_features = self.feature_fusion(feature_list)  # [B, fusion_dim]
+        
+        # ===== ID分类 =====
+        outputs = {
             'features': fused_features,
-            'reid_features': reid_norm,
-            'modality_features': modality_features,
-            'modality_masks': modality_masks,
-            'reid_features_raw': reid,
+            'raw_modality_features': raw_modality_features,
+            'modality_features': modality_features
         }
-
-    def compute_loss(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor, batch: Dict=None):
-        ce = self.ce_loss(outputs['logits'], labels)
-        con = self.contrastive_loss(
-            outputs['reid_features'],
-            labels,
-            outputs['modality_features'],
-            modal_masks=outputs.get('modality_masks', None)
+        
+        if self.bn_neck is not None:
+            bn_features, logits = self.bn_neck(fused_features)
+            outputs.update({
+                'bn_features': bn_features,
+                'logits': logits
+            })
+        
+        if return_features:
+            outputs['intermediate_features'] = {
+                'raw_modality': raw_modality_features,
+                'semantic_modality': modality_features,
+                'fused': fused_features
+            }
+        
+        return outputs
+    
+    def compute_loss(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        计算总损失：ID分类损失 + SDM对齐损失 + 特征范数正则化
+        Args:
+            outputs: 模型输出
+            labels: ID标签
+        Returns:
+            损失字典
+        """
+        # ID分类损失
+        if 'logits' not in outputs:
+            raise ValueError("模型输出中缺少logits，请确保已设置num_classes")
+        
+        ce_loss = self.ce_loss(outputs['logits'], labels)
+        
+        # SDM对比损失：RGB锚定对齐损失
+        raw_modality_features = outputs.get('raw_modality_features', {})
+        fused_features = outputs['features']
+        
+        sdm_loss = self.sdm_contrastive_loss(
+            raw_modality_features,
+            fused_features,
+            labels
         )
-        contrastive_weight = getattr(self.config, 'contrastive_weight', 0.1)
-
-        # --- 新增：特征范数正则（拉回到一个带宽内）---
-        feats = outputs['features']                      # [B, C] 这是融合后、进BNNeck前的向量
-        fn = feats.norm(p=2, dim=1)
-        target = getattr(self.config, 'feature_target_norm', 10.0)   # 可以在 config 里放个默认 10
-        band   = getattr(self.config, 'feature_norm_band', 4.0)      # 容忍带宽
-        lam    = getattr(self.config, 'feature_norm_penalty', 1e-3)  # 权重很小即可
-
-        # 只惩罚远离[target-band, target+band] 的样本（Huber-ish）
-        over = (fn - (target + band)).clamp_min(0)
-        under = ((target - band) - fn).clamp_min(0)
+        
+        # 特征范数正则化
+        feats = outputs['features']  # [B, fusion_dim]
+        fn = feats.norm(p=2, dim=1)  # [B,] 每个样本的L2范数
+        
+        target_norm = self.feature_target_norm
+        band = self.feature_norm_band
+        lam = self.feature_norm_penalty
+        
+        over = torch.clamp(fn - (target_norm + band), min=0)
+        under = torch.clamp((target_norm - band) - fn, min=0)
         feat_penalty = (over**2 + under**2).mean() * lam
-        # -------------------------------------------
+        
+        # 总损失
+        total_loss = (self.ce_weight * ce_loss + 
+                     self.contrastive_weight * sdm_loss + 
+                     feat_penalty)
+        
+        return {
+            'total_loss': total_loss,
+            'ce_loss': ce_loss,
+            'sdm_loss': sdm_loss,
+            'contrastive_loss': sdm_loss,  # 兼容性
+            'feat_penalty': feat_penalty,
+            'feature_norm': fn.mean().item()
+        }
+    
+    def get_learnable_params(self) -> List[Dict[str, Any]]:
+        """
+        获取分层学习率的参数组
+        Returns:
+            参数组列表，每组包含params和lr
+        """
+        config = self.config
+        
+        # 从CLIP编码器获取参数分组
+        clip_param_groups = self.clip_encoder.get_learnable_params()
+        
+        # 构建优化器参数组
+        param_groups = [
+            {
+                'params': clip_param_groups['backbone'],
+                'lr': getattr(config, 'base_learning_rate', 1e-5),
+                'name': 'clip_backbone'
+            },
+            {
+                'params': clip_param_groups['mer_loras'],
+                'lr': getattr(config, 'mer_learning_rate', 5e-5),
+                'name': 'mer_loras'
+            },
+            {
+                'params': clip_param_groups['tokenizers'],
+                'lr': getattr(config, 'tokenizer_learning_rate', 5e-5),
+                'name': 'tokenizers'
+            },
+            {
+                'params': clip_param_groups['projections'],
+                'lr': getattr(config, 'fusion_learning_rate', 5e-5),
+                'name': 'projections'
+            }
+        ]
+        
+        # 添加其他模块的参数
+        added_params = set()
+        for group in param_groups:
+            added_params.update(group['params'])
+        
+        other_params = []
+        for name, param in self.named_parameters():
+            if param not in added_params:
+                other_params.append(param)
+        
+        if other_params:
+            param_groups.append({
+                'params': other_params,
+                'lr': getattr(config, 'fusion_learning_rate', 5e-5),
+                'name': 'other_modules'
+            })
+        
+        # 过滤空参数组
+        param_groups = [group for group in param_groups if len(group['params']) > 0]
+        
+        return param_groups
 
-        total = ce + contrastive_weight * con + feat_penalty
-        return {'total_loss': total, 'ce_loss': ce, 'contrastive_loss': con, 'feat_penalty': feat_penalty}
+
+if __name__ == "__main__":
+    # 简单测试
+    from dataclasses import dataclass
+    
+    @dataclass
+    class TestConfig:
+        modalities = ['rgb', 'ir', 'cpencil', 'sketch', 'text']
+        fusion_dim = 512
+        vision_hidden_dim = 768
+        clip_model_name = 'openai/clip-vit-base-patch16'
+        mer_lora_rank = 4
+        mer_lora_alpha = 1.0
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    config = TestConfig()
+    model = CLIPBasedMultiModalReIDModel(config)
+    model.set_num_classes(100)  # 假设100个ID
+    
+    # 测试前向传播
+    images = {
+        'rgb': torch.randn(2, 3, 224, 224),
+        'ir': torch.randn(2, 1, 224, 224)
+    }
+    texts = ["A person walking", "红外图像中的行人"]
+    
+    outputs = model(images=images, texts=texts)
+    print(f"输出keys: {outputs.keys()}")
+    print(f"Logits shape: {outputs['logits'].shape}")
+    print(f"Features shape: {outputs['features'].shape}")
+    
+    # 测试损失计算
+    labels = torch.randint(0, 100, (2,))
+    loss_dict = model.compute_loss(outputs, labels)
+    print(f"损失项: {loss_dict.keys()}")
+    
+    print("✅ CLIP+MER多模态ReID模型测试通过！")

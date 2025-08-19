@@ -17,7 +17,7 @@ class ModalityAugmentation:
     def get_transform(self):
         if self.is_training:
             return transforms.Compose([
-                transforms.Resize((self.config.image_size, self.config.image_size)),
+                transforms.RandomResizedCrop(self.config.image_size, scale=(0.8, 1.0)),  # 先保守裁剪，稳定后再放宽
                 transforms.RandomHorizontalFlip(0.5),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2) if self.config.color_jitter else transforms.Lambda(lambda x: x),
                 transforms.ToTensor(),
