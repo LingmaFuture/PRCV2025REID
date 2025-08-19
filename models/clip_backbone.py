@@ -287,30 +287,75 @@ class CLIPUnifiedEncoder(nn.Module):
     
     def encode_text(self, texts: List[str]) -> torch.Tensor:
         """
-        文本编码
+        文本编码（带缓存和批量优化）
         Args:
             texts: 文本列表
         Returns:
             [B, fusion_dim] 文本特征
         """
-        # 文本tokenization
-        text_inputs = self.tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=77  # CLIP标准长度
-        )
-        text_inputs = {k: v.to(next(self.parameters()).device) for k, v in text_inputs.items()}
+        device = next(self.parameters()).device
         
-        # CLIP文本编码
-        text_outputs = self.clip_model.text_model(**text_inputs)
-        text_embeds = text_outputs.pooler_output  # [B, text_hidden_dim]
+        # 检查缓存，分离已缓存和未缓存的文本
+        cached_features = []
+        uncached_texts = []
+        uncached_indices = []
         
-        # 投影到fusion_dim
-        text_features = self.text_proj(text_embeds)  # [B, fusion_dim]
+        for i, text in enumerate(texts):
+            if text in self.text_cache and self.freeze_text_backbone:
+                # 只有在冻结文本编码器时才使用缓存
+                cached_features.append(self.text_cache[text])
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
         
-        return text_features
+        # 批量处理未缓存的文本（加速优化B）
+        if uncached_texts:
+            # 一次性分词所有未缓存的文本
+            text_inputs = self.tokenizer(
+                uncached_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=77  # CLIP标准长度
+            )
+            text_inputs = {k: v.to(device, non_blocking=True) for k, v in text_inputs.items()}
+            
+            # CLIP文本编码
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
+                text_outputs = self.clip_model.text_model(**text_inputs)
+                text_embeds = text_outputs.pooler_output  # [B, text_hidden_dim]
+                
+                # 投影到fusion_dim
+                text_features = self.text_proj(text_embeds)  # [B, fusion_dim]
+            
+            # 如果文本编码器冻结，缓存结果
+            if self.freeze_text_backbone:
+                for i, text in enumerate(uncached_texts):
+                    self.text_cache[text] = text_features[i].detach().cpu()
+        
+        # 重组特征（保持原始顺序）
+        if len(uncached_texts) == len(texts):
+            # 全部文本都未缓存
+            return text_features
+        elif len(uncached_texts) == 0:
+            # 全部文本都已缓存
+            return torch.stack([feat.to(device) for feat in cached_features])
+        else:
+            # 混合情况：重组特征
+            final_features = torch.zeros(len(texts), self.fusion_dim, device=device, dtype=text_features.dtype)
+            
+            # 填入缓存的特征
+            cached_idx = 0
+            for i in range(len(texts)):
+                if i not in uncached_indices:
+                    final_features[i] = cached_features[cached_idx].to(device)
+                    cached_idx += 1
+            
+            # 填入新计算的特征
+            for idx, uncached_idx in enumerate(uncached_indices):
+                final_features[uncached_idx] = text_features[idx]
+            
+            return final_features
     
     def forward(
         self, 

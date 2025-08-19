@@ -23,7 +23,7 @@ from sklearn.model_selection import train_test_split
 import torchvision.transforms as transforms
 
 # === 你项目里的数据与模型 ===
-from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn
+from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn, modal_batched_collate_fn
 from models.model import CLIPBasedMultiModalReIDModel  
 from configs.config import TrainingConfig
 
@@ -224,6 +224,109 @@ def call_model_with_batch(model, batch, return_features=False):
                 texts=texts if texts else None, 
                 return_features=return_features)
 
+
+def batched_modal_forward(model, batch, device, return_features=False):
+    """
+    加速优化A：按模态批量前向传播
+    对每个模态进行一次性编码，然后重组特征
+    Args:
+        model: CLIP+MER模型
+        batch: 按模态分桶的batch数据（来自modal_batched_collate_fn）
+        device: 计算设备
+        return_features: 是否返回特征
+    Returns:
+        模型输出（与原始格式兼容）
+    """
+    if 'modal_buckets' not in batch:
+        # 如果不是分桶格式，回退到原始方法
+        return call_model_with_batch(model, batch, return_features)
+    
+    batch_size = batch['batch_size']
+    modal_buckets = batch['modal_buckets']
+    
+    # 为每个样本分配特征槽位
+    modality_features = {}
+    features_slots = [None] * batch_size
+    
+    # 按模态批量编码（核心加速逻辑）
+    total_processed_samples = set()  # 跟踪处理过的样本
+    
+    for modality, bucket_data in modal_buckets.items():
+        if not bucket_data:
+            continue
+            
+        data = bucket_data['data']
+        indices = bucket_data['indices']
+        total_processed_samples.update(indices)  # 记录处理的样本索引
+        
+        # 移动数据到设备
+        if modality == 'text':
+            # 文本数据：批量分词和编码
+            modality_feats = model.clip_encoder.encode_text(data)  # [N, fusion_dim]
+        else:
+            # 图像数据：批量编码
+            img_tensor = data.to(device, non_blocking=True)  # [N, C, H, W]
+            # 映射模态名称：vis->rgb等
+            mapped_modality = map_modality_name(modality)
+            modality_feats = model.clip_encoder.encode_vision(img_tensor, mapped_modality)  # [N, fusion_dim]
+        
+        # 存储模态特征和索引映射
+        modality_features[map_modality_name(modality)] = modality_feats
+        
+        # 将特征分配到对应的样本槽位
+        for slot_idx, orig_idx in enumerate(indices):
+            if features_slots[orig_idx] is None:
+                features_slots[orig_idx] = []
+            features_slots[orig_idx].append(modality_feats[slot_idx])
+    
+    # 检查是否有样本未被处理（调试信息）
+    unprocessed_samples = []
+    for i in range(batch_size):
+        if i not in total_processed_samples:
+            unprocessed_samples.append(i)
+    
+    if unprocessed_samples and len(unprocessed_samples) > batch_size * 0.1:  # 超过10%样本未处理时警告
+        import logging
+        logging.warning(f"批次中有{len(unprocessed_samples)}个样本({len(unprocessed_samples)/batch_size*100:.1f}%)没有有效模态数据，将使用零特征")
+    
+    # 融合每个样本的多模态特征（确保与batch_size一致）
+    final_features = []
+    for i in range(batch_size):  # 确保遍历所有batch中的样本
+        slot_feats = features_slots[i]
+        if slot_feats is None or len(slot_feats) == 0:
+            # 如果某个样本没有有效模态，用零向量填充
+            final_features.append(torch.zeros(model.fusion_dim, device=device, dtype=torch.float32))
+        elif len(slot_feats) == 1:
+            # 单模态样本
+            final_features.append(slot_feats[0].to(dtype=torch.float32))
+        else:
+            # 多模态融合：为单个样本添加batch维度，确保数据类型一致
+            slot_feats_batched = [feat.unsqueeze(0).to(dtype=torch.float32) for feat in slot_feats]  # 转换为float32
+            fused_feat_batch = model.feature_fusion(slot_feats_batched)  # [1, fusion_dim]
+            fused_feat = fused_feat_batch.squeeze(0)  # 移除batch维度 [fusion_dim]
+            final_features.append(fused_feat)
+    
+    # 验证特征数量与batch_size一致
+    assert len(final_features) == batch_size, f"特征数量{len(final_features)}与batch_size{batch_size}不匹配"
+    fused_features = torch.stack(final_features)  # [B, fusion_dim]
+    
+    # 构建输出（与原始格式兼容）
+    outputs = {
+        'features': fused_features,
+        'raw_modality_features': modality_features,
+        'modality_features': modality_features  # 简化版本
+    }
+    
+    # 如果需要分类输出
+    if model.bn_neck is not None:
+        bn_features, logits = model.bn_neck(fused_features)
+        outputs.update({
+            'bn_features': bn_features,
+            'logits': logits
+        })
+    
+    return outputs
+
 def build_val_presence_table(dataset, val_indices):
     presence = {}
     for idx in val_indices:
@@ -392,7 +495,11 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                           leave=False, ncols=100, mininterval=0.5):
             batch = move_batch_to_device(batch, device)
             with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
-                outputs = call_model_with_batch(model, batch, return_features=True)
+                # 兼容按模态批量前向传播（如果启用）
+                if 'modal_buckets' in batch:
+                    outputs = batched_modal_forward(model, batch, device, return_features=True)
+                else:
+                    outputs = call_model_with_batch(model, batch, return_features=True)
                 feats = outputs['features']  # 提取融合后的特征用于ReID
             labels = batch['person_id']
             gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
@@ -421,7 +528,11 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                                   leave=False, ncols=100, mininterval=0.5):
                     batch = move_batch_to_device(batch, device)
                     with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
-                        outputs = call_model_with_batch(model, batch, return_features=True)
+                        # 兼容按模态批量前向传播（如果启用）
+                        if 'modal_buckets' in batch:
+                            outputs = batched_modal_forward(model, batch, device, return_features=True)
+                        else:
+                            outputs = call_model_with_batch(model, batch, return_features=True)
                         feats = outputs['features']  # 提取融合后的特征用于ReID
                     labels = batch['person_id']
                     qf.append(feats.cpu()); ql.append(labels.cpu())
@@ -514,7 +625,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             logging.info(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
 
         with autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-            outputs = call_model_with_batch(model, batch, return_features=False)
+            # 加速优化A：使用按模态批量前向传播
+            if 'modal_buckets' in batch:
+                outputs = batched_modal_forward(model, batch, device, return_features=False)
+            else:
+                outputs = call_model_with_batch(model, batch, return_features=False)
             loss_dict = model.compute_loss(outputs, labels)
             
             # SDM对比损失监控（仅在实际参与训练时警告）
@@ -753,6 +868,10 @@ def train_multimodal_reid():
     logging.info(f"每个锚的正样本数: {num_instances-1}")
     
     train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
+    # 加速优化A：使用按模态分桶的collate函数
+    use_modal_batching = getattr(config, 'use_modal_batching', True)  # 默认启用
+    selected_collate_fn = modal_batched_collate_fn if use_modal_batching else compatible_collate_fn
+    
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
@@ -760,8 +879,11 @@ def train_multimodal_reid():
         pin_memory=getattr(config, "pin_memory", True),
         persistent_workers=True,  # 保持工作进程持续运行
         prefetch_factor=2,        # 预取因子提升IO效率
-        collate_fn=compatible_collate_fn
+        collate_fn=selected_collate_fn
     )
+    
+    if use_modal_batching:
+        logging.info("启用按模态批量前向传播加速（优化A）")
 
     # 本地验证 DataLoader（赛制对齐）
     gallery_loader, query_loaders = build_eval_loaders_by_rule(
@@ -778,9 +900,9 @@ def train_multimodal_reid():
     num_classes = getattr(config, 'num_classes', None)
     if num_classes is not None:
         model.set_num_classes(num_classes)
-        logging.info(f"✅ 设置分类器：{num_classes} 个ID类别")
+        logging.info(f"设置分类器：{num_classes} 个ID类别")
     else:
-        logging.warning("⚠️ config中未找到num_classes，请确保在数据加载后设置")
+        logging.warning("config中未找到num_classes，请确保在数据加载后设置")
 
     # 优化器 - 支持CLIP+MER分层学习率
     param_groups = model.get_learnable_params()
@@ -813,7 +935,7 @@ def train_multimodal_reid():
     elif scheduler_type == 'plateau':
         scheduler = ReduceLROnPlateau(
             optimizer, mode='max', factor=0.5, patience=8, threshold=0.001,
-            min_lr=base_lr * 0.001, verbose=True
+            min_lr=getattr(config, 'base_learning_rate', 1e-5) * 0.001, verbose=True
         )
         logging.info("调度器: ReduceLROnPlateau (基于mAP)")
     elif scheduler_type == 'step':

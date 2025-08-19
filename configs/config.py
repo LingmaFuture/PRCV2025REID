@@ -113,6 +113,9 @@ class TrainingConfig:
     inference_batch_size: int = 32
     best_model_path: str = "./checkpoints/best_model.pth"
     
+    # 加速优化开关
+    use_modal_batching: bool = True  # 启用按模态批量前向传播（优化A）
+    
     def __post_init__(self):
         """初始化配置后的处理"""
         os.makedirs(self.save_dir, exist_ok=True)

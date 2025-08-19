@@ -342,3 +342,79 @@ def compatible_collate_fn(batch):
     batch_dict['modality_mask'] = mask_out
 
     return batch_dict
+
+
+def modal_batched_collate_fn(batch):
+    """
+    加速优化A：按模态分桶的批量前向collate函数
+    将样本按模态分组，支持批量前向传播
+    """
+    if not batch:
+        return {}
+    
+    batch_size = len(batch)
+    
+    # 基础信息收集
+    person_ids = torch.stack([sample['person_id'] for sample in batch])
+    
+    # 按模态分桶数据结构（加速优化A核心）
+    modal_buckets = {
+        'vis': {'tensors': [], 'indices': [], 'texts': []},
+        'nir': {'tensors': [], 'indices': [], 'texts': []}, 
+        'sk': {'tensors': [], 'indices': [], 'texts': []},
+        'cp': {'tensors': [], 'indices': [], 'texts': []},
+        'text': {'tensors': [], 'indices': [], 'texts': []}
+    }
+    
+    # 遍历batch，按模态分桶
+    for i, sample in enumerate(batch):
+        # 处理图像模态
+        if 'images' in sample:
+            for modality in ['vis', 'nir', 'sk', 'cp']:
+                if (modality in sample['images'] and 
+                    isinstance(sample['images'][modality], torch.Tensor) and
+                    sample['images'][modality].numel() > 0):
+                    # 检查模态mask
+                    modal_mask = sample.get('modality_mask', {})
+                    if modal_mask.get(modality, 0.0) > 0.5:  # 有效模态
+                        modal_buckets[modality]['tensors'].append(sample['images'][modality])
+                        modal_buckets[modality]['indices'].append(i)
+        
+        # 处理文本模态
+        text_desc = sample.get('text_description', [""])
+        if isinstance(text_desc, list) and len(text_desc) > 0:
+            text = text_desc[0]
+        elif isinstance(text_desc, str):
+            text = text_desc
+        else:
+            text = ""
+        
+        if text and len(text.strip()) > 0:
+            modal_buckets['text']['texts'].append(text)
+            modal_buckets['text']['indices'].append(i)
+    
+    # 构建批量数据（只保留有效模态）
+    batched_data = {
+        'person_id': person_ids,
+        'batch_size': batch_size,
+        'modal_buckets': {}
+    }
+    
+    # 为每个模态创建批量tensor
+    for modality, bucket in modal_buckets.items():
+        if modality == 'text':
+            if bucket['texts']:
+                batched_data['modal_buckets'][modality] = {
+                    'data': bucket['texts'],  # 文本列表
+                    'indices': bucket['indices'],
+                    'batch_size': len(bucket['texts'])
+                }
+        else:
+            if bucket['tensors']:
+                batched_data['modal_buckets'][modality] = {
+                    'data': torch.stack(bucket['tensors']),  # [N, C, H, W]
+                    'indices': bucket['indices'],
+                    'batch_size': len(bucket['tensors'])
+                }
+    
+    return batched_data
