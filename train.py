@@ -37,6 +37,10 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
+    
+    # 加速优化：启用TF32和优化CUDA操作
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 def setup_logging(log_dir):
     os.makedirs(log_dir, exist_ok=True)
@@ -171,30 +175,50 @@ def move_batch_to_device(batch, device):
 def convert_batch_for_clip_model(batch):
     """
     将数据集的batch格式转换为CLIP+MER模型的输入格式
+    修复：按modality_mask过滤有效模态，避免零特征污染融合
     Args:
-        batch: 数据集返回的batch，格式为 {'images': {...}, 'text_description': [...], ...}
+        batch: 数据集返回的batch，格式为 {'images': {...}, 'text_description': [...], 'modality_mask': {...}}
     Returns:
-        images: {modality: tensor} 图像字典，模态名称已映射
-        texts: List[str] 文本列表
+        images: {modality: tensor} 图像字典，仅包含有效模态，模态名称已映射
+        texts: List[str] 文本列表，仅包含有效文本
     """
     images = {}
     texts = None
     
-    # 处理图像数据
+    # 获取模态掩码
+    modality_mask = batch.get('modality_mask', {})
+    
+    # 处理图像数据 - 关键修复：只处理mask指示为有效的模态
     if 'images' in batch:
         for old_modality, image_tensor in batch['images'].items():
             if torch.is_tensor(image_tensor) and image_tensor.numel() > 0:
-                new_modality = map_modality_name(old_modality)
-                images[new_modality] = image_tensor
+                # 检查该模态是否在整个batch中有任何有效样本
+                mask_tensor = modality_mask.get(old_modality, torch.zeros(image_tensor.size(0)))
+                if isinstance(mask_tensor, torch.Tensor) and mask_tensor.sum() > 0:
+                    # 至少有一个样本在该模态下有效，才包含该模态
+                    new_modality = map_modality_name(old_modality)
+                    images[new_modality] = image_tensor
     
-    # 处理文本数据
+    # 处理文本数据 - 修复：始终保持batch size一致，用空字符串占位
     if 'text_description' in batch:
         text_descriptions = batch['text_description']
         if isinstance(text_descriptions, list) and len(text_descriptions) > 0:
-            # 过滤空文本
-            texts = [text for text in text_descriptions if text and text.strip()]
-            if not texts:  # 如果所有文本都是空的
-                texts = None
+            # 获取文本mask
+            text_mask = modality_mask.get('text', torch.ones(len(text_descriptions)))
+            if isinstance(text_mask, torch.Tensor):
+                # 始终保持batch size，用空字符串填充无效文本位置
+                processed_texts = []
+                has_any_valid = False
+                for i, (text, mask_val) in enumerate(zip(text_descriptions, text_mask)):
+                    if mask_val > 0.5 and text and text.strip():
+                        processed_texts.append(text.strip())
+                        has_any_valid = True
+                    else:
+                        processed_texts.append("")  # 空文本占位，让CLIP自然处理
+                
+                # 只要batch中有文本字段，就传递给模型（包含空字符串）
+                # CLIP tokenizer可以正常处理空字符串
+                texts = processed_texts
     
     return images, texts
 
@@ -215,9 +239,13 @@ def call_model_with_batch(model, batch, return_features=False):
     if not images and not texts:
         raise ValueError("Batch中没有有效的图像或文本数据")
     
-    # 调用模型
+    # 获取modality_masks
+    modality_masks = batch.get('modality_mask', None)
+    
+    # 调用模型（传递mask信息）
     return model(images=images if images else None, 
                 texts=texts if texts else None, 
+                modality_masks=modality_masks,
                 return_features=return_features)
 
 def build_val_presence_table(dataset, val_indices):
@@ -313,6 +341,8 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=True,
+        prefetch_factor=2,
         collate_fn=compatible_collate_fn
     )
     non_vis = ['nir', 'sk', 'cp', 'text']
@@ -337,6 +367,8 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
+                persistent_workers=True,
+                prefetch_factor=2,
                 collate_fn=compatible_collate_fn
             )
             query_loaders['single'][m] = loader
@@ -355,6 +387,8 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
                     shuffle=False,
                     num_workers=num_workers,
                     pin_memory=pin_memory,
+                    persistent_workers=True,
+                    prefetch_factor=2,
                     collate_fn=compatible_collate_fn
                 )
                 query_loaders[tag][key] = loader
@@ -371,7 +405,14 @@ def _subsample_features(feats: torch.Tensor, labels: torch.Tensor, ratio: float,
     return feats[perm], labels[perm]
 
 def validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0):
-    """赛制对齐评测：mAP/CMC；按样本子集采样避免偏置"""
+    """
+    赛制对齐评测：mAP/CMC；按样本子集采样避免偏置
+    
+    关键一致性原则：
+    1. 强制使用bn_features进行检索，与训练中的对齐损失保持完全一致
+    2. 融合阶段已通过mask处理缺失模态，检索时无需额外mask处理
+    3. 直接L2归一化+余弦相似度计算，简洁高效
+    """
     model.eval()
     rng = torch.Generator(device=device)
     rng.manual_seed(1234)
@@ -381,9 +422,13 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
         for batch in tqdm(gallery_loader, desc=f'提取画廊特征(全量)', 
                           leave=False, ncols=100, mininterval=0.5):
             batch = move_batch_to_device(batch, device)
-            with autocast(device_type='cuda', enabled=device.type == 'cuda'):
+            with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
                 outputs = call_model_with_batch(model, batch, return_features=True)
-                feats = outputs['features']  # 提取融合后的特征用于ReID
+                # 强制使用BN后特征进行检索，确保与训练对齐损失一致
+                if 'bn_features' in outputs:
+                    feats = outputs['bn_features']  # BN后特征，与对齐损失一致
+                else:
+                    raise ValueError("模型输出缺少bn_features，检索特征不一致")
             labels = batch['person_id']
             gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
         gal_feats = torch.cat(gal_feats, dim=0)
@@ -410,9 +455,13 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
                 for batch in tqdm(qloader, desc=f'提取查询特征[{tag}:{key}]', 
                                   leave=False, ncols=100, mininterval=0.5):
                     batch = move_batch_to_device(batch, device)
-                    with autocast(device_type='cuda', enabled=device.type == 'cuda'):
+                    with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
                         outputs = call_model_with_batch(model, batch, return_features=True)
-                        feats = outputs['features']  # 提取融合后的特征用于ReID
+                        # 强制使用BN后特征进行检索，确保与训练对齐损失一致
+                        if 'bn_features' in outputs:
+                            feats = outputs['bn_features']  # BN后特征，与对齐损失一致
+                        else:
+                            raise ValueError("模型输出缺少bn_features，检索特征不一致")
                     labels = batch['person_id']
                     qf.append(feats.cpu()); ql.append(labels.cpu())
                 if not qf:
@@ -470,7 +519,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     use_amp = (scaler is not None and getattr(scaler, "is_enabled", lambda: True)())
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', 
-                leave=True, ncols=120, mininterval=1.0, maxinterval=2.0)
+                leave=True, ncols=120, mininterval=2.0, maxinterval=5.0)
     
     # 添加批次构成监控（前3个batch）
     if epoch <= 3:
@@ -503,7 +552,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         if batch_idx == 0:
             logging.info(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
 
-        with autocast(device_type='cuda', enabled=use_amp):
+        with autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
             outputs = call_model_with_batch(model, batch, return_features=False)
             loss_dict = model.compute_loss(outputs, labels)
             
@@ -631,15 +680,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         avg_reid  = float(reid_raw_norms.mean().item()) if reid_raw_norms is not None else 0.0
         avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
 
-        pbar.set_postfix({
-            'Loss': f'{current_loss:.3f}',
-            'CE': f'{float(ce_loss.item()):.3f}',
-            'SDM': f'{float(sdm_loss.item()):.3f}',  # 显示SDM对齐损失
-            'Feat(Fused)': f'{avg_fused:.2f}',
-            #'Feat(ReID)': f'{avg_reid:.2f}',
-            'GradNorm': f'{avg_grad_norm:.2f}',
-            'Spikes': loss_spikes
-        })
+        # 优化：每5个batch更新一次进度条，避免频繁GPU-CPU同步
+        if batch_idx % 5 == 0:
+            pbar.set_postfix({
+                'Loss': f'{current_loss:.3f}',
+                'CE': f'{float(ce_loss.item()):.3f}',
+                'SDM': f'{float(sdm_loss.item()):.3f}',  # 显示SDM对齐损失
+                'Feat(Fused)': f'{avg_fused:.2f}',
+                'GradNorm': f'{avg_grad_norm:.2f}',
+                'Spikes': loss_spikes
+            })
 
     avg_loss = total_loss / max(1, len(dataloader))
     accuracy = 100. * correct / max(1, total)
@@ -747,6 +797,8 @@ def train_multimodal_reid():
         batch_sampler=train_sampler,
         num_workers=getattr(config, "num_workers", 4),
         pin_memory=getattr(config, "pin_memory", True),
+        persistent_workers=True,  # 保持工作进程持续运行
+        prefetch_factor=2,        # 预取因子提升IO效率
         collate_fn=compatible_collate_fn
     )
 
@@ -798,6 +850,7 @@ def train_multimodal_reid():
         scheduler = LambdaLR(optimizer, lr_lambda=[lmbda] * len(optimizer.param_groups))
         logging.info(f"调度器: Warmup({warmup_epochs}) + Cosine(min_factor={min_factor}) via LambdaLR")
     elif scheduler_type == 'plateau':
+        base_lr = getattr(config, 'base_learning_rate', 1e-5)
         scheduler = ReduceLROnPlateau(
             optimizer, mode='max', factor=0.5, patience=8, threshold=0.001,
             min_lr=base_lr * 0.001, verbose=True
@@ -924,7 +977,7 @@ def train_multimodal_reid():
             else:
                 scheduler.step()
 
-            if epoch % 10 == 0:
+            if epoch % 20 == 0:  # 减少查询频率：10->20
                 lrs = [pg['lr'] for pg in optimizer.param_groups]
                 logging.info(f"Epoch {epoch}: 当前学习率 = {', '.join([f'{lr:.2e}' for lr in lrs])}")
 
