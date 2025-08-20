@@ -7,7 +7,7 @@ tools/
 submissions
 # C extensions
 *.so
-
+.cursorrules
 # Distribution / packaging
 .Python
 build/
