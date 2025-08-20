@@ -481,18 +481,55 @@ def compatible_collate_fn(batch):
     batch_dict['text_description'] = text_list
 
     # 处理图像数据：堆叠各模态的图像张量
+    # 修复：先计算真实的模态可用性，避免零张量污染融合
     images = {}
     modalities = ['vis', 'nir', 'sk', 'cp']
+    
+    # 第一步：计算每个样本每个模态的真实可用性
+    real_modality_mask = {}
+    for m in modalities + ['text']:
+        real_modality_mask[m] = []
+    
+    for sample_idx, sample in enumerate(batch):
+        # 检查图像模态的真实可用性
+        for m in modalities:
+            has_valid_image = False
+            if 'images' in sample and isinstance(sample['images'], dict):
+                if m in sample['images'] and isinstance(sample['images'][m], torch.Tensor):
+                    tensor = sample['images'][m]
+                    # 关键修复：检查是否为非零张量，避免把全零张量当作有效模态
+                    if tensor.numel() > 0 and tensor.abs().sum() > 1e-6:
+                        has_valid_image = True
+            
+            # 结合原始modality_mask进行二次确认
+            if 'modality_mask' in sample and isinstance(sample['modality_mask'], dict):
+                original_mask = sample['modality_mask'].get(m, 0.0)
+                if isinstance(original_mask, bool):
+                    has_valid_image = has_valid_image and original_mask
+                elif isinstance(original_mask, (float, int)):
+                    has_valid_image = has_valid_image and (float(original_mask) > 0.5)
+            
+            real_modality_mask[m].append(1.0 if has_valid_image else 0.0)
+        
+        # 检查文本模态的真实可用性
+        has_valid_text = False
+        td = sample.get('text_description', sample.get('text_descriptions', [""]))
+        if isinstance(td, list):
+            has_valid_text = len(td) > 0 and isinstance(td[0], str) and len(td[0].strip()) > 0
+        elif isinstance(td, str):
+            has_valid_text = len(td.strip()) > 0
+        real_modality_mask['text'].append(1.0 if has_valid_text else 0.0)
+    
+    # 第二步：构建图像batch（仍需要占位符保持batch结构，但mask会指示真实可用性）
     if 'images' in first_sample and isinstance(first_sample['images'], dict):
-        # 标准的images字典格式
         for m in modalities:
             tensors = []
-            for sample in batch:
+            for sample_idx, sample in enumerate(batch):
                 if 'images' in sample and m in sample['images'] and isinstance(sample['images'][m], torch.Tensor):
                     tensors.append(sample['images'][m])
                 else:
-                    # 如果缺失该模态的图像，用零张量填充
-                    h = w = 224  # 默认图像尺寸
+                    # 缺失模态：填充零张量作为占位符（但mask会标记为无效）
+                    h = w = 224
                     tensors.append(torch.zeros(3, h, w))
             images[m] = torch.stack(tensors)
     else:
@@ -502,31 +539,10 @@ def compatible_collate_fn(batch):
                 images[m] = torch.stack([sample[m] for sample in batch])
     batch_dict['images'] = images
 
-    # 处理模态掩码：标识每个样本中哪些模态可用
+    # 第三步：使用计算出的真实模态掩码
     mask_out = {}
-    for m in modalities + ['text']:  # 包括四种图像模态和文本模态
-        vals = []
-        for sample in batch:
-            mv = 0.0  # 默认不可用
-            
-            # 从样本的modality_mask中获取掩码值
-            if 'modality_mask' in sample and isinstance(sample['modality_mask'], dict):
-                raw = sample['modality_mask'].get(m, 0.0)
-                if isinstance(raw, (float, int)):
-                    mv = float(raw)
-                elif isinstance(raw, bool):
-                    mv = 1.0 if raw else 0.0
-            
-            # 对于文本模态，额外检查文本内容是否为空
-            if m == 'text' and mv == 0.0:
-                td = sample.get('text_description', sample.get('text_descriptions', [""]))
-                if isinstance(td, list):
-                    mv = 1.0 if (len(td) > 0 and isinstance(td[0], str) and len(td[0]) > 0) else 0.0
-                elif isinstance(td, str):
-                    mv = 1.0 if len(td) > 0 else 0.0
-            vals.append(mv)
-        
-        mask_out[m] = torch.tensor(vals, dtype=torch.float)
+    for m in modalities + ['text']:
+        mask_out[m] = torch.tensor(real_modality_mask[m], dtype=torch.float)
     batch_dict['modality_mask'] = mask_out
 
     return batch_dict

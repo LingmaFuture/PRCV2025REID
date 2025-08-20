@@ -209,11 +209,12 @@ class FeatureFusion(nn.Module):
         self.norm1 = nn.LayerNorm(feature_dim)
         self.norm2 = nn.LayerNorm(feature_dim)
         
-    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, features: List[torch.Tensor], masks: List[torch.Tensor] = None) -> torch.Tensor:
         """
-        融合多个模态特征
+        融合多个模态特征，支持mask
         Args:
             features: 特征列表，每个特征shape为[B, feature_dim]
+            masks: 掩码列表，每个掩码shape为[B]，1表示有效，0表示无效
         Returns:
             [B, feature_dim] 融合后特征
         """
@@ -227,9 +228,18 @@ class FeatureFusion(nn.Module):
         stacked_features = torch.stack(features, dim=1)
         B, M, D = stacked_features.shape
         
-        # 多头注意力融合
+        # 处理mask
+        key_padding_mask = None
+        if masks is not None:
+            # 堆叠mask: [B, num_modalities]
+            stacked_masks = torch.stack(masks, dim=1)  # [B, M]
+            # 创建key_padding_mask用于attention（True表示要忽略的位置）
+            key_padding_mask = ~stacked_masks.bool()  # [B, M]
+        
+        # 多头注意力融合（带mask）
         attn_out, _ = self.multihead_attn(
-            stacked_features, stacked_features, stacked_features
+            stacked_features, stacked_features, stacked_features,
+            key_padding_mask=key_padding_mask  # 忽略mask=0的位置
         )  # [B, M, D]
         
         # 残差连接 + 层归一化
@@ -239,8 +249,21 @@ class FeatureFusion(nn.Module):
         mlp_out = self.mlp(attn_out)
         fused_features = self.norm2(attn_out + mlp_out)
         
-        # 全局平均池化得到最终融合特征
-        final_features = fused_features.mean(dim=1)  # [B, D]
+        # 带mask的加权平均池化
+        if masks is not None:
+            # 将无效位置的特征设为0
+            valid_mask = stacked_masks.unsqueeze(-1).float()  # [B, M, 1]
+            masked_features = fused_features * valid_mask
+            
+            # 计算有效模态数量
+            valid_counts = stacked_masks.sum(dim=1, keepdim=True).float()  # [B, 1]
+            valid_counts = torch.clamp(valid_counts, min=1.0)  # 避免除零
+            
+            # 加权平均
+            final_features = masked_features.sum(dim=1) / valid_counts  # [B, D]
+        else:
+            # 全局平均池化
+            final_features = fused_features.mean(dim=1)  # [B, D]
         
         return final_features
 
@@ -352,6 +375,13 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         self.feature_norm_band = getattr(config, 'feature_norm_band', 3.0)
         self.feature_norm_penalty = getattr(config, 'feature_norm_penalty', 2e-3)
         
+        # ===== 可学习的null token占位符 =====
+        # 为每个模态创建可学习的null token，用于缺失模态的占位
+        self.null_tokens = nn.ParameterDict({
+            modality: nn.Parameter(torch.randn(1, self.fusion_dim) * 0.02)
+            for modality in self.modalities
+        })
+        
         logging.info(f"✅ 初始化CLIP+MER多模态ReID模型完成")
         logging.info(f"   - 支持模态: {self.modalities}")
         logging.info(f"   - 融合维度: {self.fusion_dim}")
@@ -371,41 +401,106 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
     def forward(self, 
                 images: Optional[Dict[str, torch.Tensor]] = None,
                 texts: Optional[List[str]] = None,
+                modality_masks: Optional[Dict[str, torch.Tensor]] = None,
                 return_features: bool = False) -> Dict[str, torch.Tensor]:
         """
         模型前向传播
+        修复：使用null_token占位+精确mask，避免零特征污染
         Args:
             images: 图像字典 {modality: [B,C,H,W]}
-            texts: 文本列表
+            texts: 文本列表 [str, ...] (可包含空字符串)
+            modality_masks: 模态掩码 {modality: [B]} (1=有效, 0=无效)
             return_features: 是否返回中间特征
         Returns:
             输出字典，包含logits、features等
         """
+        # 确定batch size
+        batch_size = None
+        if images is not None:
+            for img_tensor in images.values():
+                batch_size = img_tensor.shape[0]
+                break
+        elif texts is not None:
+            batch_size = len(texts)
+        
+        if batch_size is None:
+            raise ValueError("无法确定batch size")
+        
         modality_features = {}
-        raw_modality_features = {}  # 保存原始特征用于SDM损失
+        raw_modality_features = {}
+        feature_masks = {}  # 记录每个模态的mask
         
         # ===== 视觉模态编码 =====
         if images is not None:
             for modality, img_tensor in images.items():
                 if modality in self.vision_modalities:
-                    # CLIP+MER编码
-                    visual_features = self.clip_encoder.encode_vision(
-                        img_tensor.to(self.device), modality
-                    )  # [B, fusion_dim]
+                    # 获取该模态的mask
+                    mask = None
+                    if modality_masks is not None:
+                        # 需要从原始模态名映射回来
+                        original_modality = None
+                        for orig, new in [('vis', 'rgb'), ('nir', 'ir'), ('sk', 'sketch'), ('cp', 'cpencil')]:
+                            if new == modality:
+                                original_modality = orig
+                                break
+                        if original_modality and original_modality in modality_masks:
+                            mask = modality_masks[original_modality]  # [B]
                     
-                    raw_modality_features[modality] = visual_features
+                    if mask is not None and mask.sum() > 0:
+                        # 有部分有效样本，需要selective编码
+                        valid_indices = mask.bool()
+                        valid_imgs = img_tensor[valid_indices]  # [valid_count, C, H, W]
+                        
+                        if valid_imgs.shape[0] > 0:
+                            # 编码有效样本
+                            valid_features = self.clip_encoder.encode_vision(
+                                valid_imgs.to(self.device), modality
+                            )  # [valid_count, fusion_dim]
+                            
+                            # 创建完整的特征tensor，用null_token填充无效位置
+                            # 修复AMP下的dtype不匹配：将null_token对齐为valid_features的dtype
+                            null_tok = self.null_tokens[modality].to(device=self.device, dtype=valid_features.dtype)
+                            full_features = null_tok.expand(batch_size, -1).clone()
+                            full_features[valid_indices] = valid_features
+                        else:
+                            # 全部无效，使用null_token
+                            full_features = self.null_tokens[modality].expand(batch_size, -1)
+                    else:
+                        # 全部无效或没有mask，使用null_token
+                        full_features = self.null_tokens[modality].expand(batch_size, -1)
+                        mask = torch.zeros(batch_size, device=self.device)
+                    
+                    raw_modality_features[modality] = full_features
+                    feature_masks[modality] = mask if mask is not None else torch.ones(batch_size, device=self.device)
                     
                     # SDM语义分离（仅训练时）
                     if self.training:
-                        semantic_features = self.sdm_module(visual_features)
+                        semantic_features = self.sdm_module(full_features)
                         modality_features[modality] = semantic_features
                     else:
-                        modality_features[modality] = visual_features
+                        modality_features[modality] = full_features
         
         # ===== 文本模态编码 =====
-        if texts is not None:
+        if texts is not None and len(texts) > 0:
+            # 获取文本mask
+            text_mask = None
+            if modality_masks is not None and 'text' in modality_masks:
+                text_mask = modality_masks['text']  # [B]
+            
+            # 始终编码所有文本（包括空字符串），让CLIP处理
             text_features = self.clip_encoder.encode_text(texts)  # [B, fusion_dim]
+            
+            # 如果有mask，用null_token替换无效位置
+            if text_mask is not None:
+                invalid_indices = ~text_mask.bool()
+                if invalid_indices.any():
+                    # 修复AMP下的dtype不匹配：将null_token对齐为text_features的dtype
+                    text_features[invalid_indices] = self.null_tokens['text'].to(device=self.device, dtype=text_features.dtype).expand(invalid_indices.sum(), -1)
+            else:
+                text_mask = torch.ones(batch_size, device=self.device)
+            
             raw_modality_features['text'] = text_features
+            feature_masks['text'] = text_mask
             
             # SDM语义分离（仅训练时）
             if self.training:
@@ -416,7 +511,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         
         # ===== 特征融合 =====
         if len(modality_features) == 0:
-            raise ValueError("至少需要提供一种模态的输入")
+            raise ValueError("至少需要提供一种有效模态的输入")
         
         # 模态dropout（训练时随机丢弃部分模态）
         if self.training:
@@ -425,23 +520,28 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             
             if modality_dropout > 0 and len(modality_features) > min_modalities:
                 keep_modalities = []
+                keep_masks = []
                 for mod, feat in modality_features.items():
                     if torch.rand(1).item() > modality_dropout:
                         keep_modalities.append((mod, feat))
+                        keep_masks.append((mod, feature_masks[mod]))
                 
                 if len(keep_modalities) >= min_modalities:
                     modality_features = dict(keep_modalities)
+                    feature_masks = dict(keep_masks)
         
-        # 融合多模态特征
+        # 融合多模态特征（带mask）
         feature_list = list(modality_features.values())
+        mask_list = [feature_masks[mod] for mod in modality_features.keys()]
+        
         if len(feature_list) == 1:
             fused_features = feature_list[0]
         else:
-            fused_features = self.feature_fusion(feature_list)  # [B, fusion_dim]
+            fused_features = self.feature_fusion(feature_list, mask_list)  # [B, fusion_dim]
         
         # ===== ID分类 =====
         outputs = {
-            'features': fused_features,
+            'features': fused_features,  # 融合后特征（BN前）
             'raw_modality_features': raw_modality_features,
             'modality_features': modality_features
         }
@@ -449,7 +549,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         if self.bn_neck is not None:
             bn_features, logits = self.bn_neck(fused_features)
             outputs.update({
-                'bn_features': bn_features,
+                'bn_features': bn_features,  # BN后特征（推荐用于检索）
                 'logits': logits
             })
         
@@ -479,16 +579,23 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         
         # SDM对比损失：RGB锚定对齐损失
         raw_modality_features = outputs.get('raw_modality_features', {})
-        fused_features = outputs['features']
+        # 强制使用BN后特征进行对齐损失计算，确保与检索特征完全一致
+        if 'bn_features' in outputs:
+            alignment_features = outputs['bn_features']  # 与检索特征保持完全一致
+        else:
+            raise ValueError("模型输出缺少bn_features，对齐损失特征不一致")
         
         sdm_loss = self.sdm_contrastive_loss(
             raw_modality_features,
-            fused_features,
+            alignment_features,
             labels
         )
         
-        # 特征范数正则化
-        feats = outputs['features']  # [B, fusion_dim]
+        # 特征范数正则化 - 使用与检索一致的特征
+        if 'bn_features' in outputs:
+            feats = outputs['bn_features']  # 与检索和对齐损失保持一致
+        else:
+            feats = outputs['features']  # 回退到融合后特征
         fn = feats.norm(p=2, dim=1)  # [B,] 每个样本的L2范数
         
         target_norm = self.feature_target_norm
