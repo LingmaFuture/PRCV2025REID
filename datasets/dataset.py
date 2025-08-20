@@ -1,4 +1,7 @@
 # datasets/dataset.py
+# 多模态人员重识别数据集实现
+# 支持四种模态：可见光(vis)、近红外(nir)、骨架图(sk)、彩色分割图(cp)
+
 import torch
 from torch.utils.data import Dataset, Sampler
 import torchvision.transforms as transforms
@@ -9,25 +12,52 @@ import random
 from collections import defaultdict
 
 class ModalityAugmentation:
-    """修复后的数据增强"""
+    """
+    多模态数据增强类
+    为不同模态的图像数据提供训练和验证时的数据变换
+    """
     def __init__(self, config, is_training=True):
+        """
+        初始化数据增强配置
+        
+        Args:
+            config: 配置对象，包含图像尺寸、增强参数等
+            is_training: 是否为训练模式，决定使用哪种变换策略
+        """
         self.config = config
         self.is_training = is_training
     
     def get_transform(self):
+        """
+        根据训练/验证模式返回相应的数据变换序列
+        
+        Returns:
+            transforms.Compose: PyTorch数据变换组合
+        """
         if self.is_training:
+            # 训练时的数据增强：包含随机裁剪、翻转、颜色扰动等
             return transforms.Compose([
-                transforms.RandomResizedCrop(self.config.image_size, scale=(0.8, 1.0)),  # 先保守裁剪，稳定后再放宽
+                # 随机缩放裁剪，保持宽高比的同时增强数据多样性
+                transforms.RandomResizedCrop(self.config.image_size, scale=(0.8, 1.0)),
+                # 50%概率水平翻转，增加数据变化
                 transforms.RandomHorizontalFlip(0.5),
+                # 条件颜色扰动：调整亮度和对比度
                 transforms.ColorJitter(brightness=0.2, contrast=0.2) if self.config.color_jitter else transforms.Lambda(lambda x: x),
+                # 转换为张量格式
                 transforms.ToTensor(),
+                # 使用ImageNet预训练模型的标准化参数
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                # 条件随机擦除：模拟遮挡情况
                 transforms.RandomErasing(p=self.config.random_erase, scale=(0.02, 0.2)) if self.config.random_erase > 0 else transforms.Lambda(lambda x: x)
             ])
         else:
+            # 验证时的简单变换：仅缩放和标准化
             return transforms.Compose([
+                # 直接缩放到目标尺寸
                 transforms.Resize((self.config.image_size, self.config.image_size)),
+                # 转换为张量格式
                 transforms.ToTensor(),
+                # 标准化处理
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
 
