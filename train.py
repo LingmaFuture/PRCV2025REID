@@ -389,7 +389,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
     with torch.no_grad():
         gal_feats, gal_labels = [], []
         for batch in tqdm(gallery_loader, desc=f'提取画廊特征(全量)', 
-                          leave=False, ncols=100, mininterval=0.5):
+                          leave=False, ncols=120, mininterval=1.0):
             batch = move_batch_to_device(batch, device)
             with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
                 outputs = call_model_with_batch(model, batch, return_features=True)
@@ -418,7 +418,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
             for key, qloader in group.items():
                 qf, ql = [], []
                 for batch in tqdm(qloader, desc=f'提取查询特征[{tag}:{key}]', 
-                                  leave=False, ncols=100, mininterval=0.5):
+                                  leave=False, ncols=120, mininterval=1.0):
                     batch = move_batch_to_device(batch, device)
                     with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
                         outputs = call_model_with_batch(model, batch, return_features=True)
@@ -480,11 +480,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     use_amp = (scaler is not None and getattr(scaler, "is_enabled", lambda: True)())
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', 
-                leave=True, ncols=120, mininterval=2.0, maxinterval=5.0)
+                leave=False, ncols=150, mininterval=1.0, maxinterval=3.0,
+                bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}')
     
     # 添加批次构成监控（前3个batch）
     if epoch <= 3:
-        logging.info(f"=== Epoch {epoch} 批次构成监控 ===")
+        pbar.write(f"=== Epoch {epoch} 批次构成监控 ===")
     
     for batch_idx, batch in enumerate(pbar):
         batch = move_batch_to_device(batch, device)
@@ -495,7 +496,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             unique_ids, counts = torch.unique(labels, return_counts=True)
             num_ids_per_batch = len(unique_ids)
             avg_instances_per_id = float(counts.float().mean().item())  # 转换为浮点数再计算均值
-            logging.info(f"Batch {batch_idx}: {num_ids_per_batch} IDs, 平均每ID {avg_instances_per_id:.1f} 样本 (K-1正样本数≈{avg_instances_per_id-1:.1f})")
+            pbar.write(f"Batch {batch_idx}: {num_ids_per_batch} IDs, 平均每ID {avg_instances_per_id:.1f} 样本 (K-1正样本数≈{avg_instances_per_id-1:.1f})")
 
         optimizer.zero_grad(set_to_none=True)
         # === 对比损失提前升温 + 加长升温期 ===
@@ -511,7 +512,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             
         # 每个epoch的第一个batch输出有效对比权重
         if batch_idx == 0:
-            logging.info(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
+            pbar.write(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
 
         with autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
             outputs = call_model_with_batch(model, batch, return_features=False)
@@ -525,11 +526,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             if effective_cont_w > 0.0 and sdm_loss.item() > 1.5:  
                 original_sdm = sdm_loss.item()
                 if batch_idx < 5:  # 只在前几个batch报告，避免日志过多
-                    logging.info(f"Epoch {epoch}, Batch {batch_idx}: SDM对齐损失较高 {original_sdm:.3f}")
+                    pbar.write(f"Epoch {epoch}, Batch {batch_idx}: SDM对齐损失较高 {original_sdm:.3f}")
             
             # 检查是否有NaN或Inf
             if not torch.isfinite(sdm_loss):
-                logging.error(f"Epoch {epoch}, Batch {batch_idx}: SDM损失出现NaN/Inf, 重置为0")
+                pbar.write(f"❌ Epoch {epoch}, Batch {batch_idx}: SDM损失出现NaN/Inf, 重置为0")
                 loss_dict['sdm_loss'] = torch.tensor(0.0, device=device)
                 loss_dict['contrastive_loss'] = torch.tensor(0.0, device=device)
                 # 重新计算总损失
@@ -550,7 +551,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
 
         current_loss = float(loss.item())
         if current_loss > 50.0 or not np.isfinite(current_loss):
-            logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 异常损失 {current_loss:.3f}, 跳过")
+            pbar.write(f"⚠️ Epoch {epoch}, Batch {batch_idx}: 异常损失 {current_loss:.3f}, 跳过")
             optimizer.zero_grad(set_to_none=True)
             loss_spikes += 1
             continue
@@ -641,8 +642,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         avg_reid  = float(reid_raw_norms.mean().item()) if reid_raw_norms is not None else 0.0
         avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
 
-        # 优化：每5个batch更新一次进度条，避免频繁GPU-CPU同步
-        if batch_idx % 5 == 0:
+        # 优化：每3个batch更新一次进度条显示，避免频繁GPU-CPU同步
+        if batch_idx % 3 == 0 or batch_idx == len(dataloader) - 1:
             pbar.set_postfix({
                 'Loss': f'{current_loss:.3f}',
                 'CE': f'{float(ce_loss.item()):.3f}',
@@ -811,6 +812,8 @@ def train_multimodal_reid():
         scheduler = LambdaLR(optimizer, lr_lambda=[lmbda] * len(optimizer.param_groups))
         logging.info(f"调度器: Warmup({warmup_epochs}) + Cosine(min_factor={min_factor}) via LambdaLR")
     elif scheduler_type == 'plateau':
+        # 从optimizer的第一个参数组获取base_lr
+        base_lr = optimizer.param_groups[0]['lr']
         scheduler = ReduceLROnPlateau(
             optimizer, mode='max', factor=0.5, patience=8, threshold=0.001,
             min_lr=base_lr * 0.001, verbose=True
