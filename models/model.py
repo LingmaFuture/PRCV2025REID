@@ -382,7 +382,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             for modality in self.modalities
         })
         
-        logging.info(f"✅ 初始化CLIP+MER多模态ReID模型完成")
+        logging.info(f"初始化CLIP+MER多模态ReID模型完成")
         logging.info(f"   - 支持模态: {self.modalities}")
         logging.info(f"   - 融合维度: {self.fusion_dim}")
         logging.info(f"   - MER LoRA rank: {getattr(config, 'mer_lora_rank', 4)}")

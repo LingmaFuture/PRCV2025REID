@@ -19,6 +19,10 @@ from torch.utils.data import DataLoader, Subset, Dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR, LambdaLR, ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
+
+# 立刻止血：开启 TF32 加速
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from sklearn.model_selection import train_test_split
 import torchvision.transforms as transforms
 
@@ -504,7 +508,7 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
 # ------------------------------
 # 训练一个 epoch
 # ------------------------------
-def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adaptive_clip=True):
+def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adaptive_clip=True, accum_steps=1, autocast_dtype=torch.float16):
     model.train()
     total_loss = 0.0
     ce_loss_sum = 0.0
@@ -536,7 +540,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             avg_instances_per_id = float(counts.float().mean().item())  # 转换为浮点数再计算均值
             logging.info(f"Batch {batch_idx}: {num_ids_per_batch} IDs, 平均每ID {avg_instances_per_id:.1f} 样本 (K-1正样本数≈{avg_instances_per_id-1:.1f})")
 
-        optimizer.zero_grad(set_to_none=True)
+        # 梯度累积：只在累积步开始时清零梯度
+        if batch_idx % accum_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
         # === 对比损失提前升温 + 加长升温期 ===
         cont_max = getattr(model.config, "contrastive_weight", 0.05)
         if epoch <= 5:
@@ -552,7 +558,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         if batch_idx == 0:
             logging.info(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
 
-        with autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+        with autocast(device_type='cuda', dtype=autocast_dtype, enabled=use_amp):
             outputs = call_model_with_batch(model, batch, return_features=False)
             loss_dict = model.compute_loss(outputs, labels)
             
@@ -585,70 +591,75 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         cont_loss = loss_dict.get('contrastive_loss', sdm_loss)  # 兼容性
         feat_penalty = loss_dict.get('feat_penalty', torch.tensor(0.0, device=device))
         loss = ce_loss + effective_cont_w * sdm_loss + feat_penalty  # 使用SDM损失
+        loss = loss / accum_steps  # 梯度累积：缩放损失
         loss_dict['total_loss'] = loss
 
-        current_loss = float(loss.item())
+        current_loss = float(loss.item() * accum_steps)  # 显示未缩放的损失
         if current_loss > 50.0 or not np.isfinite(current_loss):
             logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 异常损失 {current_loss:.3f}, 跳过")
-            optimizer.zero_grad(set_to_none=True)
             loss_spikes += 1
             continue
             
         if batch_idx > 0 and current_loss > total_loss / batch_idx * 1.5:
             loss_spikes += 1
         
-        # 计算梯度（移回循环内部）
-        if use_amp:
+        # 计算梯度（支持梯度累积）
+        if use_amp and scaler is not None:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            _sanitize_grads(model)
-
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    if torch.isfinite(param_norm):
-                        total_norm += param_norm.item() ** 2
-            total_norm = math.sqrt(total_norm)
-            grad_norms.append(float(total_norm))
-
-            # 自适应梯度裁剪（收紧上限提升稳定性）
-            if adaptive_clip:
-                if len(grad_norms) > 10:
-                    recent_norms = grad_norms[-10:]
-                    adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
-                else:
-                    adaptive_max_norm = 1.0
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            _sanitize_grads(model)
+            
+        # 只在累积步结束时更新参数
+        if (batch_idx + 1) % accum_steps == 0:
+            if use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                _sanitize_grads(model)
 
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    if torch.isfinite(param_norm):
-                        total_norm += param_norm.item() ** 2
-            total_norm = math.sqrt(total_norm)
-            grad_norms.append(float(total_norm))
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.detach().data.norm(2)
+                        if torch.isfinite(param_norm):
+                            total_norm += param_norm.item() ** 2
+                total_norm = math.sqrt(total_norm)
+                grad_norms.append(float(total_norm))
 
-            if adaptive_clip:
-                if len(grad_norms) > 10:
-                    recent_norms = grad_norms[-10:]
-                    adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
+                # 自适应梯度裁剪（收紧上限提升稳定性）
+                if adaptive_clip:
+                    if len(grad_norms) > 10:
+                        recent_norms = grad_norms[-10:]
+                        adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
+                    else:
+                        adaptive_max_norm = 1.0
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
                 else:
-                    adaptive_max_norm = 1.0
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                _sanitize_grads(model)
+
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.detach().data.norm(2)
+                        if torch.isfinite(param_norm):
+                            total_norm += param_norm.item() ** 2
+                total_norm = math.sqrt(total_norm)
+                grad_norms.append(float(total_norm))
+
+                if adaptive_clip:
+                    if len(grad_norms) > 10:
+                        recent_norms = grad_norms[-10:]
+                        adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
+                    else:
+                        adaptive_max_norm = 1.0
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                optimizer.step()
 
         # 统计信息更新（移回循环内部）
         total_loss += current_loss
@@ -784,14 +795,25 @@ def train_multimodal_reid():
     val_labels = [pid2label[pid] for pid in val_ids]
     logging.info(f"训练集标签范围: {min(train_labels)}-{max(train_labels)}, 验证集标签范围: {min(val_labels)}-{max(val_labels)}")
 
-    # 训练 DataLoader（确保 P×K 采样，K≥4 保证对比学习有效）
+    # ==== batch size 统一定义（必须在首次使用前计算）====
+    world_size = (torch.distributed.get_world_size() 
+                  if torch.distributed.is_available() and torch.distributed.is_initialized() else 1)
+    grad_accum_steps = getattr(config, "gradient_accumulation_steps", 4)
+    
+    # config.batch_size 约定为"每卡 micro-batch"
+    actual_batch_size = config.batch_size                   # per-GPU micro batch
+    effective_batch_size = actual_batch_size * grad_accum_steps * world_size  # 全局有效 batch
+    
+    logging.info(f"Batch size 配置: micro={actual_batch_size}, 累积步数={grad_accum_steps}, 等效={effective_batch_size}")
+
+    # 训练 DataLoader（调整 P×K 以适应梯度累积）
     num_instances = 4  # K=4，每个身份4个样本，确保每个锚有K-1=3个正样本
-    effective_batch_size = 32  # 固定batch_size=32，确保P=8
-    num_pids_per_batch = effective_batch_size // num_instances  # P=8
-    logging.info(f"采样策略: P×K = {num_pids_per_batch}×{num_instances} = {effective_batch_size}")
+    # 使用 micro batch size（单步实际处理的样本数）
+    num_pids_per_batch = actual_batch_size // num_instances  # 调整后的P
+    logging.info(f"采样策略: P×K = {num_pids_per_batch}×{num_instances} = {actual_batch_size}")
     logging.info(f"每个锚的正样本数: {num_instances-1}")
     
-    train_sampler = BalancedBatchSampler(train_dataset, effective_batch_size, num_instances=num_instances)
+    train_sampler = BalancedBatchSampler(train_dataset, actual_batch_size, num_instances=num_instances)
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
@@ -805,7 +827,7 @@ def train_multimodal_reid():
     # 本地验证 DataLoader（赛制对齐）
     gallery_loader, query_loaders = build_eval_loaders_by_rule(
         local_val_dataset, list(range(len(local_val_dataset))),
-        batch_size=effective_batch_size,
+        batch_size=actual_batch_size,  # 验证时使用 micro batch size
         num_workers=getattr(config, "num_workers", 4),
         pin_memory=getattr(config, "pin_memory", True)
     )
@@ -817,25 +839,54 @@ def train_multimodal_reid():
     num_classes = getattr(config, 'num_classes', None)
     if num_classes is not None:
         model.set_num_classes(num_classes)
-        logging.info(f"✅ 设置分类器：{num_classes} 个ID类别")
+        logging.info(f"设置分类器：{num_classes} 个ID类别")
     else:
-        logging.warning("⚠️ config中未找到num_classes，请确保在数据加载后设置")
+        logging.warning("config中未找到num_classes，请确保在数据加载后设置")
 
+    # 显存优化：冻结主干，只训练 LoRA 和特定模块
+    freeze_backbone = getattr(config, 'freeze_backbone', True)
+    if freeze_backbone:
+        logging.info("冻结 CLIP 主干，只训练 LoRA 和特定模块")
+        for name, param in model.named_parameters():
+            if 'loras' in name or 'feature_mixture' in name or 'bn_neck' in name or 'null_tokens' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+    
     # 优化器 - 支持CLIP+MER分层学习率
     param_groups = model.get_learnable_params()
     
-    # 日志输出各参数组的学习率
+    # 过滤掉冻结的参数
+    filtered_param_groups = []
     for group in param_groups:
+        trainable_params = [p for p in group['params'] if p.requires_grad]
+        if trainable_params:  # 只有包含可训练参数的组才添加
+            group['params'] = trainable_params
+            filtered_param_groups.append(group)
+    
+    # 日志输出各参数组的学习率
+    total_trainable = 0
+    for group in filtered_param_groups:
         group_name = group.get('name', 'unknown')
         group_lr = group['lr']
         num_params = len(group['params'])
+        total_trainable += sum(p.numel() for p in group['params'])
         logging.info(f"{group_name}: {num_params} 参数, 学习率: {group_lr:.2e}")
     
-    optimizer = AdamW(param_groups, weight_decay=getattr(config, "weight_decay", 1e-4))
+    logging.info(f"可训练参数总数: {total_trainable:,}")
+    
+    optimizer = AdamW(filtered_param_groups, weight_decay=getattr(config, "weight_decay", 1e-4))
 
-    # AMP（修复：正确初始化）
-    scaler = GradScaler(enabled=(device.type == 'cuda'))
-    logging.info("启用混合精度训练 (AMP)" if scaler.is_enabled() else "使用全精度训练")
+    # AMP 优化：使用 bfloat16 + 梯度累积
+    autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_scaler = (autocast_dtype == torch.float16)  # bfloat16 不需要 GradScaler
+    scaler = GradScaler(enabled=use_scaler) if use_scaler else None
+    
+    # 使用前面统一定义的 batch size 参数
+    accum_steps = grad_accum_steps  # 使用前面定义的变量
+    
+    logging.info(f"混合精度: {autocast_dtype}, 梯度累积: {accum_steps} 步")
+    logging.info(f"实际 batch_size: {actual_batch_size}, 等效 batch_size: {effective_batch_size}")
 
     # 学习率调度器
     warmup_epochs = getattr(config, "warmup_epochs", 15)
@@ -890,7 +941,7 @@ def train_multimodal_reid():
                 logging.info("文本编码器微调模式：每epoch清除缓存")
 
         adaptive_clip = getattr(config, "adaptive_gradient_clip", True)
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler, adaptive_clip)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler, adaptive_clip, accum_steps, autocast_dtype)
         
         # 监控SDM对齐损失异常并自动调整
         current_sdm_loss = train_metrics.get('sdm_loss', train_metrics['contrastive_loss'])

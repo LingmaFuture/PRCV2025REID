@@ -50,6 +50,8 @@ class TrainingConfig:
     
     # 训练相关 - CLIP统一编码器微调超参数
     batch_size: int = 32
+    gradient_accumulation_steps: int = 4  # 梯度累积步数，降低显存占用
+    freeze_backbone: bool = True  # 冻结 CLIP 主干，只训练 LoRA 和特定模块
     num_epochs: int = 150
     
     # 分层学习率设置（MER和tokenizer需要更大学习率）
