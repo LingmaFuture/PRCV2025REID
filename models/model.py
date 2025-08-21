@@ -128,21 +128,21 @@ class RGBAnchoredAlignmentLoss(nn.Module):
             eye_mask = torch.eye(batch_size, device=features.device)
             pos_mask = pos_mask * (1.0 - eye_mask)  # 移除对角线
             
-            # 正样本损失（相同ID应该相似）
+            # 正样本损失（相同ID应该相似）- 使用数值稳定的logsumexp
             if pos_mask.sum() > 0:
                 pos_sim = sim_matrix * pos_mask
-                pos_exp = torch.exp(pos_sim)
-                pos_exp_sum = pos_exp.sum(dim=1)
-                pos_loss = -torch.log(pos_exp_sum + 1e-8).mean()
+                # 将非正样本位置设为极小值，避免影响logsumexp
+                pos_logits = pos_sim + (1.0 - pos_mask) * (-1e9)
+                pos_loss = -torch.logsumexp(pos_logits, dim=1).mean()
             else:
                 pos_loss = torch.tensor(0.0, device=features.device)
             
-            # 负样本损失（不同ID应该不相似）
+            # 负样本损失（不同ID应该不相似）- 使用数值稳定的logsumexp
             if neg_mask.sum() > 0:
                 neg_sim = sim_matrix * neg_mask - self.margin
-                neg_exp = torch.exp(neg_sim)
-                neg_exp_sum = neg_exp.sum(dim=1)
-                neg_loss = torch.log(neg_exp_sum + 1e-8).mean()
+                # 将非负样本位置设为极小值，避免影响logsumexp
+                neg_logits = neg_sim + (1.0 - neg_mask) * (-1e9)
+                neg_loss = torch.logsumexp(neg_logits, dim=1).mean()
             else:
                 neg_loss = torch.tensor(0.0, device=features.device)
             

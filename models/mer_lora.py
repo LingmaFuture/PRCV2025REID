@@ -167,19 +167,60 @@ class MERMultiheadAttention(nn.Module):
         K = K.view(B, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # 计算注意力得分
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [B, num_heads, seq_len, seq_len]
-        
-        # 应用注意力掩码
-        if attn_mask is not None:
-            attn_scores = attn_scores.masked_fill(attn_mask == 0, -1e9)
-        
-        # 注意力权重 + dropout
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # 注意力输出
-        attn_out = torch.matmul(attn_weights, V)  # [B, num_heads, seq_len, head_dim]
+        # 使用PyTorch 2.x的SDPA（推荐方案B：内存高效+数值稳健）
+        try:
+            import torch.nn.functional as F
+            drop_p = self.dropout.p if self.training else 0.0
+            
+            # 启用FlashAttention等内存优化内核
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+                # attn_mask转换为bool类型，确保数值稳定
+                bool_mask = None
+                if attn_mask is not None:
+                    if attn_mask.dtype != torch.bool:
+                        bool_mask = attn_mask.to(torch.bool)
+                    else:
+                        bool_mask = attn_mask
+                
+                attn_out = F.scaled_dot_product_attention(
+                    Q, K, V, 
+                    attn_mask=bool_mask,
+                    dropout_p=drop_p,
+                    is_causal=False
+                )
+        except (AttributeError, ImportError):
+            # 回退到安全的手写实现（方案A：安全softmax）
+            # 计算注意力得分
+            attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [B, num_heads, seq_len, seq_len]
+            
+            # 安全的mask处理
+            if attn_mask is not None:
+                # 1) 确保mask为布尔类型
+                if attn_mask.dtype != torch.bool:
+                    attn_mask = attn_mask.to(torch.bool)
+                
+                # 2) 用-inf替代-1e9，dtype安全
+                attn_scores = attn_scores.masked_fill(~attn_mask, -float("inf"))
+                
+                # 3) 检查全遮行，避免softmax(全-inf)产生NaN
+                all_masked = torch.isneginf(attn_scores).all(dim=-1, keepdim=True)  # [B, H, L, 1]
+                if all_masked.any():
+                    # 给全遮行的对角位置设为0（自注意力占位）
+                    seq_len = attn_scores.size(-1)
+                    eye = torch.eye(seq_len, device=attn_scores.device, dtype=torch.bool)
+                    eye = eye.unsqueeze(0).unsqueeze(0)  # [1, 1, L, L]
+                    attn_scores = torch.where(
+                        all_masked & eye, 
+                        torch.zeros_like(attn_scores), 
+                        attn_scores
+                    )
+            
+            # 4) 以float32做softmax，再回到原dtype（数值稳定）
+            attn_weights = torch.softmax(attn_scores.float(), dim=-1).to(attn_scores.dtype)
+            attn_weights = self.dropout(attn_weights)
+            
+            # 注意力输出
+            attn_out = torch.matmul(attn_weights, V)  # [B, num_heads, seq_len, head_dim]
         
         # 重塑回原始形状
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, seq_len, self.embed_dim)

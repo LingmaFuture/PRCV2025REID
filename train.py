@@ -29,6 +29,7 @@ import torchvision.transforms as transforms
 # === 你项目里的数据与模型 ===
 from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn
 from models.model import CLIPBasedMultiModalReIDModel  
+from models.sdm_scheduler import SDMScheduler
 from configs.config import TrainingConfig
 
 # ------------------------------
@@ -91,6 +92,10 @@ def _sanitize_grads(model):
 # ------------------------------
 def compute_map(query_features, gallery_features, query_labels, gallery_labels, k=100):
     """mAP@k"""
+    # 确保两个特征张量具有相同的数据类型，统一转换为float32
+    query_features = query_features.float()
+    gallery_features = gallery_features.float()
+    
     query_features = F.normalize(query_features, p=2, dim=1)
     gallery_features = F.normalize(gallery_features, p=2, dim=1)
     sim = torch.mm(query_features, gallery_features.t())  # (Q, G)
@@ -543,24 +548,36 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         # 梯度累积：只在累积步开始时清零梯度
         if batch_idx % accum_steps == 0:
             optimizer.zero_grad(set_to_none=True)
-        # === 对比损失提前升温 + 加长升温期 ===
-        cont_max = getattr(model.config, "contrastive_weight", 0.05)
-        if epoch <= 5:
-            effective_cont_w = 0.0
-        elif 6 <= epoch <= 25:
-            # 线性升温：6->0.004, 25->cont_max
-            t = (epoch - 5) / 20.0
-            effective_cont_w = max(0.004, cont_max * t)
-        else:
-            effective_cont_w = cont_max
-            
-        # 每个epoch的第一个batch输出有效对比权重
+        # === SDM权重调度（按文档要求） ===
+        if not hasattr(model, 'sdm_scheduler'):
+            model.sdm_scheduler = SDMScheduler(config)
+        
+        # 获取当前epoch的SDM参数
+        effective_cont_w, current_temp = model.sdm_scheduler.get_parameters(epoch, {})
+        
+        # 每个epoch的第一个batch输出SDM参数
         if batch_idx == 0:
-            logging.info(f"Epoch {epoch}: effective_contrastive_weight = {effective_cont_w:.4f} (max={cont_max:.4f})")
+            logging.info(f"Epoch {epoch}: SDM_weight = {effective_cont_w:.4f}, SDM_temp = {current_temp:.3f}")
 
         with autocast(device_type='cuda', dtype=autocast_dtype, enabled=use_amp):
-            outputs = call_model_with_batch(model, batch, return_features=False)
-            loss_dict = model.compute_loss(outputs, labels)
+            try:
+                outputs = call_model_with_batch(model, batch, return_features=False)
+                loss_dict = model.compute_loss(outputs, labels)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    # 内存不足时清理缓存并跳过
+                    torch.cuda.empty_cache()
+                    logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 内存不足，跳过当前batch")
+                    continue
+                else:
+                    raise e
+            
+            # NaN检测和跳过机制（解决第29batch问题）
+            total_loss_val = loss_dict['total_loss']
+            if not torch.isfinite(total_loss_val):
+                logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 发现非有限损失值 {total_loss_val.item():.6f}，跳过当前step")
+                optimizer.zero_grad(set_to_none=True)
+                continue
             
             # SDM对比损失监控（仅在实际参与训练时警告）
             sdm_loss = loss_dict.get('sdm_loss', torch.tensor(0.0, device=device))
@@ -633,7 +650,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                         adaptive_max_norm = 1.0
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # 降低梯度裁剪阈值修复CE收敛
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -657,9 +674,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                         adaptive_max_norm = 1.0
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # 降低梯度裁剪阈值修复CE收敛
 
                 optimizer.step()
+                
+                # 定期清理CUDA缓存，防止内存累积
+                if (batch_idx + 1) % (accum_steps * 5) == 0:  # 每5个累积周期清理一次
+                    torch.cuda.empty_cache()
 
         # 统计信息更新（移回循环内部）
         total_loss += current_loss
@@ -691,13 +712,28 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         avg_reid  = float(reid_raw_norms.mean().item()) if reid_raw_norms is not None else 0.0
         avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
 
+        # 区分SDM损失和分数进行监控
+        sdm_loss_val = float(sdm_loss.item())
+        
+        # 早期训练详细监控（前5个epoch，每10个batch）
+        if epoch <= 5 and batch_idx % 10 == 0:
+            logging.info(f"详细SDM监控 Epoch {epoch}, Batch {batch_idx}: "
+                        f"SDM_Loss={sdm_loss_val:.4f}, CE_Loss={float(ce_loss.item()):.4f}, "
+                        f"Feat_Norm={avg_fused:.2f}")
+            
+            # 检查SDM损失异常（损失不应为负值）
+            if sdm_loss_val < 0:
+                logging.warning(f"⚠️  SDM损失异常为负值: {sdm_loss_val:.4f} - 这表明损失计算有误！")
+            elif sdm_loss_val > 5.0:
+                logging.warning(f"⚠️  SDM损失过大: {sdm_loss_val:.4f} - 可能存在数值不稳定")
+        
         # 优化：每5个batch更新一次进度条，避免频繁GPU-CPU同步
         if batch_idx % 5 == 0:
             pbar.set_postfix({
                 'Loss': f'{current_loss:.3f}',
                 'CE': f'{float(ce_loss.item()):.3f}',
-                'SDM': f'{float(sdm_loss.item()):.3f}',  # 显示SDM对齐损失
-                'Feat(Fused)': f'{avg_fused:.2f}',
+                'SDMLoss': f'{sdm_loss_val:.3f}',  # 明确标注这是损失值，不是分数
+                'Feat': f'{avg_fused:.2f}',
                 'GradNorm': f'{avg_grad_norm:.2f}',
                 'Spikes': loss_spikes
             })
@@ -711,6 +747,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         logging.warning(f"Epoch {epoch}: 损失异常次数 {loss_spikes}，建议降低学习率")
     if avg_feat_norm > 50.0:
         logging.warning(f"Epoch {epoch}: 平均特征范数 {avg_feat_norm:.2f} 偏大，检查稳定性")
+    
+    # 训练完成后清理CUDA缓存
+    torch.cuda.empty_cache()
     
     return {
         'total_loss': avg_loss,
@@ -742,6 +781,12 @@ def _build_lambda_with_warmup_cosine(total_epochs, warmup_epochs, start_factor=0
     return lmbda
 
 def train_multimodal_reid():
+    # 启用TF32加速（A100/RTX30xx/40xx系列GPU）
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logging.info("已启用TF32加速")
+    
     # 配置与设备
     config = TrainingConfig()
     set_seed(getattr(config, "seed", 42))
@@ -943,18 +988,21 @@ def train_multimodal_reid():
         adaptive_clip = getattr(config, "adaptive_gradient_clip", True)
         train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler, adaptive_clip, accum_steps, autocast_dtype)
         
-        # 监控SDM对齐损失异常并自动调整
-        current_sdm_loss = train_metrics.get('sdm_loss', train_metrics['contrastive_loss'])
-        if epoch > 5 and len(train_history) >= 2:
-            prev_sdm_loss = train_history[-1].get('sdm_loss', train_history[-1]['contrastive_loss'])
-            if current_sdm_loss > prev_sdm_loss * 1.8:
-                logging.warning(f"Epoch {epoch}: SDM对齐损失异常上升 {prev_sdm_loss:.4f} -> {current_sdm_loss:.4f}")
-                # 自动降低SDM损失权重
-                current_weight = getattr(config, 'contrastive_weight', 0.1)
-                new_weight = max(0.001, current_weight * 0.5)
-                config.contrastive_weight = new_weight
-                model.config.contrastive_weight = new_weight
-                logging.info(f"自动调整SDM损失权重: {current_weight:.4f} -> {new_weight:.4f}")
+        # === SDM调度器更新（基于训练指标） ===
+        if hasattr(model, 'sdm_scheduler'):
+            # 更新SDM参数
+            effective_cont_w, current_temp = model.sdm_scheduler.get_parameters(epoch, train_metrics, comp_metrics if 'comp_metrics' in locals() else None)
+            
+            # 检查是否可以增加权重
+            if model.sdm_scheduler.can_increase_weight(epoch, train_metrics, comp_metrics if 'comp_metrics' in locals() else None):
+                if model.sdm_scheduler.increase_weight():
+                    effective_cont_w = model.sdm_scheduler.weight_scheduler.current_weight
+            
+            # 检查是否需要降低权重（异常情况）
+            current_sdm_loss = train_metrics.get('sdm_loss', train_metrics.get('contrastive_loss', 0.0))
+            if current_sdm_loss > 5.0 or current_sdm_loss < 0:
+                model.sdm_scheduler.decrease_weight(f"SDM损失异常: {current_sdm_loss:.4f}")
+                effective_cont_w = model.sdm_scheduler.weight_scheduler.current_weight
         
         # 自适应增强强度：5个epoch后如果训练稳定，放宽裁剪强度
         if epoch == 5 and train_metrics['stability_score'] > 0.8:
