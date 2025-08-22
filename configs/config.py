@@ -100,9 +100,9 @@ class TrainingConfig:
     fusion_dropout: float = 0.1   # 融合模块dropout率
     
     # 特征范数正则化参数（修复CE收敛问题）
-    feature_target_norm: float = 5.0     # 进一步降低目标特征范数
-    feature_norm_band: float = 1.0       # 收紧容忍带宽
-    feature_norm_penalty: float = 5e-3   # 提高正则化权重防止特征范数过大
+    feature_target_norm: float = 10.0    # 提高目标特征范数，避免过度约束
+    feature_norm_band: float = 2.0       # 放宽容忍带宽
+    feature_norm_penalty: float = 1e-2   # 提高正则化权重防止特征范数过大
     
     # 数据增强
     random_flip: bool = True

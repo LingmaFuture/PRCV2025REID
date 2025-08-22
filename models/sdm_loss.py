@@ -10,6 +10,49 @@ import torch.nn.functional as F
 import logging
 
 
+def sdm_loss_stable(qry, gal, y, tau=0.1, eps=1e-6):
+    """
+    稳定的SDM损失函数实现（函数版本）
+    
+    Args:
+        qry (torch.Tensor): [N, D] 查询特征
+        gal (torch.Tensor): [M, D] 图库特征  
+        y (torch.Tensor): [N, M] 同身份指示矩阵
+        tau (float): 温度参数
+        eps (float): 数值稳定性参数
+        
+    Returns:
+        torch.Tensor: SDM损失值
+    """
+    # 1) L2归一化
+    qry = F.normalize(qry, dim=1, eps=eps)
+    gal = F.normalize(gal, dim=1, eps=eps)
+    S = qry @ gal.t()  # [N, M]
+    
+    def _one_side(S, y, tau):
+        logP = F.log_softmax(S / tau, dim=1)  # [N, M]
+        P = logP.exp()
+        
+        # 构造 q（每行按正样本均分），并对"无正样本行"做掩码
+        row_sum = y.sum(dim=1, keepdim=True)  # [N,1]
+        valid = (row_sum.squeeze(-1) > 0)
+        q = torch.zeros_like(y, dtype=S.dtype)
+        q[valid] = y[valid] / row_sum[valid]
+        
+        # KL(p||q) = CE(p,q) - H(p)
+        ce = -(P * torch.log(q.clamp_min(eps))).sum(dim=1)      # [N]
+        h  = -(P * logP).sum(dim=1)                             # [N]
+        kl = (ce - h)[valid]
+        return kl.mean() if valid.any() else S.new_tensor(0.)
+    
+    L_i2t = _one_side(S,      y,   tau)
+    L_t2i = _one_side(S.t(),  y.t(), tau)
+    L = L_i2t + L_t2i
+    
+    # 极少数情况下会出现 -1e-7 级别的浮点抖动，做个钳制
+    return L.clamp_min(0.0)
+
+
 class SDMLoss(nn.Module):
     """
     SDM (Similarity Distribution Matching) 损失函数
@@ -61,107 +104,21 @@ class SDMLoss(nn.Module):
         # 暂时使用查询标签，实际使用时需要传入图库标签
         y = (labels_qry == labels_gal).float()  # [N, M]
         
-        # 4) 行方向 (i2t) - 查询到图库
-        logP_i2t = F.log_softmax(S / self.temperature, dim=1)  # [N, M]
-        P_i2t = logP_i2t.exp()
-        
-        # 计算每行的正样本数量
-        q_i2t_sum = y.sum(dim=1, keepdim=True)  # [N, 1]
-        valid_i = (q_i2t_sum.squeeze(-1) > 0)  # [N]
-        
-        # 构造标签分布
-        q_i2t = torch.zeros_like(y, dtype=S.dtype)
-        q_i2t[valid_i] = y[valid_i] / q_i2t_sum[valid_i]
-        
-        # 计算KL损失
-        logQ_i2t = torch.log(q_i2t.clamp_min(self.eps))
-        KL_i2t = (P_i2t * (logP_i2t - logQ_i2t)).sum(dim=1)
-        L_i2t = KL_i2t[valid_i].mean() if valid_i.any() else S.new_tensor(0.)
-        
-        # 5) 列方向 (t2i) - 图库到查询
-        logP_t2i = F.log_softmax(S.t() / self.temperature, dim=1)  # [M, N]
-        P_t2i = logP_t2i.exp()
-        
-        y_t = y.t()  # [M, N]
-        q_t2i_sum = y_t.sum(dim=1, keepdim=True)  # [M, 1]
-        valid_j = (q_t2i_sum.squeeze(-1) > 0)  # [M]
-        
-        q_t2i = torch.zeros_like(y_t, dtype=S.dtype)
-        q_t2i[valid_j] = y_t[valid_j] / q_t2i_sum[valid_j]
-        
-        logQ_t2i = torch.log(q_t2i.clamp_min(self.eps))
-        KL_t2i = (P_t2i * (logP_t2i - logQ_t2i)).sum(dim=1)
-        L_t2i = KL_t2i[valid_j].mean() if valid_j.any() else S.new_tensor(0.)
-        
-        # 6) 总损失
-        total_loss = L_i2t + L_t2i
+        # 4) 使用稳定的SDM损失计算
+        total_loss = sdm_loss_stable(qry_features, gal_features, y, self.temperature, self.eps)
         
         if return_details:
             details = {
-                'loss_i2t': L_i2t.item(),
-                'loss_t2i': L_t2i.item(),
                 'total_loss': total_loss.item(),
                 'temperature': self.temperature,
-                'valid_queries': valid_i.sum().item(),
-                'valid_gallery': valid_j.sum().item(),
                 'similarity_mean': S.mean().item(),
                 'similarity_std': S.std().item(),
-                'p_pos_mean': P_i2t[y.bool()].mean().item() if y.bool().any() else 0.0
+                'valid_queries': (y.sum(dim=1) > 0).sum().item(),
+                'valid_gallery': (y.sum(dim=0) > 0).sum().item(),
             }
             return total_loss, details
         
         return total_loss
-
-
-def sdm_loss_stable(qry, gal, y, tau=0.1, eps=1e-6):
-    """
-    稳定的SDM损失函数实现（函数版本）
-    
-    Args:
-        qry (torch.Tensor): [N, D] 查询特征
-        gal (torch.Tensor): [M, D] 图库特征  
-        y (torch.Tensor): [N, M] 同身份指示矩阵
-        tau (float): 温度参数
-        eps (float): 数值稳定性参数
-        
-    Returns:
-        torch.Tensor: SDM损失值
-    """
-    # 1) L2归一化
-    qry = F.normalize(qry, dim=1, eps=eps)
-    gal = F.normalize(gal, dim=1, eps=eps)
-    
-    # 2) 相似度矩阵
-    S = qry @ gal.t()  # [N, M]
-    
-    # 3) 行方向 (i2t)
-    logP_i2t = F.log_softmax(S / tau, dim=1)  # [N, M]
-    P_i2t = logP_i2t.exp()
-    
-    q_i2t_sum = y.sum(dim=1, keepdim=True)
-    valid_i = (q_i2t_sum.squeeze(-1) > 0)
-    q_i2t = torch.zeros_like(y, dtype=S.dtype)
-    q_i2t[valid_i] = y[valid_i] / q_i2t_sum[valid_i]
-    
-    logQ_i2t = torch.log(q_i2t.clamp_min(eps))
-    KL_i2t = (P_i2t * (logP_i2t - logQ_i2t)).sum(dim=1)
-    L_i2t = KL_i2t[valid_i].mean() if valid_i.any() else S.new_tensor(0.)
-    
-    # 4) 列方向 (t2i)
-    logP_t2i = F.log_softmax(S.t() / tau, dim=1)  # [M, N]
-    P_t2i = logP_t2i.exp()
-    
-    y_t = y.t()
-    q_t2i_sum = y_t.sum(dim=1, keepdim=True)
-    valid_j = (q_t2i_sum.squeeze(-1) > 0)
-    q_t2i = torch.zeros_like(y_t, dtype=S.dtype)
-    q_t2i[valid_j] = y_t[valid_j] / q_t2i_sum[valid_j]
-    
-    logQ_t2i = torch.log(q_t2i.clamp_min(eps))
-    KL_t2i = (P_t2i * (logP_t2i - logQ_t2i)).sum(dim=1)
-    L_t2i = KL_t2i[valid_j].mean() if valid_j.any() else S.new_tensor(0.)
-    
-    return L_i2t + L_t2i
 
 
 # 测试函数

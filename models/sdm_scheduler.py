@@ -179,7 +179,7 @@ class SDMTemperatureScheduler:
         
         # 检查稳定性分数
         stability_score = train_metrics.get('stability_score', 0.0)
-        if stability_score < 0.7:
+        if stability_score < 0.5:  # 降低阈值，避免过度使用回退温度
             self.use_fallback = True
             logging.warning(f"训练不稳定 (score={stability_score:.2f})，使用回退温度 {self.fallback_temp}")
             return True

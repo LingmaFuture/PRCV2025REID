@@ -550,7 +550,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             optimizer.zero_grad(set_to_none=True)
         # === SDM权重调度（按文档要求） ===
         if not hasattr(model, 'sdm_scheduler'):
-            model.sdm_scheduler = SDMScheduler(config)
+            model.sdm_scheduler = SDMScheduler(model.config)
         
         # 获取当前epoch的SDM参数
         effective_cont_w, current_temp = model.sdm_scheduler.get_parameters(epoch, {})
@@ -612,12 +612,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         loss_dict['total_loss'] = loss
 
         current_loss = float(loss.item() * accum_steps)  # 显示未缩放的损失
-        if current_loss > 50.0 or not np.isfinite(current_loss):
+        if current_loss > 100.0 or not np.isfinite(current_loss):  # 提高阈值，避免误判
             logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 异常损失 {current_loss:.3f}, 跳过")
             loss_spikes += 1
             continue
             
-        if batch_idx > 0 and current_loss > total_loss / batch_idx * 1.5:
+        # 更宽松的spike检测：只有当损失超过平均值的3倍时才认为是异常
+        if batch_idx > 0 and current_loss > total_loss / batch_idx * 3.0:
             loss_spikes += 1
         
         # 计算梯度（支持梯度累积）
@@ -801,36 +802,27 @@ def train_multimodal_reid():
     logging.info("加载数据集并进行身份划分...")
     full_dataset = MultiModalDataset(config, split='train')
 
-    train_indices, val_indices, train_ids, val_ids = split_train_dataset(
-        full_dataset,
+    # 使用新的划分工具
+    from tools.split import split_ids, create_split_datasets, verify_split_integrity
+    
+    # 获取所有人员ID
+    all_person_ids = [full_dataset.data_list[i]['person_id'] for i in range(len(full_dataset))]
+    all_person_ids = sorted(list(set(all_person_ids)))
+    
+    # 按ID划分训练集和验证集
+    train_ids, val_ids = split_ids(
+        all_person_ids, 
         val_ratio=getattr(config, "val_ratio", 0.2),
         seed=getattr(config, "seed", 42)
     )
-
-    # 创建完整的 person_id -> label 映射（包含训练集和验证集）
-    all_person_ids = sorted(list(set(train_ids + val_ids)))
-    pid2label = {pid: i for i, pid in enumerate(all_person_ids)}
     
-    logging.info("创建训练和验证数据集...")
+    # 创建训练集和验证集
+    train_dataset, local_val_dataset = create_split_datasets(
+        full_dataset, train_ids, val_ids, config
+    )
     
-    # 先保存原始数据列表
-    original_data_list = full_dataset.data_list.copy()
-    
-    # 创建训练数据集
-    train_dataset = full_dataset
-    train_dataset.person_ids = all_person_ids
-    train_dataset.pid2label = pid2label
-    train_dataset.data_list = [item for item in original_data_list if item['person_id'] in train_ids]
-
-    # 创建真正的验证集（split='val'，关闭训练模式和模态dropout）
-    logging.info("创建验证集数据集（关闭增强和模态dropout）...")
-    local_val_dataset = MultiModalDataset(config, split='val', person_ids=all_person_ids)
-    local_val_dataset.pid2label = pid2label
-    # 只保留验证ID的样本
-    local_val_dataset.data_list = [item for item in local_val_dataset.data_list if item['person_id'] in val_ids]
-
-    logging.info(f"数据集划分完成 - 训练集: {len(train_ids)} IDs, {len(train_dataset.data_list)} 样本")
-    logging.info(f"数据集划分完成 - 本地验证集: {len(val_ids)} IDs, {len(local_val_dataset.data_list)} 样本")
+    # 验证划分完整性
+    verify_split_integrity(train_dataset, local_val_dataset)
 
     # 分类头 num_classes（应该覆盖所有可能的person_id以避免标签超出范围）
     config.num_classes = len(all_person_ids)

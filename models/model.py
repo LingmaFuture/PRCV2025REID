@@ -585,11 +585,13 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         else:
             raise ValueError("模型输出缺少bn_features，对齐损失特征不一致")
         
-        sdm_loss = self.sdm_contrastive_loss(
-            raw_modality_features,
-            alignment_features,
-            labels
-        )
+        # 使用fp32计算SDM损失，避免半精度下的数值不稳定
+        with torch.amp.autocast('cuda', enabled=False):
+            sdm_loss = self.sdm_contrastive_loss(
+                raw_modality_features,
+                alignment_features,
+                labels
+            )
         
         # 特征范数正则化 - 使用与检索一致的特征
         if 'bn_features' in outputs:
