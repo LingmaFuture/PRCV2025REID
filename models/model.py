@@ -370,10 +370,10 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         self.ce_weight = getattr(config, 'ce_weight', 1.0)
         self.contrastive_weight = getattr(config, 'contrastive_weight', 0.1)
         
-        # 特征范数正则化参数
-        self.feature_target_norm = getattr(config, 'feature_target_norm', 10.0)
-        self.feature_norm_band = getattr(config, 'feature_norm_band', 3.0)
-        self.feature_norm_penalty = getattr(config, 'feature_norm_penalty', 2e-3)
+        # 特征范数正则化参数（优化控制特征尺度）
+        self.feature_target_norm = getattr(config, 'feature_target_norm', 8.0)    # 降低目标范数
+        self.feature_norm_band = getattr(config, 'feature_norm_band', 2.0)       # 缩小容忍带宽
+        self.feature_norm_penalty = getattr(config, 'feature_norm_penalty', 5e-3) # 增强正则强度
         
         # ===== 可学习的null token占位符 =====
         # 为每个模态创建可学习的null token，用于缺失模态的占位

@@ -525,6 +525,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     loss_spikes = 0
     grad_norms = []
     
+    # 稳健的Spike检测状态管理
+    if not hasattr(train_epoch, '_spike_state'):
+        train_epoch._spike_state = {
+            'loss_hist': [],
+            'spikes': 0,
+            'batches': 0
+        }
+    
     use_amp = (scaler is not None and getattr(scaler, "is_enabled", lambda: True)())
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', 
@@ -612,14 +620,36 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         loss_dict['total_loss'] = loss
 
         current_loss = float(loss.item() * accum_steps)  # 显示未缩放的损失
-        if current_loss > 100.0 or not np.isfinite(current_loss):  # 提高阈值，避免误判
-            logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 异常损失 {current_loss:.3f}, 跳过")
-            loss_spikes += 1
-            continue
+        
+        # 稳健的Spike检测：使用滑动中位数 + MAD（中位数绝对偏差）
+        state = train_epoch._spike_state
+        state['loss_hist'].append(current_loss)
+        # 保持最近200个损失值的历史
+        if len(state['loss_hist']) > 200:
+            state['loss_hist'] = state['loss_hist'][-200:]
+        
+        # 计算稳健阈值
+        if len(state['loss_hist']) >= 10:  # 至少10个样本才开始检测
+            hist = np.array(state['loss_hist'])
+            median = np.median(hist)
+            mad = np.median(np.abs(hist - median)) + 1e-6
+            threshold = median + 6.0 * 1.4826 * mad  # 约等于6σ阈值
             
-        # 更宽松的spike检测：只有当损失超过平均值的3倍时才认为是异常
-        if batch_idx > 0 and current_loss > total_loss / batch_idx * 3.0:
+            # 检测异常
+            if current_loss > threshold:
+                loss_spikes += 1
+                state['spikes'] += 1
+                if batch_idx % 20 == 0:  # 减少日志频率
+                    logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 损失异常 {current_loss:.3f} > {threshold:.3f}")
+        
+        state['batches'] += 1
+        
+        # 检查数值有效性
+        if not np.isfinite(current_loss):
+            logging.error(f"Epoch {epoch}, Batch {batch_idx}: 损失无效 {current_loss}, 跳过")
             loss_spikes += 1
+            state['spikes'] += 1
+            continue
         
         # 计算梯度（支持梯度累积）
         if use_amp and scaler is not None:
@@ -761,7 +791,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         'feature_norm': avg_feat_norm,
         'grad_norm': avg_grad_norm,
         'loss_spikes': loss_spikes,
-        'stability_score': max(0.0, 1.0 - loss_spikes / max(1, len(dataloader)))
+        'stability_score': max(0.0, 1.0 - train_epoch._spike_state['spikes'] / max(1, train_epoch._spike_state['batches']))
     }
 
 # ------------------------------
@@ -809,6 +839,9 @@ def train_multimodal_reid():
     all_person_ids = [full_dataset.data_list[i]['person_id'] for i in range(len(full_dataset))]
     all_person_ids = sorted(list(set(all_person_ids)))
     
+    # 创建person_id到标签的映射
+    pid2label = {pid: idx for idx, pid in enumerate(all_person_ids)}
+    
     # 按ID划分训练集和验证集
     train_ids, val_ids = split_ids(
         all_person_ids, 
@@ -823,6 +856,18 @@ def train_multimodal_reid():
     
     # 验证划分完整性
     verify_split_integrity(train_dataset, local_val_dataset)
+    
+    # 输出最终的数据集统计（确认划分成功）
+    train_ids_actual = set(item['person_id'] for item in train_dataset.data_list)
+    val_ids_actual = set(item['person_id'] for item in local_val_dataset.data_list)
+    
+    print(f"📊 数据集划分结果:")
+    print(f"  原始数据集: {len(full_dataset.data_list)} 样本, {len(all_person_ids)} 个ID")
+    print(f"  训练数据集: {len(train_dataset.data_list)} 样本, {len(train_ids_actual)} 个ID ({len(train_dataset.data_list)/len(full_dataset.data_list):.1%})")
+    print(f"  验证数据集: {len(local_val_dataset.data_list)} 样本, {len(val_ids_actual)} 个ID ({len(local_val_dataset.data_list)/len(full_dataset.data_list):.1%})")
+    print(f"  ID重叠检查: {'✅ 无重叠' if len(train_ids_actual & val_ids_actual) == 0 else '❌ 存在重叠'}")
+    
+    logging.info(f"最终数据集: 训练集{len(train_dataset.data_list)}样本, 验证集{len(local_val_dataset.data_list)}样本")
 
     # 分类头 num_classes（应该覆盖所有可能的person_id以避免标签超出范围）
     config.num_classes = len(all_person_ids)
