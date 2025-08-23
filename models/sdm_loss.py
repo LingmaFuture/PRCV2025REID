@@ -35,27 +35,67 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-6):
     gal = F.normalize(gal, dim=1, eps=eps)
     
     def _one_side_ce(S: torch.Tensor, y: torch.Tensor):
-        """使用交叉熵形式，杜绝负值"""
+        """使用交叉熵形式，数值稳定版本"""
         # y: [N, M] ∈ {0,1}
         row_pos = y.sum(dim=1, keepdim=True)         # [N,1]
         valid = (row_pos.squeeze(-1) > 0)            # 只保留至少有一个正样本的行
         if not valid.any():
             return S.new_tensor(0.)
 
-        # 目标分布 q：正样本上均匀分布，负样本严格为 0；不做 eps 抬升
-        q = torch.zeros_like(S)
-        q[valid] = y[valid] / row_pos[valid]
+        # ✅ 数值稳定：裁剪logits防止exp溢出
+        S_clipped = S.clamp(-20.0, 20.0)
+        
+        # 目标分布 q：正样本上均匀分布，加保障防止除零
+        pos = (y > 0).float()
+        denom = pos.sum(dim=1, keepdim=True).clamp_min(1.0)  # ✅ 防0除法
+        q = torch.zeros_like(S_clipped)
+        q[valid] = pos[valid] / denom[valid]
 
-        # 预测分布 p
-        log_p = F.log_softmax(S, dim=1)
+        # ✅ 预测分布：使用稳定的log_softmax
+        log_p = F.log_softmax(S_clipped, dim=1)
 
         # 交叉熵 H(q,p) = -∑ q * log p   （保证非负）
         ce = -(q * log_p).sum(dim=1)                 # [N]
-        return ce[valid].mean()
+        
+        # ✅ 最终检查：确保非NaN
+        ce_valid = ce[valid]
+        if not torch.isfinite(ce_valid).all():
+            print(f"⚠️ CE计算出现NaN: valid_rows={valid.sum()}, ce_range=({ce_valid.min():.3f}, {ce_valid.max():.3f})")
+            return S.new_tensor(0.)
+            
+        return ce_valid.mean()
     
     # 3) 在fp32下计算，避免数值问题
     with torch.cuda.amp.autocast(enabled=False):
-        S = (qry.float() @ gal.float().t()) / adaptive_tau  # [N,M]
+        # ✅ 特征和相似度检查
+        qry_f, gal_f = qry.float(), gal.float()
+        
+        # 检查特征是否有异常
+        for name, feat in [("qry", qry_f), ("gal", gal_f)]:
+            if not torch.isfinite(feat).all():
+                print(f"⚠️ {name}特征包含NaN/Inf")
+                return torch.tensor(0.0, device=qry.device, dtype=qry.dtype)
+            feat_max = feat.abs().max().item()
+            if feat_max > 100.0:  # L2归一化后特征不应该过大
+                print(f"⚠️ {name}特征幅值异常大: {feat_max:.3f}")
+                
+        S = qry_f @ gal_f.t() / adaptive_tau  # [N,M]
+        
+        # 检查相似度矩阵
+        if not torch.isfinite(S).all():
+            print(f"⚠️ 相似度矩阵包含NaN/Inf, tau={adaptive_tau:.3f}")
+            return torch.tensor(0.0, device=qry.device, dtype=qry.dtype)
+            
+        sim_min, sim_max = S.min().item(), S.max().item()
+        if abs(sim_min) > 50 or abs(sim_max) > 50:
+            print(f"⚠️ 相似度范围异常: [{sim_min:.2f}, {sim_max:.2f}], tau={adaptive_tau:.3f}")
+            
+        # ✅ 检查正样本计数
+        pos_cnt = y.sum(dim=1)
+        zero_pos_rows = (pos_cnt == 0).nonzero(as_tuple=True)[0]
+        if len(zero_pos_rows) > 0:
+            print(f"⚠️ 发现{len(zero_pos_rows)}行无正样本: {zero_pos_rows[:5].tolist()}")
+        
         L_q2g = _one_side_ce(S, y)          # KL(q||p) 的等价优化目标
         L_g2q = _one_side_ce(S.t(), y.t())  # 对称项
         symmetric = 0.5 * (L_q2g + L_g2q)

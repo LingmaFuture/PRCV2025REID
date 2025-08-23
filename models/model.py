@@ -653,6 +653,17 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         under = torch.clamp((target_norm - band) - fn, min=0)
         feat_penalty = (over**2 + under**2).mean() * lam
         
+        # ===== 快速判因：检查各项损失 =====
+        # 1) 哪个损失炸了？
+        for name, loss_val in {"CE": ce_loss, "SDM": sdm_loss, "FeatPenalty": feat_penalty}.items():
+            if not torch.isfinite(loss_val):
+                print(f"⚠️ {name} 损失异常: {loss_val.item()}")
+                # 强制重置为0，防止传播
+                if name == "SDM":
+                    sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+                elif name == "FeatPenalty":
+                    feat_penalty = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+                    
         # 总损失
         total_loss = (self.ce_weight * ce_loss + 
                      self.contrastive_weight * sdm_loss + 

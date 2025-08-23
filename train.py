@@ -769,9 +769,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             elif sdm_loss_val > 5.0:
                 logging.warning(f"⚠️  SDM损失过大: {sdm_loss_val:.4f} - 可能存在数值不稳定")
         
-        # BN特征范数警告：每个epoch仅在前几个batch打印一次，避免日志刷屏
-        if avg_bn > 12.0 and epoch <= 5 and batch_idx % 50 == 0:
-            logging.warning(f"⚠️  BN特征范数过大: {avg_bn:.2f} - 建议增强正则化 (Epoch {epoch}, Batch {batch_idx})")
+        # BN特征范数警告：前5个epoch不报警，给正则化时间生效
+        if avg_bn > 12.0 and epoch > 5 and batch_idx % 50 == 0:
+            logging.warning(f"⚠️  BN特征范数过大: {avg_bn:.2f} - 正则化未生效 (Epoch {epoch})")
         
         # 优化：每5个batch更新一次进度条，避免频繁GPU-CPU同步
         if batch_idx % 5 == 0:
