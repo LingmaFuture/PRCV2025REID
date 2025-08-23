@@ -222,6 +222,12 @@ class SDMScheduler:
         Returns:
             tuple: (weight, temperature)
         """
+        # ✅ 容错：如果指标为空或缺少关键字段，返回当前值，不做判定
+        if not train_metrics or 'stability_score' not in train_metrics:
+            current_weight = getattr(self.weight_scheduler, 'current_weight', self.weight_scheduler.initial_weight)
+            current_temp = getattr(self.temp_scheduler, 'current_temp', self.temp_scheduler.init_temp)
+            return current_weight, current_temp
+            
         # 检查稳定性
         self.temp_scheduler.check_stability(train_metrics)
         

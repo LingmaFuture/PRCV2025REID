@@ -556,16 +556,19 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         # 梯度累积：只在累积步开始时清零梯度
         if batch_idx % accum_steps == 0:
             optimizer.zero_grad(set_to_none=True)
-        # === SDM权重调度（按文档要求） ===
+        # === SDM权重调度（只读当前参数，避免空指标触发回退） ===
         if not hasattr(model, 'sdm_scheduler'):
             model.sdm_scheduler = SDMScheduler(model.config)
         
-        # 获取当前epoch的SDM参数
-        effective_cont_w, current_temp = model.sdm_scheduler.get_parameters(epoch, {})
+        # ✅ 只读当前权重/温度，不做判定（由 epoch 结束后统一调整）
+        effective_cont_w = getattr(model.sdm_scheduler.weight_scheduler, "current_weight",
+                                   getattr(model.config, "contrastive_weight", 0.1))
+        current_temp = getattr(model.sdm_scheduler.temp_scheduler, "current_temp",
+                               getattr(model.config, "sdm_temperature", 0.2))
         
-        # 每个epoch的第一个batch输出SDM参数
+        # 每个epoch的第一个batch输出SDM参数（只读模式）
         if batch_idx == 0:
-            logging.info(f"Epoch {epoch}: SDM_weight = {effective_cont_w:.4f}, SDM_temp = {current_temp:.3f}")
+            logging.info(f"Epoch {epoch}: (read-only) SDM_weight={effective_cont_w:.4f}, SDM_temp={current_temp:.3f}")
 
         with autocast(device_type='cuda', dtype=autocast_dtype, enabled=use_amp):
             try:
@@ -628,12 +631,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         if len(state['loss_hist']) > 200:
             state['loss_hist'] = state['loss_hist'][-200:]
         
-        # 计算稳健阈值
-        if len(state['loss_hist']) >= 10:  # 至少10个样本才开始检测
-            hist = np.array(state['loss_hist'])
+        # ✅ 条件启动：足够样本再开启spike检测
+        if len(state['loss_hist']) >= 20:
+            hist = np.array(state['loss_hist'][-100:])         # ✅ 最近100个样本
             median = np.median(hist)
-            mad = np.median(np.abs(hist - median)) + 1e-6
-            threshold = median + 6.0 * 1.4826 * mad  # 约等于6σ阈值
+            mad = np.median(np.abs(hist - median))
+            mad = max(mad, 0.05)                                # ✅ MAD下限
+            threshold = max(median + 6.0 * 1.4826 * mad,       # ✅ 绝对门限
+                            median * 1.15)                     # ✅ 相对门槛 15%
             
             # 检测异常
             if current_loss > threshold:
@@ -725,23 +730,29 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         
-        # 建议：同时记录两种特征范数以更好地监控训练
+        # 监控三种特征范数：融合、BN后、原始ReID特征
         fused_norms = None
+        bn_norms = None
         reid_raw_norms = None
         if isinstance(outputs, dict):
             if 'features' in outputs:
                 fused_norms = torch.norm(outputs['features'].detach(), p=2, dim=1)  # 被feat_penalty约束的量
+            if 'bn_features' in outputs:
+                bn_norms = torch.norm(outputs['bn_features'].detach(), p=2, dim=1)  # BN后特征（对齐+检索用）
             if 'reid_features_raw' in outputs:
                 reid_raw_norms = torch.norm(outputs['reid_features_raw'].detach(), p=2, dim=1)  # 受LayerNorm影响
 
-        # 使用融合特征范数更新累积统计（因为这是正则化目标）
-        if fused_norms is not None:
+        # 使用BN特征范数更新累积统计（因为这是对齐和检索的关键）
+        if bn_norms is not None:
+            feature_norms.extend(bn_norms.cpu().numpy())
+        elif fused_norms is not None:
             feature_norms.extend(fused_norms.cpu().numpy())
 
-        # 进度条里分两栏看更直观（显示当前batch的均值）
+        # 进度条显示BN后特征范数（最重要的监控指标）
         avg_fused = float(fused_norms.mean().item()) if fused_norms is not None else 0.0
+        avg_bn = float(bn_norms.mean().item()) if bn_norms is not None else 0.0
         avg_reid  = float(reid_raw_norms.mean().item()) if reid_raw_norms is not None else 0.0
-        avg_grad_norm = np.mean(grad_norms[-10:]) if grad_norms else 0.0
+        avg_grad_norm = (np.mean(grad_norms[-10:]) if grad_norms else None)
 
         # 区分SDM损失和分数进行监控
         sdm_loss_val = float(sdm_loss.item())
@@ -750,22 +761,26 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         if epoch <= 5 and batch_idx % 10 == 0:
             logging.info(f"详细SDM监控 Epoch {epoch}, Batch {batch_idx}: "
                         f"SDM_Loss={sdm_loss_val:.4f}, CE_Loss={float(ce_loss.item()):.4f}, "
-                        f"Feat_Norm={avg_fused:.2f}")
+                        f"Feat_BN={avg_bn:.2f}, Feat_Fused={avg_fused:.2f}")
             
-            # 检查SDM损失异常（损失不应为负值）
+            # 检查SDM损失异常（修复后应该天然非负）
             if sdm_loss_val < 0:
-                logging.warning(f"⚠️  SDM损失异常为负值: {sdm_loss_val:.4f} - 这表明损失计算有误！")
+                logging.warning(f"⚠️  SDM损失异常为负值: {sdm_loss_val:.4f} - 检查mask过滤是否生效！")
             elif sdm_loss_val > 5.0:
                 logging.warning(f"⚠️  SDM损失过大: {sdm_loss_val:.4f} - 可能存在数值不稳定")
+        
+        # BN特征范数警告：每个epoch仅在前几个batch打印一次，避免日志刷屏
+        if avg_bn > 12.0 and epoch <= 5 and batch_idx % 50 == 0:
+            logging.warning(f"⚠️  BN特征范数过大: {avg_bn:.2f} - 建议增强正则化 (Epoch {epoch}, Batch {batch_idx})")
         
         # 优化：每5个batch更新一次进度条，避免频繁GPU-CPU同步
         if batch_idx % 5 == 0:
             pbar.set_postfix({
                 'Loss': f'{current_loss:.3f}',
                 'CE': f'{float(ce_loss.item()):.3f}',
-                'SDMLoss': f'{sdm_loss_val:.3f}',  # 明确标注这是损失值，不是分数
-                'Feat': f'{avg_fused:.2f}',
-                'GradNorm': f'{avg_grad_norm:.2f}',
+                'SDMLoss': f'{sdm_loss_val:.3f}',  # 修复后应该非负
+                'Feat(BN)': f'{avg_bn:.2f}',  # 重点监控BN后特征范数
+                'GradNorm': ('—' if avg_grad_norm is None else f'{avg_grad_norm:.2f}'),
                 'Spikes': loss_spikes
             })
 

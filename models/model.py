@@ -358,7 +358,8 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         self.num_classes = None
         self.bn_neck = None
         
-        # ===== 损失函数 =====
+        # ===== 损失函数和SDM参数 =====
+        self.sdm_temperature = getattr(config, "sdm_temperature", 0.2)  # 保存温度参数
         self.sdm_contrastive_loss = SDMContrastiveLoss(
             temperature=getattr(config, "sdm_temperature", 0.1),
             margin=getattr(config, "sdm_margin", 0.3),
@@ -560,6 +561,9 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                 'fused': fused_features
             }
         
+        # 输出feature_masks供损失计算时过滤使用
+        outputs['feature_masks'] = feature_masks
+        
         return outputs
     
     def compute_loss(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -577,21 +581,62 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         
         ce_loss = self.ce_loss(outputs['logits'], labels)
         
-        # SDM对比损失：RGB锚定对齐损失
+        # 真正的非负SDM损失：严格按mask过滤，避免占位符污染对齐
+        from .sdm_loss import sdm_loss_stable
         raw_modality_features = outputs.get('raw_modality_features', {})
-        # 强制使用BN后特征进行对齐损失计算，确保与检索特征完全一致
-        if 'bn_features' in outputs:
-            alignment_features = outputs['bn_features']  # 与检索特征保持完全一致
-        else:
-            raise ValueError("模型输出缺少bn_features，对齐损失特征不一致")
+        feature_masks = outputs.get('feature_masks', {})
         
-        # 使用fp32计算SDM损失，避免半精度下的数值不稳定
+        # 使用fp32计算SDM损失，避免半精度下的数值不稳定  
         with torch.amp.autocast('cuda', enabled=False):
-            sdm_loss = self.sdm_contrastive_loss(
-                raw_modality_features,
-                alignment_features,
-                labels
-            )
+            rgb_features = raw_modality_features.get('rgb', None)
+            rgb_mask = feature_masks.get('rgb', None)
+            
+            if rgb_features is None or rgb_mask is None:
+                # 回退：如果没有RGB特征或mask，跳过SDM对齐
+                sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+            else:
+                # 找到有效的RGB样本索引
+                rgb_valid_idx = (rgb_mask > 0).squeeze(-1) if rgb_mask.dim() > 1 else (rgb_mask > 0)
+                
+                if rgb_valid_idx.sum() == 0:
+                    # 没有有效RGB样本，跳过对齐
+                    sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+                else:
+                    # 过滤出有效的RGB特征和标签
+                    rgb_valid_feat = rgb_features[rgb_valid_idx]
+                    rgb_valid_labels = labels[rgb_valid_idx]
+                    
+                    sdm_losses = []
+                    # 对每个非RGB模态与有效RGB做SDM对齐
+                    for mod_name, mod_feat in raw_modality_features.items():
+                        if mod_name == 'rgb':
+                            continue
+                            
+                        mod_mask = feature_masks.get(mod_name, None)
+                        if mod_feat is None or mod_mask is None:
+                            continue
+                            
+                        # 找到该模态的有效样本
+                        mod_valid_idx = (mod_mask > 0).squeeze(-1) if mod_mask.dim() > 1 else (mod_mask > 0)
+                        
+                        if mod_valid_idx.sum() == 0:
+                            continue  # 该模态没有有效样本
+                            
+                        # 过滤出有效的模态特征和标签
+                        mod_valid_feat = mod_feat[mod_valid_idx]
+                        mod_valid_labels = labels[mod_valid_idx]
+                        
+                        # 构造有效样本间的同身份指示矩阵
+                        y = (mod_valid_labels.view(-1, 1) == rgb_valid_labels.view(1, -1)).float()
+                        
+                        # 模态特征 -> RGB特征的SDM对齐（天然非负）
+                        L = sdm_loss_stable(mod_valid_feat, rgb_valid_feat, y, 
+                                          tau=self.sdm_temperature)
+                        if torch.isfinite(L):
+                            sdm_losses.append(L)
+                    
+                    # 平均所有有效模态的SDM损失
+                    sdm_loss = torch.stack(sdm_losses).mean() if sdm_losses else torch.tensor(0.0, device=labels.device, dtype=torch.float32)
         
         # 特征范数正则化 - 使用与检索一致的特征
         if 'bn_features' in outputs:

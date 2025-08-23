@@ -84,6 +84,7 @@ class TrainingConfig:
     # SDM相关配置（按文档要求）
     sdm_semantic_dim: int = 512  # SDM语义分离特征维度
     sdm_num_heads: int = 8       # SDM注意力头数
+    sdm_temperature: float = 0.2  # SDM损失温度参数（修复后稳定版本）
     
     # 温度参数配置（提高稳定性）
     sdm_init_temperature: float = 0.20  # 提高初始温度增强数值稳定性
@@ -102,7 +103,7 @@ class TrainingConfig:
     # 特征范数正则化参数（修复CE收敛问题）
     feature_target_norm: float = 8.0     # 优化目标特征范数，控制在合理范围
     feature_norm_band: float = 2.0       # 适中的容忍带宽  
-    feature_norm_penalty: float = 5e-3   # 平衡的正则化权重
+    feature_norm_penalty: float = 1e-2   # 增强正则化权重，严格控制范数
     
     # 数据增强
     random_flip: bool = True
