@@ -35,35 +35,42 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-6):
     gal = F.normalize(gal, dim=1, eps=eps)
     
     def _one_side_ce(S: torch.Tensor, y: torch.Tensor):
-        """使用交叉熵形式，数值稳定版本"""
+        """使用交叉熵形式，数值稳定版本，强化有效行检查"""
         # y: [N, M] ∈ {0,1}
-        row_pos = y.sum(dim=1, keepdim=True)         # [N,1]
-        valid = (row_pos.squeeze(-1) > 0)            # 只保留至少有一个正样本的行
+        row_pos = y.sum(dim=1)  # [N] 每行正样本数
+        valid = (row_pos > 0)   # 至少有一个正样本的行
+        
         if not valid.any():
-            return S.new_tensor(0.)
+            # 没有任何有效行，直接返回0
+            return torch.tensor(0.0, device=S.device, dtype=S.dtype)
 
-        # ✅ 数值稳定：裁剪logits防止exp溢出
-        S_clipped = S.clamp(-20.0, 20.0)
+        # 只处理有效行，提升数值稳定性
+        S_valid = S[valid].clamp(-20.0, 20.0)  # [valid_N, M] 裁剪防溢出
+        y_valid = y[valid]  # [valid_N, M]
         
-        # 目标分布 q：正样本上均匀分布，加保障防止除零
-        pos = (y > 0).float()
-        denom = pos.sum(dim=1, keepdim=True).clamp_min(1.0)  # ✅ 防0除法
-        q = torch.zeros_like(S_clipped)
-        q[valid] = pos[valid] / denom[valid]
-
-        # ✅ 预测分布：使用稳定的log_softmax
-        log_p = F.log_softmax(S_clipped, dim=1)
-
-        # 交叉熵 H(q,p) = -∑ q * log p   （保证非负）
-        ce = -(q * log_p).sum(dim=1)                 # [N]
+        # 构造目标分布q：在正样本上均匀分布
+        pos = (y_valid > 0).float()  # [valid_N, M]
+        pos_sum = pos.sum(dim=1, keepdim=True).clamp_min(1.0)  # [valid_N, 1] 防零除
+        q = pos / pos_sum  # [valid_N, M] 归一化到概率分布
         
-        # ✅ 最终检查：确保非NaN
-        ce_valid = ce[valid]
-        if not torch.isfinite(ce_valid).all():
-            print(f"⚠️ CE计算出现NaN: valid_rows={valid.sum()}, ce_range=({ce_valid.min():.3f}, {ce_valid.max():.3f})")
-            return S.new_tensor(0.)
-            
-        return ce_valid.mean()
+        # 预测分布p的log值
+        log_p = F.log_softmax(S_valid, dim=1)  # [valid_N, M]
+        
+        # 交叉熵：H(q,p) = -∑_j q_j * log p_j
+        ce_per_row = -(q * log_p).sum(dim=1)  # [valid_N] 每行的交叉熵
+        
+        # 数值检查
+        if not torch.isfinite(ce_per_row).all():
+            nan_cnt = (~torch.isfinite(ce_per_row)).sum()
+            print(f"⚠️ CE计算出现{nan_cnt}个NaN: S范围[{S_valid.min():.2f}, {S_valid.max():.2f}]")
+            # 移除NaN值后计算均值
+            ce_finite = ce_per_row[torch.isfinite(ce_per_row)]
+            if ce_finite.numel() > 0:
+                return ce_finite.mean()
+            else:
+                return torch.tensor(0.0, device=S.device, dtype=S.dtype)
+        
+        return ce_per_row.mean()
     
     # 3) 在fp32下计算，避免数值问题
     with torch.cuda.amp.autocast(enabled=False):
@@ -96,9 +103,26 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-6):
         if len(zero_pos_rows) > 0:
             print(f"⚠️ 发现{len(zero_pos_rows)}行无正样本: {zero_pos_rows[:5].tolist()}")
         
-        L_q2g = _one_side_ce(S, y)          # KL(q||p) 的等价优化目标
-        L_g2q = _one_side_ce(S.t(), y.t())  # 对称项
+        # 计算对称SDM损失，添加调试信息
+        L_q2g = _one_side_ce(S, y)          # 查询->图库
+        L_g2q = _one_side_ce(S.t(), y.t())  # 图库->查询（对称项）
         symmetric = 0.5 * (L_q2g + L_g2q)
+        
+        # 调试监控：检查有效行数和正样本分布
+        pos_cnt_per_row = y.sum(dim=1)  # 每行的正样本数
+        valid_rows = (pos_cnt_per_row > 0)
+        
+        # 每50次打印一次调试信息（减少日志噪音）
+        import time
+        if hasattr(sdm_loss_stable, '_last_debug_time'):
+            current_time = time.time()
+            if current_time - sdm_loss_stable._last_debug_time > 5.0:  # 每5秒打印一次
+                print(f"SDM调试: valid_rows={int(valid_rows.sum())}/{len(valid_rows)}, "
+                      f"pos_min={int(pos_cnt_per_row[valid_rows].min()) if valid_rows.any() else 0}, "
+                      f"L_q2g={float(L_q2g):.3f}, L_g2q={float(L_g2q):.3f}")
+                sdm_loss_stable._last_debug_time = current_time
+        else:
+            sdm_loss_stable._last_debug_time = time.time()
 
     # 4) 交叉熵天然非负，无需 clamp
     result = symmetric

@@ -11,9 +11,6 @@ import numpy as np
 from typing import Dict, List, Optional, Union, Tuple, Any
 
 from .clip_backbone import CLIPUnifiedEncoder
-from .patch_embeds import MultiModalPatchEmbeds
-from .mer_lora import MERLinear, MERMultiheadAttention, MERMLP
-
 
 # 导入原有的SDM和损失函数组件
 class SemanticDisentanglementModule(nn.Module):
@@ -235,6 +232,17 @@ class FeatureFusion(nn.Module):
             stacked_masks = torch.stack(masks, dim=1)  # [B, M]
             # 创建key_padding_mask用于attention（True表示要忽略的位置）
             key_padding_mask = ~stacked_masks.bool()  # [B, M]
+            
+            # ❶ 防全遮罩 → 引发MHA NaN
+            all_masked = key_padding_mask.all(dim=1)  # [B] 检查哪些样本被全部mask
+            if all_masked.any():
+                # 至少保留第一个位置不被mask，避免softmax(-inf) → NaN
+                key_padding_mask[all_masked, 0] = False
+                # 为全遮罩样本提供一个稳定的占位特征（使用第一个模态的均值）
+                global_mean = stacked_features[~all_masked].mean(dim=[0, 1], keepdim=True)  # [1, 1, D]
+                if global_mean.numel() == 0:  # 如果所有样本都被mask，使用零向量
+                    global_mean = torch.zeros(1, 1, D, device=stacked_features.device)
+                stacked_features[all_masked, 0] = global_mean.squeeze(0)
         
         # 多头注意力融合（带mask）
         attn_out, _ = self.multihead_attn(
@@ -248,6 +256,9 @@ class FeatureFusion(nn.Module):
         # MLP混合器 + 残差连接
         mlp_out = self.mlp(attn_out)
         fused_features = self.norm2(attn_out + mlp_out)
+        
+        # ❷ 保险丝：清理任何残留的NaN/Inf
+        fused_features = torch.nan_to_num(fused_features, nan=0.0, posinf=1e4, neginf=-1e4)
         
         # 带mask的加权平均池化
         if masks is not None:
@@ -316,6 +327,9 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         
         self.config = config
         self.device = getattr(config, 'device', 'cuda')
+        
+        # 训练状态跟踪
+        self.current_epoch = 0  # 用于控制modality_dropout的热身期
         
         # 模态配置
         self.modalities = getattr(config, 'modalities', ['rgb', 'ir', 'cpencil', 'sketch', 'text'])
@@ -514,22 +528,46 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         if len(modality_features) == 0:
             raise ValueError("至少需要提供一种有效模态的输入")
         
-        # 模态dropout（训练时随机丢弃部分模态）
+        # 模态dropout（训练时随机丢弃部分模态）- 修复版：防止样本被"打空" + 热身期控制
         if self.training:
             modality_dropout = getattr(self.config, 'modality_dropout', 0.0)
             min_modalities = getattr(self.config, 'min_modalities', 1)
             
+            # ❺ 前2-3个epoch关闭modality_dropout，等训练稳定
+            warmup_epochs = getattr(self.config, 'modality_dropout_warmup_epochs', 3)
+            if self.current_epoch <= warmup_epochs:
+                modality_dropout = 0.0  # 热身期强制关闭dropout
+            
             if modality_dropout > 0 and len(modality_features) > min_modalities:
+                # 保存原始状态用于回退
+                original_modality_features = modality_features.copy()
+                original_feature_masks = feature_masks.copy()
+                
+                # 永不drop 'rgb'，优先保留主模态
                 keep_modalities = []
                 keep_masks = []
                 for mod, feat in modality_features.items():
-                    if torch.rand(1).item() > modality_dropout:
+                    if mod == 'rgb' or torch.rand(1).item() > modality_dropout:
                         keep_modalities.append((mod, feat))
                         keep_masks.append((mod, feature_masks[mod]))
                 
                 if len(keep_modalities) >= min_modalities:
-                    modality_features = dict(keep_modalities)
-                    feature_masks = dict(keep_masks)
+                    # 检查dropout后是否会造成样本级"全遮罩"
+                    temp_modality_features = dict(keep_modalities)
+                    temp_feature_masks = dict(keep_masks)
+                    
+                    # 检查每个样本是否至少有一个有效模态
+                    stacked_masks = torch.stack([temp_feature_masks[mod] for mod in temp_modality_features], dim=1)
+                    per_sample_valid = stacked_masks.any(dim=1)  # [B]
+                    
+                    if per_sample_valid.all():
+                        # 安全：所有样本都有至少一个有效模态
+                        modality_features = temp_modality_features
+                        feature_masks = temp_feature_masks
+                    else:
+                        # 危险：有样本会被完全遮罩，取消本次dropout
+                        modality_features = original_modality_features
+                        feature_masks = original_feature_masks
         
         # 融合多模态特征（带mask）
         feature_list = list(modality_features.values())
@@ -575,11 +613,36 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         Returns:
             损失字典
         """
-        # ID分类损失
+        # ID分类损失 - 添加有效样本计数保护
         if 'logits' not in outputs:
             raise ValueError("模型输出中缺少logits，请确保已设置num_classes")
         
-        ce_loss = self.ce_loss(outputs['logits'], labels)
+        logits = outputs['logits']
+        feature_masks = outputs.get('feature_masks', {})
+        
+        # 构建有效样本mask：至少有一个模态有效且标签有效
+        if feature_masks:
+            # 计算每个样本是否至少有一个模态有效
+            valid_modality_mask = torch.zeros(labels.shape[0], dtype=torch.bool, device=labels.device)
+            for mod_name, mask in feature_masks.items():
+                if mask is not None:
+                    mod_valid = (mask > 0).squeeze(-1) if mask.dim() > 1 else (mask > 0)
+                    valid_modality_mask = valid_modality_mask | mod_valid
+        else:
+            # 没有mask信息，假设全部有效
+            valid_modality_mask = torch.ones(labels.shape[0], dtype=torch.bool, device=labels.device)
+        
+        # 添加标签有效性检查
+        valid_label_mask = (labels >= 0) & (labels < logits.shape[1])
+        valid_ce_mask = valid_modality_mask & valid_label_mask
+        valid_ce_cnt = int(valid_ce_mask.sum())
+        
+        if valid_ce_cnt > 0:
+            ce_loss = self.ce_loss(logits[valid_ce_mask], labels[valid_ce_mask])
+        else:
+            ce_loss = torch.zeros([], device=logits.device)
+            import logging
+            logging.warning(f"CE skipped: valid_ce_cnt=0, mod_valid={int(valid_modality_mask.sum())}, label_valid={int(valid_label_mask.sum())}")
         
         # 真正的非负SDM损失：严格按mask过滤，避免占位符污染对齐
         from .sdm_loss import sdm_loss_stable
@@ -636,22 +699,56 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                             sdm_losses.append(L)
                     
                     # 平均所有有效模态的SDM损失
-                    sdm_loss = torch.stack(sdm_losses).mean() if sdm_losses else torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+                    if sdm_losses:
+                        sdm_loss = torch.stack(sdm_losses).mean()
+                    else:
+                        # ❸ 临时兜底：没有任何SDM正对，说明采样器问题
+                        sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+                        # 偶发性告警（避免日志过多）
+                        if hasattr(self, '_last_no_pairs_warning'):
+                            current_time = __import__('time').time()
+                            if current_time - self._last_no_pairs_warning > 10.0:  # 10秒打印一次
+                                logging.warning("⚠️ 当前batch无SDM正对，可能是采样器未保证rgb+非rgb组合")
+                                self._last_no_pairs_warning = current_time
+                        else:
+                            self._last_no_pairs_warning = __import__('time').time()
+                            logging.warning("⚠️ 当前batch无SDM正对，可能是采样器未保证rgb+非rgb组合")
         
-        # 特征范数正则化 - 使用与检索一致的特征
+        # 特征范数正则化 - 添加NaN保护和有效样本过滤
         if 'bn_features' in outputs:
             feats = outputs['bn_features']  # 与检索和对齐损失保持一致
         else:
             feats = outputs['features']  # 回退到融合后特征
-        fn = feats.norm(p=2, dim=1)  # [B,] 每个样本的L2范数
         
-        target_norm = self.feature_target_norm
-        band = self.feature_norm_band
+        # 只对有效样本计算特征惩罚
+        if valid_ce_cnt > 0:
+            feat = feats[valid_ce_mask]
+        else:
+            feat = feats
+        
+        fn = feat.norm(p=2, dim=1)  # [B,] 每个样本的L2范数
+        
+        # 检查特征范数的有限性
+        if not torch.isfinite(fn).all():
+            import logging
+            logging.warning(f"Feature norms contain NaN/Inf: {fn}")
+            fn = torch.nan_to_num(fn, nan=1.0, posinf=10.0, neginf=1.0)
+        
+        # 降低目标范数到8-12区间，减少数值风险
+        target_norm = 10.0  # 从原来的值降低到10
+        band = 2.0  # 允许8-12的范围
         lam = self.feature_norm_penalty
         
         over = torch.clamp(fn - (target_norm + band), min=0)
         under = torch.clamp((target_norm - band) - fn, min=0)
-        feat_penalty = (over**2 + under**2).mean() * lam
+        
+        if feat.numel() > 0:
+            feat_penalty = (over**2 + under**2).mean() * lam
+        else:
+            feat_penalty = torch.zeros([], device=feats.device)
+        
+        # 最终NaN保护
+        feat_penalty = torch.nan_to_num(feat_penalty, nan=0.0, posinf=1e4, neginf=0.0)
         
         # ===== 快速判因：检查各项损失 =====
         # 1) 哪个损失炸了？
@@ -675,7 +772,8 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             'sdm_loss': sdm_loss,
             'contrastive_loss': sdm_loss,  # 兼容性
             'feat_penalty': feat_penalty,
-            'feature_norm': fn.mean().item()
+            'feature_norm': fn.mean().item(),
+            'ce_valid_cnt': valid_ce_cnt  # 添加有效CE样本计数
         }
     
     def get_learnable_params(self) -> List[Dict[str, Any]]:
@@ -734,6 +832,14 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         param_groups = [group for group in param_groups if len(group['params']) > 0]
         
         return param_groups
+    
+    def set_epoch(self, epoch: int):
+        """
+        设置当前训练epoch，用于控制modality_dropout热身期
+        Args:
+            epoch: 当前epoch（从1开始）
+        """
+        self.current_epoch = epoch
 
 
 if __name__ == "__main__":

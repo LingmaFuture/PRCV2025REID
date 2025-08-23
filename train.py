@@ -515,6 +515,9 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
 # ------------------------------
 def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adaptive_clip=True, accum_steps=1, autocast_dtype=torch.float16):
     model.train()
+    
+    # 设置当前epoch，用于控制modality_dropout热身期
+    model.set_epoch(epoch)
     total_loss = 0.0
     ce_loss_sum = 0.0
     contrastive_loss_sum = 0.0
@@ -757,17 +760,43 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         # 区分SDM损失和分数进行监控
         sdm_loss_val = float(sdm_loss.item())
         
-        # 早期训练详细监控（前5个epoch，每10个batch）
-        if epoch <= 5 and batch_idx % 10 == 0:
-            logging.info(f"详细SDM监控 Epoch {epoch}, Batch {batch_idx}: "
-                        f"SDM_Loss={sdm_loss_val:.4f}, CE_Loss={float(ce_loss.item()):.4f}, "
-                        f"Feat_BN={avg_bn:.2f}, Feat_Fused={avg_fused:.2f}")
+        # 关键监控字段输出（按你的建议格式）
+        if batch_idx % 50 == 0:  # 每50个batch输出一次关键监控
+            # 计算有效样本统计
+            feature_masks = outputs.get('feature_masks', {})
+            vis_cnt = 0
+            for mod_name, mask in feature_masks.items():
+                if mask is not None:
+                    mod_valid = (mask > 0).squeeze(-1) if mask.dim() > 1 else (mask > 0)
+                    if mod_name in ['rgb', 'vis']:  # RGB或可见光模态
+                        vis_cnt = int(mod_valid.sum())
+                        break
+            
+            # 从loss_dict中获取ce_valid计数
+            ce_valid_cnt = loss_dict.get('ce_valid_cnt', len(labels))  # 从模型获取实际有效CE样本数
+            
+            # 输出关键字段
+            logging.info(f"[{epoch:02d}, {batch_idx:03d}] "
+                        f"vis_cnt={vis_cnt}, ce_valid={ce_valid_cnt}, "
+                        f"Feat(BN)_mean={avg_bn:.2f}, "
+                        f"SDMLoss={sdm_loss_val:.3f}, CE={float(ce_loss.item()):.3f}")
+        
+        # 早期训练详细监控（前3个epoch，每20个batch）
+        if epoch <= 3 and batch_idx % 20 == 0:
+            # 获取logits的最大绝对值
+            max_abs_logit = 0.0
+            if 'logits' in outputs:
+                max_abs_logit = float(outputs['logits'].abs().max().item())
+            
+            logging.info(f"数值监控 Epoch {epoch}, Batch {batch_idx}: "
+                        f"max_abs_logit={max_abs_logit:.2f}, "
+                        f"SDM_weight={effective_cont_w:.3f}, SDM_temp={current_temp:.3f}")
             
             # 检查SDM损失异常（修复后应该天然非负）
             if sdm_loss_val < 0:
-                logging.warning(f"⚠️  SDM损失异常为负值: {sdm_loss_val:.4f} - 检查mask过滤是否生效！")
+                logging.warning(f"⚠️ SDM损失异常为负值: {sdm_loss_val:.4f} - 检查mask过滤是否生效！")
             elif sdm_loss_val > 5.0:
-                logging.warning(f"⚠️  SDM损失过大: {sdm_loss_val:.4f} - 可能存在数值不稳定")
+                logging.warning(f"⚠️ SDM损失过大: {sdm_loss_val:.4f} - 可能存在数值不稳定")
         
         # BN特征范数警告：前5个epoch不报警，给正则化时间生效
         if avg_bn > 12.0 and epoch > 5 and batch_idx % 50 == 0:
