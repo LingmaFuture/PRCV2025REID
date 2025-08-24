@@ -24,10 +24,11 @@ class SDMWeightScheduler:
         Args:
             config: 训练配置对象
         """
-        self.warmup_epochs = getattr(config, 'sdm_weight_warmup_epochs', 3)
-        self.initial_weight = getattr(config, 'sdm_weight_initial', 0.5)
-        self.final_weight = getattr(config, 'sdm_weight_final', 1.0)
-        self.max_weight = getattr(config, 'sdm_weight_max', 1.5)
+        self.warmup_epochs = getattr(config, 'sdm_weight_warmup_epochs', 1)  # guide5.md
+        self.weight_schedule = getattr(config, 'sdm_weight_schedule', [0.1, 0.3, 0.5])  # guide5.md: 渐进式
+        self.initial_weight = getattr(config, 'sdm_weight_initial', 0.1)
+        self.final_weight = getattr(config, 'sdm_weight_final', 0.5)
+        self.max_weight = getattr(config, 'sdm_weight_max', 0.5)
         
         # 当前权重
         self.current_weight = 0.0
@@ -40,7 +41,7 @@ class SDMWeightScheduler:
     
     def get_weight(self, epoch):
         """
-        获取当前epoch的SDM权重
+        获取当前epoch的SDM权重 - guide5.md: 实现渐进式调度0.1→0.3→0.5
         
         Args:
             epoch (int): 当前epoch (从1开始)
@@ -49,14 +50,15 @@ class SDMWeightScheduler:
             float: SDM权重
         """
         if epoch <= self.warmup_epochs:
-            # 热身阶段：λ_sdm = 0
+            # guide5.md: 热身阶段完全跳过SDM
             weight = 0.0
-        elif epoch <= self.warmup_epochs + 2:
-            # 初始阶段：λ_sdm = 0.5
-            weight = self.initial_weight
         else:
-            # 稳定阶段：λ_sdm = 1.0
-            weight = self.final_weight
+            # guide5.md: warmup后按渐进权重调度
+            schedule_idx = min(epoch - self.warmup_epochs - 1, len(self.weight_schedule) - 1)
+            if schedule_idx >= 0 and schedule_idx < len(self.weight_schedule):
+                weight = self.weight_schedule[schedule_idx]
+            else:
+                weight = self.final_weight
         
         self.current_weight = weight
         return weight

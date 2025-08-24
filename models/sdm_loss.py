@@ -97,11 +97,25 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-8):
         if abs(sim_min) > 15 or abs(sim_max) > 15:
             print(f"⚠️ 相似度范围较大: [{sim_min:.2f}, {sim_max:.2f}], tau={effective_tau:.3f}")
             
-        # ✅ 检查正样本计数
+        # ✅ 检查正样本计数 - guide3.md: 过滤无效行，减少日志噪音
         pos_cnt = y.sum(dim=1)
         zero_pos_rows = (pos_cnt == 0).nonzero(as_tuple=True)[0]
-        if len(zero_pos_rows) > 0:
-            print(f"⚠️ 发现{len(zero_pos_rows)}行无正样本: {zero_pos_rows[:5].tolist()}")
+        
+        # 如果没有任何有效行，直接返回0，不打印警告（guide3.md修复）
+        if len(zero_pos_rows) == len(pos_cnt):
+            return torch.zeros([], device=qry.device, dtype=qry.dtype)
+            
+        # 只在每5秒打印一次汇总信息，避免刷屏
+        import time
+        if hasattr(sdm_loss_stable, '_last_warning_time'):
+            current_time = time.time()
+            if current_time - sdm_loss_stable._last_warning_time > 5.0 and len(zero_pos_rows) > 0:
+                total_rows = len(pos_cnt)
+                missing_ratio = len(zero_pos_rows) / total_rows
+                print(f"⚠️ 批内无正样本行: {len(zero_pos_rows)}/{total_rows} ({missing_ratio:.1%})")
+                sdm_loss_stable._last_warning_time = current_time
+        else:
+            sdm_loss_stable._last_warning_time = time.time()
         
         # 计算对称SDM损失，添加调试信息
         L_q2g = _one_side_ce(S, y)          # 查询->图库

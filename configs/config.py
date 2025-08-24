@@ -48,17 +48,17 @@ class TrainingConfig:
     # num_classes 将在训练时根据实际训练集ID数量动态设置
     dropout_rate: float = 0.5  # 增强dropout
     
-    # 训练相关 - 按优化清单配置稳定参数
-    batch_size: int = 16  # 优化后的micro-batch，P×K=4×4
-    gradient_accumulation_steps: int = 2  # 等效batch_size=32
+    # 训练相关 - guide4.py: 化简流程确保梯度流，临时设置accumulation=1
+    batch_size: int = 8  # guide3.md: 降低为P×K=4×2，更容易凑齐正对
+    gradient_accumulation_steps: int = 1  # guide4.py: 临时化简为1，确保梯度流正常
     freeze_backbone: bool = True  # 冻结 CLIP 主干，只训练 LoRA 和特定模块
     num_epochs: int = 60   # 按清单推荐：总60epoch
     
-    # 分层学习率设置（按优化清单要求）
-    base_learning_rate: float = 1e-5     # CLIP系列参数 lr=1e-5
-    mer_learning_rate: float = 5e-5      # MER/FM模块 lr=5e-5  
-    tokenizer_learning_rate: float = 5e-5 # 新引入模块 lr=5e-5
-    fusion_learning_rate: float = 5e-5    # 融合层 lr=5e-5
+    # 分层学习率设置（保守配置，优先跑通）
+    base_learning_rate: float = 5e-6     # 降低CLIP学习率，更稳定
+    mer_learning_rate: float = 2e-5      # 降低MER学习率
+    tokenizer_learning_rate: float = 2e-5 # 降低tokenizer学习率  
+    fusion_learning_rate: float = 2e-5    # 降低融合层学习率
     
     weight_decay: float = 1e-4
     warmup_epochs: int = 5      # 前5个epoch线性warmup
@@ -72,11 +72,12 @@ class TrainingConfig:
     # SDM损失权重配置（按文档要求）
     ce_weight: float = 1.0  # ID分类损失权重α=1.0（论文要求）
     
-    # SDM权重调度配置
-    sdm_weight_warmup_epochs: int = 3   # 前3个epoch热身，λ_sdm = 0
-    sdm_weight_initial: float = 0.5     # 热身后的初始权重
-    sdm_weight_final: float = 1.0       # 稳定后的目标权重
-    sdm_weight_max: float = 1.5         # 最大权重上限
+    # SDM权重调度配置 - guide5.md: 渐进式权重调度0.1→0.3→0.5
+    sdm_weight_warmup_epochs: int = 1   # guide4.py: 先只用1个epoch CE调试
+    sdm_weight_schedule: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5])  # guide5.md: 渐进权重
+    sdm_weight_initial: float = 0.1     # guide5.md: 从0.1开始
+    sdm_weight_final: float = 0.5       # guide5.md: 最终0.5，保守稳定
+    sdm_weight_max: float = 0.5         # guide5.md: 最大权重限制在0.5
     
     # 当前使用的SDM权重（训练过程中动态调整）
     contrastive_weight: float = 0.0     # 初始为0，按调度器调整
@@ -86,10 +87,10 @@ class TrainingConfig:
     sdm_num_heads: int = 8       # SDM注意力头数
     sdm_temperature: float = 0.2  # SDM损失温度参数（修复后稳定版本）
     
-    # 温度参数配置（提高稳定性）
-    sdm_init_temperature: float = 0.20  # 提高初始温度增强数值稳定性
-    sdm_final_temperature: float = 0.18 # 稳定后的温度
-    sdm_fallback_temperature: float = 0.25  # 出现不稳定时的回退温度
+    # 温度参数配置（提高稳定性）- guide3.md推荐0.15-0.2
+    sdm_init_temperature: float = 0.18  # guide3.md推荐范围内的初始温度
+    sdm_final_temperature: float = 0.16 # guide3.md推荐范围内的稳定温度
+    sdm_fallback_temperature: float = 0.20  # guide3.md推荐范围内的回退温度
     
     # 可学习温度配置
     sdm_learnable_temp: bool = True     # 使用可学习温度

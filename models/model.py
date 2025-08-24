@@ -313,10 +313,14 @@ class BNNeck(nn.Module):
             logits: [B, num_classes] 分类logits
         """
         bn_features = self.bn(features)
-        dropped_features = self.dropout(bn_features)
+        
+        # guide3.md: 添加L2归一化控制特征范数到~8-10，避免Feat(BN)=22.5过大
+        bn_features_normalized = F.normalize(bn_features, p=2, dim=1) * 8.0  # 目标范数=8
+        
+        dropped_features = self.dropout(bn_features_normalized)
         logits = self.classifier(dropped_features)
         
-        return bn_features, logits
+        return bn_features_normalized, logits
 
 
 class CLIPBasedMultiModalReIDModel(nn.Module):
@@ -382,7 +386,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             margin=getattr(config, "sdm_margin", 0.3),
             alpha=1.0
         )
-        self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.05)
+        self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)  # guide6.md: 增加到0.1更稳
         
         # 损失权重
         self.ce_weight = getattr(config, 'ce_weight', 1.0)
@@ -643,15 +647,19 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             ce_loss = torch.zeros([], device=logits.device)
             logger.warning(f"CE skipped: valid_ce_cnt=0, mod_valid={int(valid_modality_mask.sum())}, label_valid={int(valid_label_mask.sum())}")
         
-        # 真正的非负SDM损失：严格按mask过滤，避免占位符污染对齐
-        from .sdm_loss import sdm_loss_stable
-        raw_modality_features = outputs.get('raw_modality_features', {})
-        feature_masks = outputs.get('feature_masks', {})
+        # guide5.md: 在warmup期间完全跳过SDM前向计算，节省时间
+        use_sdm = (self.current_epoch >= self.config.sdm_weight_warmup_epochs) and (self.contrastive_weight > 0)
         
-        # 使用fp32计算SDM损失，避免半精度下的数值不稳定  
-        with torch.amp.autocast('cuda', enabled=False):
-            rgb_features = raw_modality_features.get('rgb', None)
-            rgb_mask = feature_masks.get('rgb', None)
+        if use_sdm:
+            # 真正的非负SDM损失：严格按mask过滤，避免占位符污染对齐
+            from .sdm_loss import sdm_loss_stable
+            raw_modality_features = outputs.get('raw_modality_features', {})
+            feature_masks = outputs.get('feature_masks', {})
+            
+            # 使用fp32计算SDM损失，避免半精度下的数值不稳定  
+            with torch.amp.autocast('cuda', enabled=False):
+                rgb_features = raw_modality_features.get('rgb', None)
+                rgb_mask = feature_masks.get('rgb', None)
             
             if rgb_features is None or rgb_mask is None:
                 # 回退：如果没有RGB特征或mask，跳过SDM对齐
@@ -719,6 +727,9 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                         else:
                             self._last_no_pairs_warning = __import__('time').time()
                             logger.warning("⚠️ 当前batch无SDM正对，已将SDM损失置零以继续训练")
+        else:
+            # guide5.md: warmup期间完全跳过SDM计算
+            sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
         
         # ===== 简化损失：只保留CE + SDM =====
         # 检查核心损失的数值稳定性
@@ -777,15 +788,28 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             }
         ]
         
-        # 添加其他模块的参数
+        # 添加其他模块的参数 - guide4.py: 分离分类头使用高学习率
         added_params = set()
         for group in param_groups:
             added_params.update(group['params'])
         
+        # guide4.py: 专门为分类头设置高学习率（1e-2）
+        classifier_params = []
         other_params = []
         for name, param in self.named_parameters():
             if param not in added_params:
-                other_params.append(param)
+                if name.startswith("bn_neck.classifier"):
+                    classifier_params.append(param)
+                else:
+                    other_params.append(param)
+        
+        # guide6.md: 分类头学习率降档，防止权重爆涨
+        if classifier_params:
+            param_groups.append({
+                'params': classifier_params,
+                'lr': 3e-3,  # guide6.md: 从1e-2降到3e-3，防止权重从7→35爆涨
+                'name': 'classification_head'
+            })
         
         if other_params:
             param_groups.append({

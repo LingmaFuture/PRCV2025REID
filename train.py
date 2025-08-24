@@ -343,6 +343,26 @@ class CombinationQueryDataset(Dataset):
             'modality_mask': modality_mask
         }
 
+def dl_kwargs(num_workers, collate_fn, pin_memory=True):
+    """
+    按guide2.md建议：智能DataLoader参数配置
+    避免 num_workers=0 时设置 prefetch_factor 导致的错误
+    """
+    kwargs = {
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'collate_fn': collate_fn
+    }
+    
+    # 只有多进程模式才设置 prefetch_factor 和 persistent_workers
+    if num_workers > 0:
+        kwargs.update({
+            'persistent_workers': True,
+            'prefetch_factor': 2
+        })
+    
+    return kwargs
+
 def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pin_memory):
     presence = build_val_presence_table(dataset, val_indices)
     gal_ds = GalleryOnlyVIS(dataset, val_indices, presence)
@@ -350,11 +370,7 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
         gal_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=True,
-        prefetch_factor=2,
-        collate_fn=compatible_collate_fn
+        **dl_kwargs(num_workers, compatible_collate_fn, pin_memory)
     )
     non_vis = ['nir', 'sk', 'cp', 'text']
 
@@ -376,11 +392,7 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
                 CombinationQueryDataset(dataset, items),
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                persistent_workers=True,
-                prefetch_factor=2,
-                collate_fn=compatible_collate_fn
+                **dl_kwargs(num_workers, compatible_collate_fn, pin_memory)
             )
             query_loaders['single'][m] = loader
 
@@ -396,11 +408,7 @@ def build_eval_loaders_by_rule(dataset, val_indices, batch_size, num_workers, pi
                     CombinationQueryDataset(dataset, items),
                     batch_size=batch_size,
                     shuffle=False,
-                    num_workers=num_workers,
-                    pin_memory=pin_memory,
-                    persistent_workers=True,
-                    prefetch_factor=2,
-                    collate_fn=compatible_collate_fn
+                    **dl_kwargs(num_workers, compatible_collate_fn, pin_memory)
                 )
                 query_loaders[tag][key] = loader
 
@@ -530,6 +538,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     loss_spikes = 0
     grad_norms = []
     
+    # guide6.md: 三条健康线监控
+    if not hasattr(train_epoch, '_health_monitors'):
+        train_epoch._health_monitors = {
+            'pair_cov_hist': [],  # pair coverage 历史
+            'ce_hist': [],        # CE损失历史
+            'top1_hist': []       # Top-1准确率历史
+        }
+    
     # 稳健的Spike检测状态管理
     if not hasattr(train_epoch, '_spike_state'):
         train_epoch._spike_state = {
@@ -550,6 +566,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     for batch_idx, batch in enumerate(pbar):
         batch = move_batch_to_device(batch, device)
         labels = batch['person_id']
+        
+        # guide4.py: 标签合法性断言，确保CrossEntropy要求的0...C-1范围
+        assert labels.min().item() >= 0 and labels.max().item() < model.num_classes, \
+            f"guide4.py: 标签越界! labels范围[{labels.min().item()}, {labels.max().item()}], 要求[0, {model.num_classes-1}]"
         
         # 批次构成监控（前3个epoch的前3个batch）
         if epoch <= 3 and batch_idx < 3:
@@ -613,9 +633,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         current_temp = getattr(model.sdm_scheduler.temp_scheduler, "current_temp",
                                getattr(model.config, "sdm_temperature", 0.2))
         
-        # 每个epoch的第一个batch输出SDM参数（只读模式）
+        # guide6.md: 每个epoch的第一个step打印SDM调度权重信息
         if batch_idx == 0:
-            logging.info(f"Epoch {epoch}: (read-only) SDM_weight={effective_cont_w:.4f}, SDM_temp={current_temp:.3f}")
+            use_sdm = (epoch >= model.config.sdm_weight_warmup_epochs)
+            sdm_w = model.sdm_scheduler.get_weight(epoch) if hasattr(model, 'sdm_scheduler') else effective_cont_w
+            print(f"[sdm] epoch={epoch} weight={sdm_w:.3f} use_sdm={use_sdm}")
+            logging.info(f"Epoch {epoch}: SDM_weight={sdm_w:.4f}, SDM_temp={current_temp:.3f}, use_sdm={use_sdm}")
 
         with autocast(device_type='cuda', dtype=autocast_dtype, enabled=use_amp):
             try:
@@ -779,6 +802,24 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
 
                 optimizer.step()
+                
+                # guide4.py + guide5.md: 每100步监控分类头权重和梯度变化 + Top-1准确率
+                if (batch_idx + 1) % 100 == 0:
+                    if hasattr(model, 'bn_neck') and hasattr(model.bn_neck, 'classifier'):
+                        w = model.bn_neck.classifier.weight
+                        print(f"[guide4-dbg] step={batch_idx+1} head |w|={w.norm():.4f}")
+                        
+                        # 监控梯度范数
+                        g = 0.0
+                        for p in model.bn_neck.classifier.parameters():
+                            if p.grad is not None:
+                                g += (p.grad.detach().float().norm().item())
+                        print(f"[guide4-dbg] step={batch_idx+1} head grad-norm ≈ {g:.4f}")
+                    
+                    # guide5.md: 训练Top-1准确率（快速sanity检查）
+                    if isinstance(outputs, dict) and 'logits' in outputs:
+                        top1 = (outputs['logits'].argmax(1) == labels).float().mean()
+                        print(f"[guide5-dbg] step={batch_idx+1} top1={top1*100:.2f}%")
                 
                 # 定期清理CUDA缓存，防止内存累积
                 if (batch_idx + 1) % (accum_steps * 5) == 0:  # 每5个累积周期清理一次
@@ -1037,37 +1078,28 @@ def train_multimodal_reid():
     logging.info(f"采用止血方案：直接使用ModalAwarePKSampler")
     logging.info(f"P×K结构: {P}×{num_instances} = {actual_batch_size}")
     
-    # ✅ 性能优化：使用缓存版采样器，避免反复模态推断
-    from datasets.cached_sampler import CachedModalAwarePKSampler
+    # 按guide.md要求：简化采样器，优先跑通训练
+    # 使用标准DataLoader，避免复杂的batch_sampler问题
+    safe_batch_size = min(8, actual_batch_size)  # 小batch更稳定
+    logging.info(f"使用简化配置：batch_size={safe_batch_size}（原计划{actual_batch_size}）")
     
-    train_sampler = CachedModalAwarePKSampler(
-        dataset=train_dataset,               # 直接传训练集
-        batch_size=actual_batch_size,        # P*K
-        num_instances=num_instances,         # K
-        ensure_rgb=True,                     # 至少含一张RGB
-        prefer_complete=True,                # 优先凑齐rgb+非rgb
-        seed=getattr(config, 'sampler_seed', 42),
-    )
-    
-    logging.info("✅ ModalAwarePKSampler创建成功 - 避开了MultiModalBalancedSampler的索引映射bug")
-    # 按优化清单配置DataLoader性能参数
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler=train_sampler,         # 使用batch_sampler而非sampler
-        num_workers=getattr(config, "num_workers", 2),           # 配置文件中的优化值
-        pin_memory=getattr(config, "pin_memory", True),          # 配合non_blocking加速H2D传输
-        persistent_workers=getattr(config, "persistent_workers", True),  # 避免反复spawn进程
-        prefetch_factor=getattr(config, "prefetch_factor", 2),   # 预取因子平衡内存和性能
-        drop_last=True,                      # 避免动态形状，提升性能
-        collate_fn=compatible_collate_fn     # 关键：使用兼容的collate函数
+        batch_size=safe_batch_size,
+        shuffle=True,
+        num_workers=max(0, getattr(config, "num_workers", 2) - 1),  # 减少工作进程避免Windows问题
+        pin_memory=getattr(config, "pin_memory", True),
+        collate_fn=compatible_collate_fn,
+        drop_last=True,  # 避免最后一个不完整batch
+        persistent_workers=False  # 简化配置
     )
 
-    # 本地验证 DataLoader（赛制对齐）- 应用优化配置
+    # 简化验证配置，减少验证开销
     gallery_loader, query_loaders = build_eval_loaders_by_rule(
         local_val_dataset, list(range(len(local_val_dataset))),
-        batch_size=actual_batch_size,  # 验证时使用 micro batch size
-        num_workers=getattr(config, "num_workers", 2),
-        pin_memory=getattr(config, "pin_memory", True)
+        batch_size=min(4, safe_batch_size),  # 进一步减少验证batch_size
+        num_workers=0,  # 验证时不用多进程
+        pin_memory=False  # 简化配置
     )
 
     # 模型：CLIP+MER架构
@@ -1114,14 +1146,33 @@ def train_multimodal_reid():
     logging.info(f"可训练参数总数: {total_trainable:,}")
     
     optimizer = AdamW(filtered_param_groups, weight_decay=getattr(config, "weight_decay", 1e-4))
+    
+    # 快速测试：验证模型能正常前向传播
+    logging.info("执行模型前向传播测试...")
+    try:
+        test_batch = next(iter(train_loader))
+        test_batch = move_batch_to_device(test_batch, device)
+        with torch.no_grad():
+            test_outputs = call_model_with_batch(model, test_batch)
+            logging.info(f"✅ 前向传播测试成功，输出keys: {list(test_outputs.keys())}")
+            if 'logits' in test_outputs:
+                logging.info(f"   logits shape: {test_outputs['logits'].shape}")
+            if 'bn_features' in test_outputs:
+                logging.info(f"   bn_features shape: {test_outputs['bn_features'].shape}")
+    except Exception as e:
+        logging.error(f"❌ 前向传播测试失败: {e}")
+        raise e
 
     # AMP 优化：使用 bfloat16 + 梯度累积
     autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     use_scaler = (autocast_dtype == torch.float16)  # bfloat16 不需要 GradScaler
     scaler = GradScaler(enabled=use_scaler) if use_scaler else None
     
-    # 使用前面统一定义的 batch size 参数
-    accum_steps = grad_accum_steps  # 使用前面定义的变量
+    # 调整梯度累积以补偿小batch_size
+    target_effective_batch = 16  # 目标有效batch大小
+    accum_steps = max(1, target_effective_batch // safe_batch_size)  # 动态调整累积步数
+    effective_batch_size = safe_batch_size * accum_steps
+    logging.info(f"梯度累积调整: {safe_batch_size} × {accum_steps} = {effective_batch_size}")
     
     logging.info(f"混合精度: {autocast_dtype}, 梯度累积: {accum_steps} 步")
     logging.info(f"实际 batch_size: {actual_batch_size}, 等效 batch_size: {effective_batch_size}")
@@ -1165,7 +1216,7 @@ def train_multimodal_reid():
     # 训练循环
     best_map = 0.0
     train_history, val_history = [], []
-    eval_freq = getattr(config, "eval_freq", 20)
+    eval_freq = max(50, getattr(config, "eval_freq", 20))  # 增加验证频率，减少验证开销
     save_dir = getattr(config, "save_dir", "./checkpoints")
     os.makedirs(save_dir, exist_ok=True)
 
