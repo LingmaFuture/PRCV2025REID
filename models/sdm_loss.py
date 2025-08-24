@@ -10,25 +10,22 @@ import torch.nn.functional as F
 import logging
 
 
-def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-6):
+def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-8):
     """
-    稳健的SDM损失函数实现 - 修复KL散度计算错误
+    稳健的SDM损失函数实现 - 按照优化清单修复数值稳定性
     
     Args:
-        qry (torch.Tensor): [N, D] 查询特征
-        gal (torch.Tensor): [M, D] 图库特征  
+        qry (torch.Tensor): [N, D] 查询特征  
+        gal (torch.Tensor): [M, D] 图库特征
         y (torch.Tensor): [N, M] 同身份指示矩阵
-        tau (float): 温度参数（提高默认值到0.2以增强数值稳定性）
+        tau (float): 温度参数（推荐0.2避免数值溢出）
         eps (float): 数值稳定性参数
         
     Returns:
-        torch.Tensor: SDM损失值
+        torch.Tensor: SDM损失值（天然非负）
     """
-    # 1) 修复的自适应温度：在归一化前统计范数
-    qry_norms = qry.norm(dim=1).mean().detach()
-    gal_norms = gal.norm(dim=1).mean().detach()
-    scale = 0.5 * (qry_norms + gal_norms)
-    adaptive_tau = float(torch.clamp(tau * (scale / 8.0), 0.15, 0.5))
+    # 1) 强化数值稳定性：固定温度在安全范围，避免自适应引入的不稳定
+    effective_tau = max(0.15, min(0.5, tau))  # 限制在[0.15, 0.5]安全区间
     
     # 2) L2归一化
     qry = F.normalize(qry, dim=1, eps=eps)
@@ -73,7 +70,7 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-6):
         return ce_per_row.mean()
     
     # 3) 在fp32下计算，避免数值问题
-    with torch.cuda.amp.autocast(enabled=False):
+    with torch.amp.autocast('cuda', enabled=False):
         # ✅ 特征和相似度检查
         qry_f, gal_f = qry.float(), gal.float()
         
@@ -86,16 +83,19 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-6):
             if feat_max > 100.0:  # L2归一化后特征不应该过大
                 print(f"⚠️ {name}特征幅值异常大: {feat_max:.3f}")
                 
-        S = qry_f @ gal_f.t() / adaptive_tau  # [N,M]
+        S = qry_f @ gal_f.t() / effective_tau  # [N,M]
         
-        # 检查相似度矩阵
+        # 检查相似度矩阵数值稳定性
         if not torch.isfinite(S).all():
-            print(f"⚠️ 相似度矩阵包含NaN/Inf, tau={adaptive_tau:.3f}")
+            print(f"⚠️ 相似度矩阵包含NaN/Inf, tau={effective_tau:.3f}")
             return torch.tensor(0.0, device=qry.device, dtype=qry.dtype)
+        
+        # 相似度裁剪防止极值
+        S = torch.clamp(S, min=-20.0, max=20.0)  # 强制裁剪到安全范围
             
         sim_min, sim_max = S.min().item(), S.max().item()
-        if abs(sim_min) > 50 or abs(sim_max) > 50:
-            print(f"⚠️ 相似度范围异常: [{sim_min:.2f}, {sim_max:.2f}], tau={adaptive_tau:.3f}")
+        if abs(sim_min) > 15 or abs(sim_max) > 15:
+            print(f"⚠️ 相似度范围较大: [{sim_min:.2f}, {sim_max:.2f}], tau={effective_tau:.3f}")
             
         # ✅ 检查正样本计数
         pos_cnt = y.sum(dim=1)
@@ -127,9 +127,9 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-6):
     # 4) 交叉熵天然非负，无需 clamp
     result = symmetric
     
-    # 5) 异常监控（应该不再需要）
-    if torch.isnan(result):
-        print(f"⚠️ SDM出现NaN: tau={adaptive_tau:.3f}, scale={scale:.2f}")
+    # 5) 最终数值检查与保护
+    if torch.isnan(result) or torch.isinf(result) or result < 0:
+        print(f"⚠️ SDM损失异常: {result:.6f}, tau={effective_tau:.3f}")
         return torch.tensor(0.0, device=qry.device, dtype=qry.dtype)
     
     return result

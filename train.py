@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+import math  # 确保math被导入用于CE诊断
 from tqdm import tqdm
 
 import torch
@@ -27,7 +28,7 @@ from sklearn.model_selection import train_test_split
 import torchvision.transforms as transforms
 
 # === 你项目里的数据与模型 ===
-from datasets.dataset import MultiModalDataset, BalancedBatchSampler, compatible_collate_fn
+from datasets.dataset import MultiModalDataset, BalancedBatchSampler, ModalAwarePKSampler, MultiModalBalancedSampler, compatible_collate_fn
 from models.model import CLIPBasedMultiModalReIDModel  
 from models.sdm_scheduler import SDMScheduler
 from configs.config import TrainingConfig
@@ -59,7 +60,7 @@ def setup_logging(log_dir):
     )
 
 def move_batch_to_device(batch, device):
-    """将批次数据移动到指定设备（仅移动 Tensor）"""
+    """将批次数据移动到指定设备（仅移动 Tensor）- 使用non_blocking优化"""
     if isinstance(batch, dict):
         out = {}
         for k, v in batch.items():
@@ -70,7 +71,8 @@ def move_batch_to_device(batch, device):
     elif isinstance(batch, tuple):
         return tuple(move_batch_to_device(x, device) for x in batch)
     elif torch.is_tensor(batch):
-        return batch.to(device)
+        # ✅ 使用non_blocking加速H2D传输（配合pin_memory=True）
+        return batch.to(device, non_blocking=True)
     else:
         return batch
 
@@ -555,6 +557,48 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             num_ids_per_batch = len(unique_ids)
             avg_instances_per_id = float(counts.float().mean().item())  # 转换为浮点数再计算均值
             logging.info(f"Batch {batch_idx}: {num_ids_per_batch} IDs, 平均每ID {avg_instances_per_id:.1f} 样本 (K-1正样本数≈{avg_instances_per_id-1:.1f})")
+            
+            # ✅ 修复2: CE损失诊断 - 检查标签和分类器匹配性
+            if batch_idx == 0:
+                print(f"=== CE损失诊断 (Epoch {epoch}) ===")
+                print(f"labels范围: {labels.min().item()} - {labels.max().item()}")
+                print(f"model.num_classes: {model.num_classes}")
+                print(f"理论随机CE: {np.log(model.num_classes):.3f}")
+                
+                # 检查分类器参数是否可训练
+                classifier_params = []
+                for name, param in model.named_parameters():
+                    if 'classifier' in name and param.requires_grad:
+                        classifier_params.append(name)
+                print(f"可训练分类器参数: {classifier_params}")
+                
+                if labels.max().item() >= model.num_classes:
+                    logging.error(f"❌ 标签超出范围! max_label={labels.max().item()}, num_classes={model.num_classes}")
+            
+            # 采样器自检：统计每个ID在该batch是否有vis/非vis
+            ids = labels.cpu().tolist()
+            modality_mask = batch.get('modality_mask', {})
+            
+            has_vis = {}
+            has_nonvis = {}
+            for k, pid in enumerate(ids):
+                # 检查vis模态
+                vis_mask = modality_mask.get('vis', torch.zeros_like(labels)).bool()
+                has_vis[pid] = has_vis.get(pid, False) or bool(vis_mask[k].item())
+                
+                # 检查非vis模态（nir, sk, cp, text等）
+                nonvis = False
+                for m in ['nir', 'sk', 'cp', 'text']:
+                    msk = modality_mask.get(m, torch.zeros_like(labels)).bool()
+                    nonvis = nonvis or bool(msk[k].item())
+                has_nonvis[pid] = has_nonvis.get(pid, False) or nonvis
+            
+            # 统计同时具备vis+非vis的ID数量
+            both = sum(1 for pid in set(ids) if has_vis.get(pid, False) and has_nonvis.get(pid, False))
+            vis_only = sum(1 for pid in set(ids) if has_vis.get(pid, False) and not has_nonvis.get(pid, False))
+            nonvis_only = sum(1 for pid in set(ids) if not has_vis.get(pid, False) and has_nonvis.get(pid, False))
+            
+            logging.info(f"[采样自检] 本batch ID数={len(set(ids))}, vis+非vis={both}, 仅vis={vis_only}, 仅非vis={nonvis_only}")
 
         # 梯度累积：只在累积步开始时清零梯度
         if batch_idx % accum_steps == 0:
@@ -608,20 +652,18 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                 logging.error(f"Epoch {epoch}, Batch {batch_idx}: SDM损失出现NaN/Inf, 重置为0")
                 loss_dict['sdm_loss'] = torch.tensor(0.0, device=device)
                 loss_dict['contrastive_loss'] = torch.tensor(0.0, device=device)
-                # 重新计算总损失
+                # 重新计算总损失（简化版）
                 ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
-                feat_penalty = loss_dict.get('feat_penalty', torch.tensor(0.0, device=device))
                 sdm_weight = getattr(model.config, 'contrastive_weight', 0.1)
-                loss_dict['total_loss'] = ce_loss + sdm_weight * loss_dict['sdm_loss'] + feat_penalty
+                loss_dict['total_loss'] = ce_loss + sdm_weight * loss_dict['sdm_loss']
             
             loss = loss_dict['total_loss']
         
-        # 用 warmup 后的有效权重重算总损失（包含特征范数正则项）
+        # 用 warmup 后的有效权重重算总损失（简化版：只有CE+SDM）
         ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
         sdm_loss = loss_dict.get('sdm_loss', torch.tensor(0.0, device=device))
         cont_loss = loss_dict.get('contrastive_loss', sdm_loss)  # 兼容性
-        feat_penalty = loss_dict.get('feat_penalty', torch.tensor(0.0, device=device))
-        loss = ce_loss + effective_cont_w * sdm_loss + feat_penalty  # 使用SDM损失
+        loss = ce_loss + effective_cont_w * sdm_loss  # 简化：只有CE + SDM
         loss = loss / accum_steps  # 梯度累积：缩放损失
         loss_dict['total_loss'] = loss
 
@@ -671,17 +713,22 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                 scaler.unscale_(optimizer)
                 _sanitize_grads(model)
 
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.detach().data.norm(2)
-                        if torch.isfinite(param_norm):
-                            total_norm += param_norm.item() ** 2
-                total_norm = math.sqrt(total_norm)
-                grad_norms.append(float(total_norm))
-
-                # 自适应梯度裁剪（收紧上限提升稳定性）
+                # ✅ 梯度范数计算优化：只在需要监控时计算完整范数
                 if adaptive_clip:
+                    # 自适应裁剪需要计算完整梯度范数
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.detach().data.norm(2)
+                            if torch.isfinite(param_norm):
+                                total_norm += param_norm.item() ** 2
+                    total_norm = math.sqrt(total_norm)
+                    
+                    # 只在监控频率下记录到列表
+                    if batch_idx % NORM_EVERY == 0:
+                        grad_norms.append(float(total_norm))
+                    
+                    # 自适应裁剪
                     if len(grad_norms) > 10:
                         recent_norms = grad_norms[-10:]
                         adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
@@ -689,23 +736,34 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                         adaptive_max_norm = 1.0
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # 降低梯度裁剪阈值修复CE收敛
+                    # 非自适应：直接裁剪，偶尔记录范数用于监控
+                    if batch_idx % NORM_EVERY == 0:
+                        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        grad_norms.append(float(total_norm))
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
 
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 _sanitize_grads(model)
 
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.detach().data.norm(2)
-                        if torch.isfinite(param_norm):
-                            total_norm += param_norm.item() ** 2
-                total_norm = math.sqrt(total_norm)
-                grad_norms.append(float(total_norm))
-
+                # ✅ 梯度范数计算优化：只在需要监控时计算完整范数（非AMP版本）
                 if adaptive_clip:
+                    # 自适应裁剪需要计算完整梯度范数
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.detach().data.norm(2)
+                            if torch.isfinite(param_norm):
+                                total_norm += param_norm.item() ** 2
+                    total_norm = math.sqrt(total_norm)
+                    
+                    # 只在监控频率下记录到列表
+                    if batch_idx % NORM_EVERY == 0:
+                        grad_norms.append(float(total_norm))
+                    
+                    # 自适应裁剪
                     if len(grad_norms) > 10:
                         recent_norms = grad_norms[-10:]
                         adaptive_max_norm = min(3.0, max(0.5, np.percentile(recent_norms, 70) * 1.15))
@@ -713,7 +771,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                         adaptive_max_norm = 1.0
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(adaptive_max_norm))
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # 降低梯度裁剪阈值修复CE收敛
+                    # 非自适应：直接裁剪，偶尔记录范数用于监控
+                    if batch_idx % NORM_EVERY == 0:
+                        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        grad_norms.append(float(total_norm))
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
 
                 optimizer.step()
                 
@@ -739,7 +802,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         reid_raw_norms = None
         if isinstance(outputs, dict):
             if 'features' in outputs:
-                fused_norms = torch.norm(outputs['features'].detach(), p=2, dim=1)  # 被feat_penalty约束的量
+                fused_norms = torch.norm(outputs['features'].detach(), p=2, dim=1)  # 融合后特征范数
             if 'bn_features' in outputs:
                 bn_norms = torch.norm(outputs['bn_features'].detach(), p=2, dim=1)  # BN后特征（对齐+检索用）
             if 'reid_features_raw' in outputs:
@@ -760,8 +823,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         # 区分SDM损失和分数进行监控
         sdm_loss_val = float(sdm_loss.item())
         
-        # 关键监控字段输出（按你的建议格式）
-        if batch_idx % 50 == 0:  # 每50个batch输出一次关键监控
+        # ✅ 调试输出降频：减少日志开销
+        LOG_EVERY = 100  # 从50提高到100，减少一半日志输出
+        NORM_EVERY = 200  # 特征范数监控频率更低
+        
+        # 关键监控字段输出（降频优化）
+        if batch_idx % LOG_EVERY == 0:  # 降频：每100个batch输出一次
             # 计算有效样本统计
             feature_masks = outputs.get('feature_masks', {})
             vis_cnt = 0
@@ -798,12 +865,33 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             elif sdm_loss_val > 5.0:
                 logging.warning(f"⚠️ SDM损失过大: {sdm_loss_val:.4f} - 可能存在数值不稳定")
         
-        # BN特征范数警告：前5个epoch不报警，给正则化时间生效
-        if avg_bn > 12.0 and epoch > 5 and batch_idx % 50 == 0:
-            logging.warning(f"⚠️  BN特征范数过大: {avg_bn:.2f} - 正则化未生效 (Epoch {epoch})")
+        # ✅ 修复3: 调整BN特征范数阈值 - 如果使用L2归一化，范数应该接近1
+        # 检查模型是否在使用L2归一化
+        using_l2_norm = False
+        if isinstance(outputs, dict) and 'bn_features' in outputs:
+            bn_feats = outputs['bn_features']
+            sample_norm = bn_feats[0].norm(p=2).item()
+            if 0.8 <= sample_norm <= 1.2:  # 接近单位范数
+                using_l2_norm = True
         
-        # 优化：每5个batch更新一次进度条，避免频繁GPU-CPU同步
-        if batch_idx % 5 == 0:
+        # 根据是否使用L2归一化调整阈值
+        if using_l2_norm:
+            # L2归一化情况下，范数应该接近1
+            if avg_bn > 2.0 and epoch > 5 and batch_idx % 50 == 0:
+                logging.warning(f"⚠️ BN特征范数异常(L2归一化): {avg_bn:.2f} - 应接近1.0 (Epoch {epoch})")
+        else:
+            # 非归一化情况下，范数阈值设为更合理的值
+            if avg_bn > 15.0 and epoch > 5 and batch_idx % 50 == 0:
+                logging.warning(f"⚠️ BN特征范数过大(非归一化): {avg_bn:.2f} - 正则化未生效 (Epoch {epoch})")
+        
+        # 特征范数监控改进（降频优化）
+        if batch_idx % NORM_EVERY == 0 and batch_idx > 0:
+            logging.info(f"[特征监控] Epoch {epoch}, Batch {batch_idx}: "
+                        f"融合特征={avg_fused:.2f}, BN特征={avg_bn:.2f}, "
+                        f"原始ReID特征={avg_reid:.2f}, 是否L2归一化={using_l2_norm}")
+        
+        # ✅ 进度条更新降频：从5提高到10，减少GPU-CPU同步开销
+        if batch_idx % 10 == 0:
             pbar.set_postfix({
                 'Loss': f'{current_loss:.3f}',
                 'CE': f'{float(ce_loss.item()):.3f}',
@@ -939,22 +1027,46 @@ def train_multimodal_reid():
     logging.info(f"采样策略: P×K = {num_pids_per_batch}×{num_instances} = {actual_batch_size}")
     logging.info(f"每个锚的正样本数: {num_instances-1}")
     
-    train_sampler = BalancedBatchSampler(train_dataset, actual_batch_size, num_instances=num_instances)
+    # ✅ 立即止血方案：直接使用ModalAwarePKSampler，避开MultiModalBalancedSampler的索引bug
+    
+    # 关键参数校验
+    assert actual_batch_size % num_instances == 0, \
+        f"actual_batch_size({actual_batch_size}) 必须能被 num_instances({num_instances}) 整除"
+    P = actual_batch_size // num_instances  # 每个batch身份数
+    
+    logging.info(f"采用止血方案：直接使用ModalAwarePKSampler")
+    logging.info(f"P×K结构: {P}×{num_instances} = {actual_batch_size}")
+    
+    # ✅ 性能优化：使用缓存版采样器，避免反复模态推断
+    from datasets.cached_sampler import CachedModalAwarePKSampler
+    
+    train_sampler = CachedModalAwarePKSampler(
+        dataset=train_dataset,               # 直接传训练集
+        batch_size=actual_batch_size,        # P*K
+        num_instances=num_instances,         # K
+        ensure_rgb=True,                     # 至少含一张RGB
+        prefer_complete=True,                # 优先凑齐rgb+非rgb
+        seed=getattr(config, 'sampler_seed', 42),
+    )
+    
+    logging.info("✅ ModalAwarePKSampler创建成功 - 避开了MultiModalBalancedSampler的索引映射bug")
+    # 按优化清单配置DataLoader性能参数
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler=train_sampler,
-        num_workers=getattr(config, "num_workers", 4),
-        pin_memory=getattr(config, "pin_memory", True),
-        persistent_workers=True,  # 保持工作进程持续运行
-        prefetch_factor=2,        # 预取因子提升IO效率
-        collate_fn=compatible_collate_fn
+        batch_sampler=train_sampler,         # 使用batch_sampler而非sampler
+        num_workers=getattr(config, "num_workers", 2),           # 配置文件中的优化值
+        pin_memory=getattr(config, "pin_memory", True),          # 配合non_blocking加速H2D传输
+        persistent_workers=getattr(config, "persistent_workers", True),  # 避免反复spawn进程
+        prefetch_factor=getattr(config, "prefetch_factor", 2),   # 预取因子平衡内存和性能
+        drop_last=True,                      # 避免动态形状，提升性能
+        collate_fn=compatible_collate_fn     # 关键：使用兼容的collate函数
     )
 
-    # 本地验证 DataLoader（赛制对齐）
+    # 本地验证 DataLoader（赛制对齐）- 应用优化配置
     gallery_loader, query_loaders = build_eval_loaders_by_rule(
         local_val_dataset, list(range(len(local_val_dataset))),
         batch_size=actual_batch_size,  # 验证时使用 micro batch size
-        num_workers=getattr(config, "num_workers", 4),
+        num_workers=getattr(config, "num_workers", 2),
         pin_memory=getattr(config, "pin_memory", True)
     )
 

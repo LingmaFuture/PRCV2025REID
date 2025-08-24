@@ -11,6 +11,36 @@ import os
 import random
 from collections import defaultdict
 
+
+def infer_modalities_of_sample(ds, idx):
+    """
+    返回该样本拥有哪些模态的集合，如 {'vis','nir'} 或 {'text'} 等
+    兼容两种结构：
+      A) ds.data_list[idx].get('modality') 是单模态字符串
+      B) ds.data_list[idx].get('images') 是dict，键包含多模态
+    """
+    rec = ds.data_list[idx]
+    mods = set()
+
+    # 常见字段1：单字段
+    m = rec.get('modality', None)
+    if isinstance(m, str) and m:
+        mods.add(m)
+
+    # 常见字段2：图像字典
+    imgs = rec.get('images', None)
+    if isinstance(imgs, dict):
+        for k in imgs.keys():
+            if k in ('vis', 'nir', 'sk', 'cp'):
+                mods.add(k)
+
+    # 文本
+    td = rec.get('text_description', None)
+    if isinstance(td, str) and td.strip():
+        mods.add('text')
+
+    return mods
+
 class ModalityAugmentation:
     """
     多模态数据增强类
@@ -430,6 +460,277 @@ class BalancedBatchSampler(Sampler):
     def __len__(self):
         """返回采样器的总批次数量"""
         return max(1, self.length // self.batch_size)
+
+
+class ModalAwarePKSampler(Sampler):
+    """
+    模态感知的P×K采样器
+    
+    在原有P×K采样基础上，尽量保证每个ID在同一batch里含有vis和非vis（nir/sk/cp/text任一）
+    这样可以显著减少SDM损失为0和融合层NaN的问题
+    """
+    def __init__(self, dataset, batch_size, num_instances=4, seed=42,
+                 prefer_complete=True, ensure_rgb=True):
+        """
+        Args:
+            dataset: 数据集对象
+            batch_size: 批次大小
+            num_instances: 每个ID的实例数量（K）
+            seed: 随机种子
+            prefer_complete: 优先选择模态齐全的ID
+            ensure_rgb: 尽量保证每个ID都有vis模态
+        """
+        assert batch_size % num_instances == 0, f"batch_size({batch_size}) must be divisible by num_instances({num_instances})"
+        
+        # 处理数据集子集的情况
+        if hasattr(dataset, 'dataset'):
+            # 如果是Subset对象，获取原始数据集和索引映射
+            self.base_dataset = dataset.dataset
+            self.indices = dataset.indices
+        else:
+            # 如果是完整数据集，直接使用
+            self.base_dataset = dataset
+            self.indices = list(range(len(dataset)))
+        
+        self.batch_size = batch_size
+        self.num_instances = num_instances
+        self.num_pids_per_batch = batch_size // num_instances
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.prefer_complete = prefer_complete
+        self.ensure_rgb = ensure_rgb
+
+        # 1) 建 pid -> 索引列表
+        self.pid_to_indices = {}
+        for subset_idx, orig_idx in enumerate(self.indices):
+            # 从数据集中获取人员ID
+            if hasattr(self.base_dataset, 'data_list'):
+                person_id = self.base_dataset.data_list[orig_idx]['person_id']
+            else:
+                person_id = self.base_dataset[orig_idx]['person_id'].item() + 1
+            
+            if isinstance(person_id, torch.Tensor):
+                person_id = int(person_id.item())
+            else:
+                person_id = int(person_id)
+                
+            self.pid_to_indices.setdefault(person_id, []).append(subset_idx)
+
+        # 2) 建 pid -> 模态桶（vis / nonvis 以及细分）
+        self.pid_to_mod = {}
+        for pid, idxs in self.pid_to_indices.items():
+            buckets = {'vis': [], 'nir': [], 'sk': [], 'cp': [], 'text': [], 'nonvis': []}
+            for idx in idxs:
+                orig_idx = self.indices[idx]
+                mods = infer_modalities_of_sample(self.base_dataset, orig_idx)
+                if 'vis' in mods:  
+                    buckets['vis'].append(idx)
+                if 'nir' in mods:  
+                    buckets['nir'].append(idx)
+                    buckets['nonvis'].append(idx)
+                if 'sk' in mods:   
+                    buckets['sk'].append(idx)
+                    buckets['nonvis'].append(idx)
+                if 'cp' in mods:   
+                    buckets['cp'].append(idx)
+                    buckets['nonvis'].append(idx)
+                if 'text' in mods: 
+                    buckets['text'].append(idx)
+                    buckets['nonvis'].append(idx)
+            self.pid_to_mod[pid] = buckets
+
+        # 3) 可选：把"模态较齐全"的ID排在前面（提高命中率）
+        self.all_pids = list(self.pid_to_indices.keys())
+        if self.prefer_complete:
+            # 优先级：既有vis又有nonvis > 只有vis > 只有nonvis > 其他
+            def completeness_score(p):
+                buckets = self.pid_to_mod[p]
+                has_vis = len(buckets['vis']) > 0
+                has_nonvis = len(buckets['nonvis']) > 0
+                return (has_vis and has_nonvis, has_vis, has_nonvis)
+            self.all_pids.sort(key=completeness_score, reverse=True)
+
+    def __len__(self):
+        # 近似：所有样本除以batch_size
+        total_samples = sum(len(indices) for indices in self.pid_to_indices.values())
+        return total_samples // self.batch_size
+
+    def __iter__(self):
+        pids = self.all_pids[:]  # 拷贝
+        self.rng.shuffle(pids)
+
+        batch = []
+        i = 0
+        while i + self.num_pids_per_batch <= len(pids):
+            chosen_pids = pids[i:i+self.num_pids_per_batch]
+            i += self.num_pids_per_batch
+
+            for pid in chosen_pids:
+                b = self.pid_to_mod[pid]
+                chosen = []
+
+                # A) 先拿1张 vis（如果需要且有）
+                if self.ensure_rgb and len(b['vis']) > 0:
+                    chosen.append(self.rng.choice(b['vis']))
+
+                # B) 再拿1张 非vis（如果有）
+                if len(b['nonvis']) > 0:
+                    # 避免与已选重复
+                    cand = [x for x in b['nonvis'] if x not in chosen]
+                    if not cand and b['nonvis']:
+                        cand = b['nonvis']
+                    if cand:
+                        chosen.append(self.rng.choice(cand))
+
+                # C) 补齐到K（从该ID的全部索引里选，允许重复回绕）
+                pool = self.pid_to_indices[pid][:]
+                self.rng.shuffle(pool)
+                j = 0
+                while len(chosen) < self.num_instances and j < 10 * len(pool):
+                    idx = pool[j % len(pool)]
+                    chosen.append(idx)
+                    j += 1
+
+                # D) 若实在不够（极端稀疏ID），最后从该ID任取（允许重复）
+                while len(chosen) < self.num_instances:
+                    chosen.append(self.rng.choice(self.pid_to_indices[pid]))
+
+                batch.extend(chosen)
+
+            # 输出一个batch
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+
+        # 末尾不足一个batch则丢弃（常见做法）
+
+
+class MultiModalBalancedSampler(Sampler):
+    """
+    多模态平衡采样器：确保每个ID都有RGB+非RGB模态组合
+    
+    专门解决SDM损失中"无正样本"问题，通过强制每个ID包含：
+    - ≥1 张 RGB (vis) 模态
+    - ≥1 张 非RGB模态 (nir/sk/cp/text)
+    """
+    def __init__(self, dataset, batch_size, num_instances=4, seed=42):
+        """
+        Args:
+            dataset: 数据集对象
+            batch_size: 批次大小
+            num_instances: 每个ID的实例数量（K）
+            seed: 随机种子
+        """
+        assert batch_size % num_instances == 0, f"batch_size({batch_size}) must be divisible by num_instances({num_instances})"
+        
+        # 处理数据集子集的情况
+        if hasattr(dataset, 'dataset'):
+            self.base_dataset = dataset.dataset
+            self.indices = dataset.indices
+        else:
+            self.base_dataset = dataset
+            self.indices = list(range(len(dataset)))
+        
+        self.batch_size = batch_size
+        self.num_instances = num_instances
+        self.num_pids_per_batch = batch_size // num_instances
+        self.seed = seed
+        self.rng = random.Random(seed)
+
+        # 构建ID到索引的映射
+        self.pid_to_indices = {}
+        for subset_idx, orig_idx in enumerate(self.indices):
+            if hasattr(self.base_dataset, 'data_list'):
+                person_id = self.base_dataset.data_list[orig_idx]['person_id']
+            else:
+                person_id = self.base_dataset[orig_idx]['person_id'].item() + 1
+            
+            if isinstance(person_id, torch.Tensor):
+                person_id = int(person_id.item())
+            else:
+                person_id = int(person_id)
+                
+            self.pid_to_indices.setdefault(person_id, []).append(subset_idx)
+
+        # 构建每个ID的模态分布
+        self.pid_to_modalities = {}
+        self.valid_pids = []  # 只包含有RGB+非RGB组合的ID
+        
+        for pid, idxs in self.pid_to_indices.items():
+            rgb_indices = []
+            non_rgb_indices = []
+            
+            for idx in idxs:
+                orig_idx = self.indices[idx]
+                mods = infer_modalities_of_sample(self.base_dataset, orig_idx)
+                
+                if 'vis' in mods:
+                    rgb_indices.append(idx)
+                if any(m in mods for m in ['nir', 'sk', 'cp', 'text']):
+                    non_rgb_indices.append(idx)
+            
+            self.pid_to_modalities[pid] = {
+                'rgb': rgb_indices,
+                'non_rgb': non_rgb_indices,
+                'all': idxs
+            }
+            
+            # 只保留有RGB+非RGB组合的ID
+            if len(rgb_indices) > 0 and len(non_rgb_indices) > 0:
+                self.valid_pids.append(pid)
+
+    def __len__(self):
+        total_samples = sum(len(indices) for indices in self.pid_to_indices.values())
+        return total_samples // self.batch_size
+
+    def __iter__(self):
+        # 只使用有效的ID（有RGB+非RGB组合）
+        pids = self.valid_pids[:]
+        self.rng.shuffle(pids)
+
+        batch = []
+        i = 0
+        
+        while i + self.num_pids_per_batch <= len(pids):
+            chosen_pids = pids[i:i+self.num_pids_per_batch]
+            i += self.num_pids_per_batch
+
+            for pid in chosen_pids:
+                mod_info = self.pid_to_modalities[pid]
+                chosen = []
+
+                # 强制选择：1张RGB + 1张非RGB
+                if mod_info['rgb']:
+                    chosen.append(self.rng.choice(mod_info['rgb']))
+                
+                if mod_info['non_rgb']:
+                    chosen.append(self.rng.choice(mod_info['non_rgb']))
+
+                # 补齐到K张（从该ID的所有样本中选择）
+                remaining_needed = self.num_instances - len(chosen)
+                if remaining_needed > 0:
+                    # 从所有样本中随机选择，避免重复
+                    available = [idx for idx in mod_info['all'] if idx not in chosen]
+                    if available:
+                        # 随机选择剩余需要的样本
+                        if len(available) >= remaining_needed:
+                            chosen.extend(self.rng.sample(available, remaining_needed))
+                        else:
+                            # 如果不够，允许重复选择
+                            chosen.extend(self.rng.choices(available, k=remaining_needed))
+                    else:
+                        # 极端情况：从所有样本中重复选择
+                        chosen.extend(self.rng.choices(mod_info['all'], k=remaining_needed))
+
+                batch.extend(chosen)
+
+            # 输出一个batch
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+
+        # 末尾不足一个batch则丢弃
+
 
 def compatible_collate_fn(batch):
     """

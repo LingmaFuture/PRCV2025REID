@@ -186,10 +186,10 @@ class CLIPUnifiedEncoder(nn.Module):
             self.clip_model.vision_model.embeddings.position_embedding.weight.clone()
         )
         
-        # CLS token (从CLIP vision encoder复制，添加batch和序列维度)
+        # CLS token (从CLIP vision encoder复制，添加batch和序列维度)  
         # class_embedding 原始形状: [768], 需要变成 [1, 1, 768] 用于expand
         self.cls_token = nn.Parameter(
-        self.clip_model.vision_model.embeddings.class_embedding.clone().unsqueeze(0).unsqueeze(0)  # [1, 1, 768]
+            self.clip_model.vision_model.embeddings.class_embedding.clone().unsqueeze(0).unsqueeze(0)  # [1, 1, 768]
         )
         
         # 视觉MER Transformer层

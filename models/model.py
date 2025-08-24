@@ -10,6 +10,9 @@ import logging
 import numpy as np
 from typing import Dict, List, Optional, Union, Tuple, Any
 
+# 初始化logger
+logger = logging.getLogger(__name__)
+
 from .clip_backbone import CLIPUnifiedEncoder
 
 # 导入原有的SDM和损失函数组件
@@ -385,10 +388,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         self.ce_weight = getattr(config, 'ce_weight', 1.0)
         self.contrastive_weight = getattr(config, 'contrastive_weight', 0.1)
         
-        # 特征范数正则化参数（优化控制特征尺度）
-        self.feature_target_norm = getattr(config, 'feature_target_norm', 8.0)    # 降低目标范数
-        self.feature_norm_band = getattr(config, 'feature_norm_band', 2.0)       # 缩小容忍带宽
-        self.feature_norm_penalty = getattr(config, 'feature_norm_penalty', 5e-3) # 增强正则强度
+        # 简化损失：移除特征范数正则化参数
         
         # ===== 可学习的null token占位符 =====
         # 为每个模态创建可学习的null token，用于缺失模态的占位
@@ -397,10 +397,10 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             for modality in self.modalities
         })
         
-        logging.info(f"初始化CLIP+MER多模态ReID模型完成")
-        logging.info(f"   - 支持模态: {self.modalities}")
-        logging.info(f"   - 融合维度: {self.fusion_dim}")
-        logging.info(f"   - MER LoRA rank: {getattr(config, 'mer_lora_rank', 4)}")
+        logger.info(f"初始化CLIP+MER多模态ReID模型完成")
+        logger.info(f"   - 支持模态: {self.modalities}")
+        logger.info(f"   - 融合维度: {self.fusion_dim}")
+        logger.info(f"   - MER LoRA rank: {getattr(config, 'mer_lora_rank', 4)}")
     
     def set_num_classes(self, num_classes: int):
         """动态设置类别数并初始化分类器"""
@@ -411,7 +411,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             dropout=getattr(self.config, 'dropout_rate', 0.5)
         ).to(self.device)
         
-        logging.info(f"设置分类器：{num_classes} 个ID类别")
+        logger.info(f"设置分类器：{num_classes} 个ID类别")
     
     def forward(self, 
                 images: Optional[Dict[str, torch.Tensor]] = None,
@@ -641,8 +641,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             ce_loss = self.ce_loss(logits[valid_ce_mask], labels[valid_ce_mask])
         else:
             ce_loss = torch.zeros([], device=logits.device)
-            import logging
-            logging.warning(f"CE skipped: valid_ce_cnt=0, mod_valid={int(valid_modality_mask.sum())}, label_valid={int(valid_label_mask.sum())}")
+            logger.warning(f"CE skipped: valid_ce_cnt=0, mod_valid={int(valid_modality_mask.sum())}, label_valid={int(valid_label_mask.sum())}")
         
         # 真正的非负SDM损失：严格按mask过滤，避免占位符污染对齐
         from .sdm_loss import sdm_loss_stable
@@ -692,6 +691,13 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                         # 构造有效样本间的同身份指示矩阵
                         y = (mod_valid_labels.view(-1, 1) == rgb_valid_labels.view(1, -1)).float()
                         
+                        # ❸ 轻兜底：检查该模态与RGB是否有正对
+                        if y.numel() == 0 or y.sum() == 0:
+                            if self.training:
+                                # 只在训练时警告，推理时静默跳过
+                                logger.debug(f"SDM: {mod_name}↔RGB无正对，跳过该模态对齐")
+                            continue  # 跳过这个模态，不加入sdm_losses
+                        
                         # 模态特征 -> RGB特征的SDM对齐（天然非负）
                         L = sdm_loss_stable(mod_valid_feat, rgb_valid_feat, y, 
                                           tau=self.sdm_temperature)
@@ -702,77 +708,37 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                     if sdm_losses:
                         sdm_loss = torch.stack(sdm_losses).mean()
                     else:
-                        # ❸ 临时兜底：没有任何SDM正对，说明采样器问题
+                        # 稳健化改造：没有任何SDM正对时，将SDM损失置零以继续训练
                         sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
                         # 偶发性告警（避免日志过多）
                         if hasattr(self, '_last_no_pairs_warning'):
                             current_time = __import__('time').time()
                             if current_time - self._last_no_pairs_warning > 10.0:  # 10秒打印一次
-                                logging.warning("⚠️ 当前batch无SDM正对，可能是采样器未保证rgb+非rgb组合")
+                                logger.warning("⚠️ 当前batch无SDM正对，已将SDM损失置零以继续训练")
                                 self._last_no_pairs_warning = current_time
                         else:
                             self._last_no_pairs_warning = __import__('time').time()
-                            logging.warning("⚠️ 当前batch无SDM正对，可能是采样器未保证rgb+非rgb组合")
+                            logger.warning("⚠️ 当前batch无SDM正对，已将SDM损失置零以继续训练")
         
-        # 特征范数正则化 - 添加NaN保护和有效样本过滤
-        if 'bn_features' in outputs:
-            feats = outputs['bn_features']  # 与检索和对齐损失保持一致
-        else:
-            feats = outputs['features']  # 回退到融合后特征
-        
-        # 只对有效样本计算特征惩罚
-        if valid_ce_cnt > 0:
-            feat = feats[valid_ce_mask]
-        else:
-            feat = feats
-        
-        fn = feat.norm(p=2, dim=1)  # [B,] 每个样本的L2范数
-        
-        # 检查特征范数的有限性
-        if not torch.isfinite(fn).all():
-            import logging
-            logging.warning(f"Feature norms contain NaN/Inf: {fn}")
-            fn = torch.nan_to_num(fn, nan=1.0, posinf=10.0, neginf=1.0)
-        
-        # 降低目标范数到8-12区间，减少数值风险
-        target_norm = 10.0  # 从原来的值降低到10
-        band = 2.0  # 允许8-12的范围
-        lam = self.feature_norm_penalty
-        
-        over = torch.clamp(fn - (target_norm + band), min=0)
-        under = torch.clamp((target_norm - band) - fn, min=0)
-        
-        if feat.numel() > 0:
-            feat_penalty = (over**2 + under**2).mean() * lam
-        else:
-            feat_penalty = torch.zeros([], device=feats.device)
-        
-        # 最终NaN保护
-        feat_penalty = torch.nan_to_num(feat_penalty, nan=0.0, posinf=1e4, neginf=0.0)
-        
-        # ===== 快速判因：检查各项损失 =====
-        # 1) 哪个损失炸了？
-        for name, loss_val in {"CE": ce_loss, "SDM": sdm_loss, "FeatPenalty": feat_penalty}.items():
+        # ===== 简化损失：只保留CE + SDM =====
+        # 检查核心损失的数值稳定性
+        for name, loss_val in {"CE": ce_loss, "SDM": sdm_loss}.items():
             if not torch.isfinite(loss_val):
                 print(f"⚠️ {name} 损失异常: {loss_val.item()}")
                 # 强制重置为0，防止传播
                 if name == "SDM":
                     sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
-                elif name == "FeatPenalty":
-                    feat_penalty = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+                elif name == "CE":
+                    ce_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
                     
-        # 总损失
-        total_loss = (self.ce_weight * ce_loss + 
-                     self.contrastive_weight * sdm_loss + 
-                     feat_penalty)
+        # 简化的总损失：CE + SDM
+        total_loss = self.ce_weight * ce_loss + self.contrastive_weight * sdm_loss
         
         return {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
             'sdm_loss': sdm_loss,
             'contrastive_loss': sdm_loss,  # 兼容性
-            'feat_penalty': feat_penalty,
-            'feature_norm': fn.mean().item(),
             'ce_valid_cnt': valid_ce_cnt  # 添加有效CE样本计数
         }
     

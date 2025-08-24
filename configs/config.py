@@ -48,21 +48,21 @@ class TrainingConfig:
     # num_classes 将在训练时根据实际训练集ID数量动态设置
     dropout_rate: float = 0.5  # 增强dropout
     
-    # 训练相关 - 16GB显存安全配置（只有micro-batch影响显存）
-    batch_size: int = 8   # micro-batch大小：显存安全优先
-    gradient_accumulation_steps: int = 4  # 保持等效batch_size=32
+    # 训练相关 - 按优化清单配置稳定参数
+    batch_size: int = 16  # 优化后的micro-batch，P×K=4×4
+    gradient_accumulation_steps: int = 2  # 等效batch_size=32
     freeze_backbone: bool = True  # 冻结 CLIP 主干，只训练 LoRA 和特定模块
-    num_epochs: int = 150
+    num_epochs: int = 60   # 按清单推荐：总60epoch
     
-    # 分层学习率设置（修复CE收敛问题）
-    base_learning_rate: float = 5e-6     # 降低CLIP backbone学习率
-    mer_learning_rate: float = 3e-5      # 降低MER LoRA学习率  
-    tokenizer_learning_rate: float = 3e-5 # 降低非共享tokenizer学习率
-    fusion_learning_rate: float = 3e-5    # 降低融合层学习率
+    # 分层学习率设置（按优化清单要求）
+    base_learning_rate: float = 1e-5     # CLIP系列参数 lr=1e-5
+    mer_learning_rate: float = 5e-5      # MER/FM模块 lr=5e-5  
+    tokenizer_learning_rate: float = 5e-5 # 新引入模块 lr=5e-5
+    fusion_learning_rate: float = 5e-5    # 融合层 lr=5e-5
     
     weight_decay: float = 1e-4
-    warmup_epochs: int = 5      # 缩短warmup避免学习率过高
-    scheduler: str = "cosine"
+    warmup_epochs: int = 5      # 前5个epoch线性warmup
+    scheduler: str = "cosine"   # warmup后cosine衰减
     
     # 调度器与稳定性
     conservative_factor: float = 0.7
@@ -100,10 +100,7 @@ class TrainingConfig:
     fusion_mlp_ratio: float = 2.0  # 融合模块MLP扩展比例
     fusion_dropout: float = 0.1   # 融合模块dropout率
     
-    # 特征范数正则化参数（修复CE收敛问题）
-    feature_target_norm: float = 8.0     # 优化目标特征范数，控制在合理范围
-    feature_norm_band: float = 2.0       # 适中的容忍带宽  
-    feature_norm_penalty: float = 1e-2   # 增强正则化权重，严格控制范数
+    # 简化损失：移除特征范数正则化，只保留CE+SDM核心损失
     
     # 数据增强
     random_flip: bool = True
@@ -111,14 +108,17 @@ class TrainingConfig:
     color_jitter: bool = True
     random_erase: float = 0.3
     
-    # 模态dropout（降低以提高特征稳定性）
+    # 模态dropout（按优化清单热身期配置）
     modality_dropout: float = 0.15
+    modality_dropout_warmup_epochs: int = 3  # 前3个epoch关闭dropout等训练稳定
     min_modalities: int = 1
     
-    # 设备和并行 (16GB显存优化)
+    # 设备和并行（按优化清单优化DataLoader）
     device: str = "cuda"
-    num_workers: int = 1  # 降低数据加载器工作进程数以节省内存
-    pin_memory: bool = False  # 关闭内存锁定以节省内存
+    num_workers: int = 2  # 适中的工作进程数
+    pin_memory: bool = True  # 开启内存锁定配合non_blocking加速传输
+    persistent_workers: bool = True  # 保持工作进程，避免重复创建
+    prefetch_factor: int = 2  # 预取因子，平衡内存和性能
     
     # 保存和日志
     save_dir: str = "./checkpoints"
