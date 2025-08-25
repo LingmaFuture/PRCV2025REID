@@ -6,8 +6,7 @@ import random
 import pickle
 import logging
 import hashlib
-from collections import defaultdict, deque
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -19,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, MultiStepLR, LambdaLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import StepLR, MultiStepLR, LambdaLR, ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
 
 # 立刻止血：开启 TF32 加速
@@ -40,7 +39,7 @@ from sklearn.model_selection import train_test_split
 import torchvision.transforms as transforms
 
 # === 你项目里的数据与模型 ===
-from datasets.dataset import MultiModalDataset, BalancedBatchSampler, ModalAwarePKSampler, MultiModalBalancedSampler, compatible_collate_fn
+from datasets.dataset import MultiModalDataset, compatible_collate_fn
 from models.model import CLIPBasedMultiModalReIDModel  
 from models.sdm_scheduler import SDMScheduler
 from configs.config import TrainingConfig
@@ -275,7 +274,8 @@ def build_val_presence_table(dataset, val_indices):
     presence = {}
     for idx in val_indices:
         entry = dataset.data_list[idx]
-        pid_str = entry['person_id_str']
+        # 修复：从person_id转换为字符串，而不是直接访问不存在的person_id_str
+        pid_str = str(entry['person_id'])
         has = {m: False for m in ['vis','nir','sk','cp','text']}
         cache = dataset.image_cache.get(pid_str, {})
         for m in ['vis','nir','sk','cp']:
@@ -475,13 +475,15 @@ def analyze_dataset_sampling_capability(dataset, min_k=2):
         try:
             # 获取person_id，兼容不同数据集结构
             if hasattr(dataset, 'data_list'):
-                pid = dataset.data_list[i]['person_id_str']
+                # 修复：从person_id转换为字符串，而不是直接访问不存在的person_id_str
+                pid = str(dataset.data_list[i]['person_id'])
             elif hasattr(dataset, 'person_id'):
                 pid = dataset.person_id[i] if isinstance(dataset.person_id[i], str) else str(dataset.person_id[i])
             else:
                 # 通过__getitem__获取
                 sample = dataset[i]
-                pid = sample.get('person_id_str', str(sample.get('person_id', i)))
+                # 修复：直接使用person_id，不再查找不存在的person_id_str
+                pid = str(sample.get('person_id', i))
                 
             # 获取模态信息
             if hasattr(dataset, 'modality'):
@@ -518,7 +520,12 @@ def analyze_dataset_sampling_capability(dataset, min_k=2):
     print(f"  总ID数: {total_ids}")
     print(f"  总样本数: {sum(modal_stats.values())}")
     print(f"  各模态分布: {dict(modal_stats)}")
-    print(f"  可配对ID数 (K≥{min_k}): {len(pairable_ids)} ({len(pairable_ids)/total_ids*100:.1f}%)")
+    # 添加除零保护
+    if total_ids > 0:
+        print(f"  可配对ID数 (K≥{min_k}): {len(pairable_ids)} ({len(pairable_ids)/total_ids*100:.1f}%)")
+    else:
+        print(f"  可配对ID数 (K≥{min_k}): {len(pairable_ids)} (无法计算百分比：总ID数为0)")
+        print("  ⚠️ 警告：没有成功分析到任何ID，请检查数据集结构")
     
     # 估算理论最大batch数
     P = 4  # unique_id
@@ -843,10 +850,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         logging.warning(f"检测到eval_after_steps={eval_after_steps}，guide15建议禁用此参数")
     steps_run = 0
     
-    # guide16.md: 避免误导性的总步数显示，使用动态增长的进度条
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}', 
-                leave=True, ncols=120, mininterval=2.0, maxinterval=5.0,
-                total=None)  # 不设置total，让tqdm自动计算实际处理的batch数
+    # 修复进度条：为每个epoch创建独立的进度条，正确显示epoch进度
+    total_batches = len(dataloader) if hasattr(dataloader, '__len__') else None
+    pbar = tqdm(total=total_batches, desc=f'Epoch {epoch}', 
+                leave=False, ncols=120, mininterval=2.0, maxinterval=5.0)
     
     # 添加批次构成监控（前3个batch）
     if epoch <= 3:
@@ -854,7 +861,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     
     # guide14.md: 只统计成功步，避免continue误报
     processed = 0
-    for batch_idx, batch in enumerate(pbar):
+    for batch_idx, batch in enumerate(dataloader):
         batch = move_batch_to_device(batch, device)
         labels = batch['person_id']
         
@@ -974,6 +981,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                     # 内存不足时清理缓存并跳过
                     torch.cuda.empty_cache()
                     logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 内存不足，跳过当前batch")
+                    pbar.update(1)  # 更新进度条
                     continue
                 else:
                     raise e
@@ -983,6 +991,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             if not torch.isfinite(total_loss_val):
                 logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 发现非有限损失值 {total_loss_val.item():.6f}，跳过当前step")
                 optimizer.zero_grad(set_to_none=True)
+                pbar.update(1)  # 更新进度条
                 continue
             
             # SDM对比损失监控（仅在实际参与训练时警告）
@@ -1080,6 +1089,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             logging.error(f"Epoch {epoch}, Batch {batch_idx}: 损失无效 {current_loss}, 跳过")
             loss_spikes += 1
             state['spikes'] += 1
+            pbar.update(1)  # 更新进度条
             continue
         
         # 计算梯度（支持梯度累积）
@@ -1308,6 +1318,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                 'Spikes': loss_spikes
             })
         
+        # 修复关键问题：每个batch处理完后更新进度条
+        pbar.update(1)
+        
         # guide14.md: 成功处理一个batch后增加计数（在所有continue检查之后）
         processed += 1
         
@@ -1334,6 +1347,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     if actual < expected * 0.9:  # 如果实际处理数少于90%
         logging.warning(f"[Epoch {epoch}] 采样器提前耗尽: 实际batch={actual}, 名义batch={expected}. "
                        "可能因 unique_id/Kmin/跨模态约束过严或数据不平衡导致。")
+    
+    # 关闭进度条
+    pbar.close()
     
     # 训练完成后清理CUDA缓存
     torch.cuda.empty_cache()
@@ -1491,31 +1507,30 @@ def train_multimodal_reid():
     safe_batch_size = min(8, actual_batch_size)  # 小batch更稳定
     logging.info(f"使用简化配置：batch_size={safe_batch_size}（原计划{actual_batch_size}）")
     
-    if require_modal_pairs:
-        # 使用强配对采样器
-        from datasets.dataset import ModalAwarePKSampler_Strict
-        train_sampler = ModalAwarePKSampler_Strict(
-            train_dataset,
-            batch_size=safe_batch_size,
-            num_instances=num_instances,
-            seed=getattr(config, "seed", 42),
-            retry_limit=modal_pair_retry_limit,
-            fallback_ratio=modal_pair_fallback_ratio
-        )
-        logging.info("✅ 强配对采样器创建成功")
-    else:
-        # 使用普通采样器
-        train_sampler = ModalAwarePKSampler(
-            train_dataset,
-            batch_size=safe_batch_size,
-            num_instances=num_instances,
-            seed=getattr(config, "seed", 42)
-        )
-        logging.info("✅ 普通采样器创建成功")
+    # Guide19修复：使用批采样器替代普通采样器，避免batch_size参数错误
+    from datasets.dataset import ModalAwarePKBatchSampler_Strict, analyze_sampling_capability
+    
+    # 先分析数据集采样能力
+    strong_count, total_count = analyze_sampling_capability(train_dataset, limit=2000)
+    
+    if strong_count == 0:
+        logging.error(f"可配对ID数({strong_count}) < 每批需要ID数({P})，建议检查数据集或降低num_ids_per_batch")
+        raise ValueError("数据集无有效的强配对ID，无法进行训练")
+    
+    # 使用批采样器
+    train_batch_sampler = ModalAwarePKBatchSampler_Strict(
+        train_dataset,
+        num_ids_per_batch=P,
+        num_instances=num_instances,
+        allow_id_reuse=getattr(config, "allow_id_reuse", True),
+        include_text=True,
+        min_modal_coverage=getattr(config, "min_modal_coverage", 0.6)
+    )
+    logging.info("✅ 强配对批采样器创建成功")
     
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler=train_sampler,
+        batch_sampler=train_batch_sampler,
         num_workers=getattr(config, "num_workers", 2),  # guide6.md: 适中的工作进程数
         pin_memory=getattr(config, "pin_memory", True),  # 开启内存锁定配合non_blocking加速传输
         collate_fn=compatible_collate_fn,

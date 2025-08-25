@@ -54,10 +54,11 @@ class TrainingConfig:
     num_ids_per_batch: int = 3      # P = 每个batch中的ID数量，guide16建议从4降到3
     num_instances: int = 2          # K = 每个ID的实例数量，强制≥2
     
-    # guide16.md: 采样器兜底策略配置
+    # guide18: 采样器配置（防止再早停）
     allow_id_reuse: bool = True     # 允许同epoch内ID复用，防止采样耗尽
     sampling_fallback: bool = True  # 无法满足约束时是否回退到随机采样
-    min_modal_coverage: float = 0.6 # 跨模态覆盖率最低要求，适当降低避免过严
+    min_modal_coverage: float = 0.6 # 跨模态覆盖率最低要求
+    instances_per_id: int = 2       # K - 每个ID的实例数量，与num_instances保持一致
     gradient_accumulation_steps: int = 1  # guide4.py: 临时化简为1，确保梯度流正常
     freeze_backbone: bool = True  # 冻结 CLIP 主干，只训练 LoRA 和特定模块
     num_epochs: int = 60   # 按清单推荐：总60epoch
