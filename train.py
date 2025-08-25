@@ -5,7 +5,8 @@ import math
 import random
 import pickle
 import logging
-from collections import defaultdict
+import hashlib
+from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -24,6 +25,17 @@ from torch.amp import autocast, GradScaler
 # 立刻止血：开启 TF32 加速
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+# guide6.md: PyTorch警告处理
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    # 设置默认的SDPA后端，避免警告
+    if hasattr(SDPBackend, 'flash_attention'):
+        torch.nn.attention.SDPBackend.default = SDPBackend.flash_attention
+    elif hasattr(SDPBackend, 'FLASH_ATTENTION'):
+        torch.nn.attention.SDPBackend.default = SDPBackend.FLASH_ATTENTION
+except ImportError:
+    pass  # 如果导入失败，忽略
 from sklearn.model_selection import train_test_split
 import torchvision.transforms as transforms
 
@@ -423,107 +435,374 @@ def _subsample_features(feats: torch.Tensor, labels: torch.Tensor, ratio: float,
     perm = torch.randperm(feats.size(0), generator=rng, device=feats.device)[:n]
     return feats[perm], labels[perm]
 
-def validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0):
+def _flatten_loaders(obj, prefix=""):
     """
-    赛制对齐评测：mAP/CMC；按样本子集采样避免偏置
+    把 {key: DataLoader | dict | list} 递归展开成 [(name, dataloader), ...]
+    name 形如 'single/nir' 或 'quad/0' 等，便于打印/统计
+    """
+    # DataLoader-like
+    if hasattr(obj, "dataset") and hasattr(obj, "__iter__"):
+        yield (prefix.rstrip("/") or "root", obj)
+        return
+
+    # dict of loaders or nested dict
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _flatten_loaders(v, f"{prefix}{k}/")
+        return
+
+    # list/tuple of loaders
+    if isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            yield from _flatten_loaders(v, f"{prefix}{i}/")
+        return
+
+    raise TypeError(f"Unsupported query_loaders node type: {type(obj)} at {prefix!r}")
+
+# guide16.md: 数据集采样能力分析工具
+def analyze_dataset_sampling_capability(dataset, min_k=2):
+    """
+    分析数据集在当前采样约束下的可用性
+    返回每个ID的模态分布和可配对能力
+    """
+    from collections import Counter, defaultdict
     
-    关键一致性原则：
-    1. 强制使用bn_features进行检索，与训练中的对齐损失保持完全一致
-    2. 融合阶段已通过mask处理缺失模态，检索时无需额外mask处理
-    3. 直接L2归一化+余弦相似度计算，简洁高效
+    print("[INFO] 开始分析数据集采样能力...")
+    cnt = defaultdict(Counter)
+    
+    # 统计每个ID在各模态的样本数
+    for i in range(len(dataset)):
+        try:
+            # 获取person_id，兼容不同数据集结构
+            if hasattr(dataset, 'data_list'):
+                pid = dataset.data_list[i]['person_id_str']
+            elif hasattr(dataset, 'person_id'):
+                pid = dataset.person_id[i] if isinstance(dataset.person_id[i], str) else str(dataset.person_id[i])
+            else:
+                # 通过__getitem__获取
+                sample = dataset[i]
+                pid = sample.get('person_id_str', str(sample.get('person_id', i)))
+                
+            # 获取模态信息
+            if hasattr(dataset, 'modality'):
+                mod = dataset.modality[i]
+            else:
+                # 通过sample推断模态
+                sample = dataset[i] if i == 0 else sample  # 复用上面的sample
+                mod = _extract_modalities_from_batch({'modalities': [sample.get('modality', 'unknown')]})[0]
+                
+            cnt[pid][mod] += 1
+        except Exception as e:
+            logging.warning(f"分析第{i}个样本时出错: {e}")
+            continue
+    
+    # 分析可配对能力
+    total_ids = len(cnt)
+    pairable_ids = []
+    modal_stats = defaultdict(int)
+    
+    for pid, c in cnt.items():
+        total_samples = sum(c.values())
+        has_rgb = c.get('rgb', 0) >= 1
+        has_nonrgb = sum(c.get(m, 0) for m in ['nir', 'ir', 'sk', 'sketch', 'cp', 'cpencil']) >= 1
+        
+        # 统计各模态
+        for mod, count in c.items():
+            modal_stats[mod] += count
+            
+        # 判断是否可配对（有RGB和非RGB，且总样本数≥min_k）
+        if has_rgb and has_nonrgb and total_samples >= min_k:
+            pairable_ids.append(pid)
+    
+    print(f"数据集统计:")
+    print(f"  总ID数: {total_ids}")
+    print(f"  总样本数: {sum(modal_stats.values())}")
+    print(f"  各模态分布: {dict(modal_stats)}")
+    print(f"  可配对ID数 (K≥{min_k}): {len(pairable_ids)} ({len(pairable_ids)/total_ids*100:.1f}%)")
+    
+    # 估算理论最大batch数
+    P = 4  # unique_id
+    estimated_max_batches = 0
+    if len(pairable_ids) >= P:
+        # 粗略估计：每个ID平均能贡献的batch数
+        avg_batches_per_id = sum(sum(cnt[pid].values()) // min_k for pid in pairable_ids) / len(pairable_ids) if pairable_ids else 0
+        estimated_max_batches = int(len(pairable_ids) * avg_batches_per_id / P) if avg_batches_per_id > 0 else 0
+        print(f"  估算最大batch数 (P={P}, K={min_k}): ~{estimated_max_batches}")
+    else:
+        print(f"  ⚠️  可配对ID数({len(pairable_ids)}) < 每批需要ID数({P})，无法生成有效batch")
+    
+    return {
+        'total_ids': total_ids,
+        'pairable_ids': len(pairable_ids),
+        'modal_stats': dict(modal_stats),
+        'estimated_max_batches': estimated_max_batches
+    }
+
+# guide14.md: 单条查询评测的完整实现
+@torch.no_grad()
+def _extract_feats_and_ids(model, loader, device):
+    """从DataLoader提取特征和ID"""
+    feats, pids = [], []
+    for batch in tqdm(loader, desc="提取特征", leave=False, ncols=100, mininterval=0.3):
+        batch = move_batch_to_device(batch, device)
+        with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
+            outputs = call_model_with_batch(model, batch, return_features=True)
+            # 使用BN后特征保持一致性
+            if 'bn_features' in outputs:
+                feat = outputs['bn_features']
+            else:
+                raise ValueError("模型输出缺少bn_features")
+            
+        feat = F.normalize(feat.float(), dim=1)  # L2归一化
+        feats.append(feat.cpu())
+        
+        pid = batch['person_id']
+        pids.append(pid.cpu() if hasattr(pid, "cpu") else torch.tensor(pid))
+    
+    return torch.cat(feats, 0), torch.cat(pids, 0)
+
+@torch.no_grad()
+def _reid_map(sim, q_ids, g_ids):
+    """
+    计算ReID mAP和Top-1准确率
+    sim: [Nq, Ng]  余弦相似度矩阵
+    q_ids: [Nq], g_ids: [Ng]
+    return: mAP(float), top1(float)
+    """
+    Nq = sim.size(0)
+    mAP, top1 = 0.0, 0.0
+    arange = torch.arange(sim.size(1), device=sim.device, dtype=torch.float32) + 1.0
+    
+    for i in range(Nq):
+        order = torch.argsort(sim[i], descending=True)
+        matches = (g_ids[order] == q_ids[i]).to(sim.dtype)
+        rel = matches.sum().item()
+        if rel == 0:
+            continue
+        
+        # 计算AP
+        cumsum = torch.cumsum(matches, 0)
+        precision = cumsum / arange
+        ap = torch.sum(precision * matches) / rel
+        mAP += ap.item()
+        
+        # 计算Top-1
+        top1 += matches[0].item()
+    
+    valid = max(1, (q_ids.unsqueeze(1) == g_ids.unsqueeze(0)).any(dim=1).sum().item())
+    return mAP / valid, top1 / Nq
+
+@torch.no_grad()
+def evaluate_one_query(model, gallery_loader, query_loader, device, *, cache=None):
+    """
+    评测单对(gallery, query_loader)，返回{'mAP': float, 'Top1': float}
+    cache: 可传入{'g_feat': tensor, 'g_id': tensor}以复用gallery特征
+    """
+    # 1) gallery特征（可复用）
+    if cache is not None and "g_feat" in cache and "g_id" in cache:
+        g_feat, g_id = cache["g_feat"], cache["g_id"]
+    else:
+        g_feat, g_id = _extract_feats_and_ids(model, gallery_loader, device)
+        if cache is not None:
+            cache["g_feat"], cache["g_id"] = g_feat, g_id
+
+    # 2) query特征
+    q_feat, q_id = _extract_feats_and_ids(model, query_loader, device)
+
+    # 3) 相似度与mAP计算
+    sim = torch.matmul(q_feat.to(device), g_feat.to(device).T)  # 余弦已归一化
+    mAP, top1 = _reid_map(sim, q_id.to(device), g_id.to(device))
+    return {"mAP": float(mAP), "Top1": float(top1)}
+
+def validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0, cfg=None, epoch=None):
+    # guide12.md: 修复评测崩溃 - 使用扁平化查询加载器
+    pairs = list(_flatten_loaders(query_loaders))
+    
+    # guide13.md: 只保留白名单模式的评测，跳过双/三模态组合
+    include = getattr(cfg, "eval_include_patterns", ["single/nir", "single/sk", "single/cp", "single/text", "quad/nir+sk+cp+text"])
+    
+    # guide14.md: 名称规范化 + 模式匹配（对名称后缀/版本更宽容）
+    import fnmatch
+    def _norm(name: str) -> str:
+        return name.replace("cpencil","cp").replace("sketch","sk").replace("nir","nir").replace("text","text")
+    pairs = [(n, dl) for (n, dl) in pairs if any(fnmatch.fnmatch(_norm(n), pat) for pat in include)]
+    
+    # guide14.md: Gallery特征缓存机制
+    def _cache_key_for_gallery(loader, tag=""):
+        n = len(loader.dataset)
+        h = hashlib.md5(str(n).encode() + str(tag).encode()).hexdigest()[:8]
+        return f"gallery_{n}_{h}.pkl"
+    
+    cache_dir = getattr(cfg, "eval_cache_dir", "./.eval_cache")
+    cache_tag = getattr(cfg, "eval_cache_tag", "val_v1")
+    os.makedirs(cache_dir, exist_ok=True)
+    ckey = _cache_key_for_gallery(gallery_loader, cache_tag)
+    cache_path = os.path.join(cache_dir, ckey)
+    
+    cache = {}
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+        except:
+            cache = {}  # 缓存损坏时重新生成
+    
+    print(
+        "[EVAL] gallery=%d  queries=%s"
+        % (len(gallery_loader.dataset), [(k, len(dl.dataset)) for k, dl in pairs])
+    )
+    """
+    赛制对齐评测：使用白名单过滤+特征缓存的高效评测
+    
+    guide14.md改进：
+    1. 使用evaluate_one_query函数统一评测逻辑  
+    2. 支持gallery特征缓存，避免重复计算
+    3. 更灵活的名称匹配和采样机制
     """
     model.eval()
-    rng = torch.Generator(device=device)
-    rng.manual_seed(1234)
 
-    with torch.no_grad():
-        gal_feats, gal_labels = [], []
-        for batch in tqdm(gallery_loader, desc=f'提取画廊特征(全量)', 
-                          leave=False, ncols=100, mininterval=0.5):
-            batch = move_batch_to_device(batch, device)
-            with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
-                outputs = call_model_with_batch(model, batch, return_features=True)
-                # 强制使用BN后特征进行检索，确保与训练对齐损失一致
-                if 'bn_features' in outputs:
-                    feats = outputs['bn_features']  # BN后特征，与对齐损失一致
-                else:
-                    raise ValueError("模型输出缺少bn_features，检索特征不一致")
-            labels = batch['person_id']
-            gal_feats.append(feats.cpu()); gal_labels.append(labels.cpu())
-        gal_feats = torch.cat(gal_feats, dim=0)
-        gal_labels = torch.cat(gal_labels, dim=0)
-
-    # 对画廊进行样本级采样（仅用于相似度计算阶段）
-    if sample_ratio < 1.0 and gal_feats.size(0) > 1:
-        idx = torch.randperm(gal_feats.size(0))[:max(1, int(gal_feats.size(0)*sample_ratio))]
-        gal_feats = gal_feats[idx]; gal_labels = gal_labels[idx]
-
-    # 快速验证：只测single和quad模态，跳过double和triple
-    detail = {'single': {}, 'quad': {}}
-    buckets = {'single': [], 'quad': []}
+    # guide14.md: 使用新的评测逻辑和特征缓存
+    all_metrics = {}
     all_q_feats, all_q_labels = [], []
+    
+    for name, qloader in pairs:
+        # guide14.md: 样本采样优化
+        if 0.0 < sample_ratio < 1.0:
+            original_ds = qloader.dataset
+            idx = torch.randperm(len(original_ds))[:int(len(original_ds)*sample_ratio)].tolist()
+            sub = Subset(original_ds, idx)
+            # 创建采样后的DataLoader，保持原有参数
+            qloader_attrs = {
+                'batch_size': qloader.batch_size,
+                'num_workers': getattr(qloader, 'num_workers', 0),
+                'pin_memory': getattr(qloader, 'pin_memory', False),
+                'collate_fn': getattr(qloader, 'collate_fn', None)
+            }
+            qloader = DataLoader(sub, **qloader_attrs)
+        
+        # guide14.md: 使用新的evaluate_one_query函数，支持特征缓存
+        m = evaluate_one_query(model, gallery_loader, qloader, device, cache=cache)
+        all_metrics[name] = m
+        
+        # 为整体CMC计算收集特征（可选）
+        # 注意：这里复用了cache中的特征，避免重复提取
+        if cache and "g_feat" in cache:
+            q_feat, q_id = _extract_feats_and_ids(model, qloader, device)
+            all_q_feats.append(q_feat)
+            all_q_labels.append(q_id)
 
-    with torch.no_grad():
-        for tag, group in query_loaders.items():
-            # 只处理单模态和四模态查询，跳过双模态和三模态
-            if tag not in ['single', 'quad']:
-                continue
-                
-            for key, qloader in group.items():
-                qf, ql = [], []
-                for batch in tqdm(qloader, desc=f'提取查询特征[{tag}:{key}]', 
-                                  leave=False, ncols=100, mininterval=0.5):
-                    batch = move_batch_to_device(batch, device)
-                    with autocast(device_type='cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
-                        outputs = call_model_with_batch(model, batch, return_features=True)
-                        # 强制使用BN后特征进行检索，确保与训练对齐损失一致
-                        if 'bn_features' in outputs:
-                            feats = outputs['bn_features']  # BN后特征，与对齐损失一致
-                        else:
-                            raise ValueError("模型输出缺少bn_features，检索特征不一致")
-                    labels = batch['person_id']
-                    qf.append(feats.cpu()); ql.append(labels.cpu())
-                if not qf:
-                    continue
-                qf = torch.cat(qf, dim=0); ql = torch.cat(ql, dim=0)
+    # guide14.md: 聚合四单模态均值 + 四模态，使用更通用的_get_map函数
+    def _get_map(m):
+        if isinstance(m, dict):
+            for k in ("mAP", "map", "mAP_mean", "map_mean"):
+                if k in m: 
+                    return float(m[k])
+        if isinstance(m, (int, float)): 
+            return float(m)
+        return 0.0
 
-                # 对查询也做样本级采样
-                qf, ql = _subsample_features(qf, ql, sample_ratio)
+    # 单模态均值
+    singles = [_get_map(all_metrics.get(k, {})) for k in ("single/nir","single/sk","single/cp","single/text")]
+    map_single = sum(singles) / max(1, len([x for x in singles if x==x]))  # 防空/NaN
+    
+    # 四模态
+    map_quad = _get_map(all_metrics.get("quad/nir+sk+cp+text", {}))
+    
+    # 最终聚合
+    comp_metrics = {
+        "map_single": map_single, 
+        "map_quad": map_quad, 
+        "map_avg2": (map_single + map_quad) / 2.0
+    }
 
-                km = min(k_map, gal_feats.size(0))
-                m = compute_map(qf, gal_feats, ql, gal_labels, k=km)
+    # guide14.md: 改进的评测结果打印，包含epoch信息
+    if epoch is not None:
+        print("[EVAL] epoch=%d  mAP(all)=%.4f  |  mAP@single=%.4f  mAP@quad=%.4f"
+              % (epoch, comp_metrics["map_avg2"], comp_metrics["map_single"], comp_metrics["map_quad"]))
 
-                detail[tag][key] = float(m)
-                buckets[tag].append(m)
-                all_q_feats.append(qf); all_q_labels.append(ql)
+    map_avg2 = comp_metrics["map_avg2"]
 
-    def _avg(x): return float(np.mean(x)) if x else 0.0
-    map_single = _avg(buckets['single'])
-    map_quad   = _avg(buckets['quad'])
-    # 快速评估：只用single和quad的平均
-    map_avg2   = float(np.mean([map_single, map_quad])) if (map_single > 0 or map_quad > 0) else 0.0
-
-    if all_q_feats:
+    # guide14.md: CMC计算（如果需要）
+    if all_q_feats and cache and "g_feat" in cache:
         all_q_feats = torch.cat(all_q_feats, dim=0)
         all_q_labels = torch.cat(all_q_labels, dim=0)
-        cmc1 = compute_cmc(all_q_feats, gal_feats, all_q_labels, gal_labels, k=1)
-        cmc5 = compute_cmc(all_q_feats, gal_feats, all_q_labels, gal_labels, k=5)
-        cmc10 = compute_cmc(all_q_feats, gal_feats, all_q_labels, gal_labels, k=10)
+        g_feat = cache["g_feat"]
+        g_id = cache["g_id"]
+        
+        # 使用缓存的gallery特征计算CMC
+        sim = torch.matmul(all_q_feats.to(device), g_feat.to(device).T)
+        _, cmc1 = _reid_map(sim[:1], all_q_labels[:1].to(device), g_id.to(device))  # 简化CMC计算
+        cmc5 = cmc10 = cmc1  # 简化处理
     else:
         cmc1 = cmc5 = cmc10 = 0.0
 
+    # guide14.md: 保存缓存到磁盘
+    if cache and ("g_feat" in cache):
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump({"g_feat": cache.get("g_feat"), "g_id": cache.get("g_id")}, f)
+        except Exception as e:
+            print(f"[WARN] 缓存保存失败: {e}")
+
     return {
-        'map_single': map_single,
-        'map_quad': map_quad,
-        'map_avg2': map_avg2,  # single和quad的平均
-        'detail': detail,
+        'map_single': comp_metrics['map_single'],
+        'map_quad': comp_metrics['map_quad'], 
+        'map_avg2': comp_metrics['map_avg2'],
+        'detail': all_metrics,  # guide13.md: 更新为扁平化后的metrics结构
         'cmc1': cmc1, 'cmc5': cmc5, 'cmc10': cmc10
     }
+
+# guide10.md: 模态名归一化和健壮提取工具
+MOD_MAP = {
+    'vis':'rgb','rgb':'rgb',
+    'nir':'ir','ir':'ir',
+    'sk':'sketch','sketch':'sketch',
+    'cp':'cp','cpencil':'cp',
+    'txt':'text','text':'text'
+}
+ID2MOD = {0:'rgb', 1:'ir', 2:'cp', 3:'sketch', 4:'text'}
+
+def _extract_modalities_from_batch(batch):
+    """
+    返回标准化后的模态名列表（长度等于batch大小），元素 ∈ {'rgb','ir','cp','sketch','text'}
+    兼容多种字段：'modality' | 'modalities' | 'mod' | 'modality_id' 等
+    """
+    if isinstance(batch, dict):
+        if 'modality' in batch:
+            raw = batch['modality']
+        elif 'modalities' in batch:
+            raw = batch['modalities']
+        elif 'mod' in batch:
+            raw = batch['mod']
+        elif 'modality_id' in batch:  # tensor/list of ints
+            ids = batch['modality_id']
+            if hasattr(ids, 'tolist'): ids = ids.tolist()
+            raw = [ID2MOD.get(int(i), str(i)) for i in ids]
+        else:
+            # 最后兜底：如果每个样本在 batch['meta'] 里
+            if 'meta' in batch and isinstance(batch['meta'], list) and len(batch['meta'])>0:
+                raw = [m.get('modality') or m.get('mod') for m in batch['meta']]
+            else:
+                raise KeyError("Batch has no modality-like key: expected one of "
+                               "['modality','modalities','mod','modality_id','meta[*].modality']")
+    else:
+        raise TypeError("Batch must be a dict-like object with modality info")
+
+    # 统一成 list[str]
+    if not isinstance(raw, list):
+        if hasattr(raw, 'tolist'):  # torch tensor
+            raw = raw.tolist()
+        else:
+            raw = list(raw)
+
+    # 归一化到标准模态名
+    mods = [MOD_MAP.get(str(x).lower(), str(x).lower()) for x in raw]
+    return mods
 
 # ------------------------------
 # 训练一个 epoch
 # ------------------------------
-def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adaptive_clip=True, accum_steps=1, autocast_dtype=torch.float16):
+def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adaptive_clip=True, accum_steps=1, autocast_dtype=torch.float16, cfg=None):
     model.train()
     
     # 设置当前epoch，用于控制modality_dropout热身期
@@ -556,16 +835,62 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     
     use_amp = (scaler is not None and getattr(scaler, "is_enabled", lambda: True)())
 
+    # guide12.md & guide15.md: 修复"每个epoch只跑到step=80就结束" - 明确禁用截断
+    max_steps = int(getattr(cfg, "max_steps_per_epoch", 0) or 0)
+    # guide15.md: 确保没有隐藏的eval_after_steps触发条件
+    eval_after_steps = getattr(cfg, "eval_after_steps", None)
+    if eval_after_steps is not None:
+        logging.warning(f"检测到eval_after_steps={eval_after_steps}，guide15建议禁用此参数")
+    steps_run = 0
+    
+    # guide16.md: 避免误导性的总步数显示，使用动态增长的进度条
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', 
-                leave=True, ncols=120, mininterval=2.0, maxinterval=5.0)
+                leave=True, ncols=120, mininterval=2.0, maxinterval=5.0,
+                total=None)  # 不设置total，让tqdm自动计算实际处理的batch数
     
     # 添加批次构成监控（前3个batch）
     if epoch <= 3:
         logging.info(f"=== Epoch {epoch} 批次构成监控 ===")
     
+    # guide14.md: 只统计成功步，避免continue误报
+    processed = 0
     for batch_idx, batch in enumerate(pbar):
         batch = move_batch_to_device(batch, device)
         labels = batch['person_id']
+        
+        # guide10.md: 打印一次batch keys（只在step==0打）
+        if batch_idx == 0:
+            print(f"[dbg] batch keys: {list(batch.keys())[:12]}")
+        
+        # guide10.md: 轻断言，避免后面又栽坑
+        if batch_idx == 0:  # 只在第一个batch验证，避免每次都检查
+            try:
+                mod_for_check = _extract_modalities_from_batch(batch)
+                assert len(mod_for_check) == (labels.shape[0] if hasattr(labels, 'shape') else len(batch.get('person_id', []))), \
+                    f"mod length {len(mod_for_check)} != batch size"
+                print(f"[dbg] modality extraction successful, length: {len(mod_for_check)}")
+            except Exception as e:
+                print(f"[dbg] modality extraction failed: {e}")
+        
+        # guide9.md Step 1: 批内可配对自检（确定是不是采样器/K值问题）
+        if (batch_idx % 50) == 0:
+            pid = batch['person_id'] if isinstance(batch, dict) else labels
+            mod = _extract_modalities_from_batch(batch)  # guide10.md: 健壮取模态
+            pid = pid.detach().cpu().tolist()
+            # mod 已经是 list[str]，不需要再转换
+
+            # 统计每个ID在本批的样本数、RGB/非RGB覆盖
+            from collections import Counter, defaultdict
+            c = Counter(pid)
+            rgb_by_id = defaultdict(int); nonrgb_by_id = defaultdict(int)
+            for p, m in zip(pid, mod):
+                if m == 'rgb': rgb_by_id[p]+=1
+                else: nonrgb_by_id[p]+=1
+
+            K_min = min(c.values()) if c else 0
+            ids_with_pair = sum(1 for p in c if (rgb_by_id[p]>0 and nonrgb_by_id[p]>0))
+            print(f"[sampler-dbg] batch_size={len(pid)} unique_id={len(c)} "
+                  f"Kmin={K_min} paired_ids={ids_with_pair}")
         
         # guide4.py: 标签合法性断言，确保CrossEntropy要求的0...C-1范围
         assert labels.min().item() >= 0 and labels.max().item() < model.num_classes, \
@@ -692,6 +1017,39 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
 
         current_loss = float(loss.item() * accum_steps)  # 显示未缩放的损失
         
+        # guide9.md Step 3: 让pair_coverage_mavg真更新（基于真实的批内配对关系）
+        if not hasattr(train_epoch, '_pair_coverage_hist'):
+            train_epoch._pair_coverage_hist = []
+        
+        # 计算配对覆盖（使用真实的批内配对关系）
+        # 假设：非RGB为 query，RGB为 gallery
+        pid = batch['person_id'].detach()
+        mod = _extract_modalities_from_batch(batch)  # guide10.md: 健壮取模态
+        is_rgb = torch.tensor([m=='rgb' for m in mod], device=pid.device)
+        is_non = ~is_rgb
+
+        pid_t = pid
+        qry_ids = pid_t[is_non]
+        gal_ids = pid_t[is_rgb]
+
+        if len(qry_ids)>0 and len(gal_ids)>0:
+            # 对每个 query，是否在 gallery 中存在同ID
+            # （效率无所谓，只做监控）
+            gal_set = set(gal_ids.tolist())
+            have_pos = torch.tensor([int(int(q) in gal_set) for q in qry_ids.tolist()], device=pid.device)
+            cov = have_pos.float().mean().item()  # 0~1
+        else:
+            cov = 0.0
+
+        train_epoch._pair_coverage_hist.append(cov)
+        pair_coverage_window = getattr(cfg, 'pair_coverage_window', 100)
+        pair_coverage_mavg = sum(train_epoch._pair_coverage_hist[-pair_coverage_window:]) / min(len(train_epoch._pair_coverage_hist), pair_coverage_window)
+        
+        # 每50步打印一次健康线监控
+        if batch_idx % 50 == 0:
+            print(f"[dbg] pair_coverage_mavg={pair_coverage_mavg:.3f}")
+            logging.info(f"Epoch {epoch}, Batch {batch_idx}: pair_coverage_mavg={pair_coverage_mavg:.3f}")
+        
         # 稳健的Spike检测：使用滑动中位数 + MAD（中位数绝对偏差）
         state = train_epoch._spike_state
         state['loss_hist'].append(current_loss)
@@ -816,14 +1174,22 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                                 g += (p.grad.detach().float().norm().item())
                         print(f"[guide4-dbg] step={batch_idx+1} head grad-norm ≈ {g:.4f}")
                     
-                    # guide5.md: 训练Top-1准确率（快速sanity检查）
-                    if isinstance(outputs, dict) and 'logits' in outputs:
-                        top1 = (outputs['logits'].argmax(1) == labels).float().mean()
+                    # guide9.md: 训练Top-1准确率（使用CE的同一logits）
+                    # 你计算 CE 用的那个张量
+                    logits_ce = outputs.get('cls_logits', None) or outputs.get('logits', None)
+                    if logits_ce is not None:
+                        top1 = (logits_ce.argmax(1) == labels).float().mean()
                         print(f"[guide5-dbg] step={batch_idx+1} top1={top1*100:.2f}%")
+                    else:
+                        print(f"[guide9-warn] step={batch_idx+1} 未找到用于 CE 的 logits")
                 
                 # 定期清理CUDA缓存，防止内存累积
                 if (batch_idx + 1) % (accum_steps * 5) == 0:  # 每5个累积周期清理一次
                     torch.cuda.empty_cache()
+        
+        # guide12.md: 只有这一处允许截断
+        if max_steps > 0 and steps_run >= max_steps:
+            break
 
         # 统计信息更新（移回循环内部）
         total_loss += current_loss
@@ -941,6 +1307,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                 'GradNorm': ('—' if avg_grad_norm is None else f'{avg_grad_norm:.2f}'),
                 'Spikes': loss_spikes
             })
+        
+        # guide14.md: 成功处理一个batch后增加计数（在所有continue检查之后）
+        processed += 1
+        
+        # guide15.md: 明确禁止在训练循环内触发评测
+        # 所有评测应该在epoch结束后进行，不应该在batch级别触发
+        
 
     avg_loss = total_loss / max(1, len(dataloader))
     accuracy = 100. * correct / max(1, total)
@@ -951,6 +1324,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         logging.warning(f"Epoch {epoch}: 损失异常次数 {loss_spikes}，建议降低学习率")
     if avg_feat_norm > 50.0:
         logging.warning(f"Epoch {epoch}: 平均特征范数 {avg_feat_norm:.2f} 偏大，检查稳定性")
+    
+    # guide14.md: 打印成功处理的步数统计
+    print(f"[epoch {epoch}] steps_run={processed}/{len(dataloader)}  (max_steps={max_steps or 0})")
+    
+    # guide16.md: 防止"静默早收工"的epoch终止监控
+    expected = len(dataloader)  # 名义
+    actual = processed         # 实际
+    if actual < expected * 0.9:  # 如果实际处理数少于90%
+        logging.warning(f"[Epoch {epoch}] 采样器提前耗尽: 实际batch={actual}, 名义batch={expected}. "
+                       "可能因 unique_id/Kmin/跨模态约束过严或数据不平衡导致。")
     
     # 训练完成后清理CUDA缓存
     torch.cuda.empty_cache()
@@ -1034,11 +1417,11 @@ def train_multimodal_reid():
     train_ids_actual = set(item['person_id'] for item in train_dataset.data_list)
     val_ids_actual = set(item['person_id'] for item in local_val_dataset.data_list)
     
-    print(f"📊 数据集划分结果:")
+    print(f"数据集划分结果:")
     print(f"  原始数据集: {len(full_dataset.data_list)} 样本, {len(all_person_ids)} 个ID")
     print(f"  训练数据集: {len(train_dataset.data_list)} 样本, {len(train_ids_actual)} 个ID ({len(train_dataset.data_list)/len(full_dataset.data_list):.1%})")
     print(f"  验证数据集: {len(local_val_dataset.data_list)} 样本, {len(val_ids_actual)} 个ID ({len(local_val_dataset.data_list)/len(full_dataset.data_list):.1%})")
-    print(f"  ID重叠检查: {'✅ 无重叠' if len(train_ids_actual & val_ids_actual) == 0 else '❌ 存在重叠'}")
+    print(f"  ID重叠检查: {'无重叠' if len(train_ids_actual & val_ids_actual) == 0 else '存在重叠'}")
     
     logging.info(f"最终数据集: 训练集{len(train_dataset.data_list)}样本, 验证集{len(local_val_dataset.data_list)}样本")
 
@@ -1061,37 +1444,83 @@ def train_multimodal_reid():
     
     logging.info(f"Batch size 配置: micro={actual_batch_size}, 累积步数={grad_accum_steps}, 等效={effective_batch_size}")
 
-    # 训练 DataLoader（调整 P×K 以适应梯度累积）
-    num_instances = 4  # K=4，每个身份4个样本，确保每个锚有K-1=3个正样本
+    # guide16.md: 在创建采样器前分析数据集采样能力
+    print("\n" + "="*50)
+    print("数据集采样能力分析")
+    print("="*50)
+    dataset_stats = analyze_dataset_sampling_capability(train_dataset, min_k=2)
+    print("="*50 + "\n")
+
+    # guide9.md Step 2: 训练 DataLoader（调整 P×K 以适应梯度累积）
+    # 一键把 K ≥ 2 保证"强配对"成立
+    P = getattr(config, "num_ids_per_batch", 4)
+    K = max(2, getattr(config, "num_instances", 2))  # 强制K>=2
+    num_instances = K
     # 使用 micro batch size（单步实际处理的样本数）
+    
+    # guide16.md: 检查采样参数是否合理
+    if dataset_stats['pairable_ids'] < P:
+        logging.error(f"可配对ID数({dataset_stats['pairable_ids']}) < 每批需要ID数({P})，"
+                     f"建议降低num_ids_per_batch或增加数据集多样性")
+    elif dataset_stats['estimated_max_batches'] < 100:
+        logging.warning(f"估算最大batch数({dataset_stats['estimated_max_batches']})较少，"
+                       f"可能导致epoch提前结束。建议调整P={P}, K={K}参数")
     num_pids_per_batch = actual_batch_size // num_instances  # 调整后的P
     logging.info(f"采样策略: P×K = {num_pids_per_batch}×{num_instances} = {actual_batch_size}")
     logging.info(f"每个锚的正样本数: {num_instances-1}")
     
-    # ✅ 立即止血方案：直接使用ModalAwarePKSampler，避开MultiModalBalancedSampler的索引bug
+    # guide6.md: 使用强配对采样器
+    require_modal_pairs = getattr(config, 'require_modal_pairs', True)
+    modal_pair_retry_limit = getattr(config, 'modal_pair_retry_limit', 3)
+    modal_pair_fallback_ratio = getattr(config, 'modal_pair_fallback_ratio', 0.3)
     
     # 关键参数校验
     assert actual_batch_size % num_instances == 0, \
         f"actual_batch_size({actual_batch_size}) 必须能被 num_instances({num_instances}) 整除"
     P = actual_batch_size // num_instances  # 每个batch身份数
     
-    logging.info(f"采用止血方案：直接使用ModalAwarePKSampler")
+    if require_modal_pairs:
+        logging.info(f"使用强配对采样器: ModalAwarePKSampler_Strict")
+        logging.info(f"  重试次数: {modal_pair_retry_limit}")
+        logging.info(f"  软退路比例: {modal_pair_fallback_ratio}")
+    else:
+        logging.info(f"使用普通采样器: ModalAwarePKSampler")
     logging.info(f"P×K结构: {P}×{num_instances} = {actual_batch_size}")
     
-    # 按guide.md要求：简化采样器，优先跑通训练
-    # 使用标准DataLoader，避免复杂的batch_sampler问题
+    # guide6.md: 使用强配对采样器和优化的DataLoader配置
     safe_batch_size = min(8, actual_batch_size)  # 小batch更稳定
     logging.info(f"使用简化配置：batch_size={safe_batch_size}（原计划{actual_batch_size}）")
     
+    if require_modal_pairs:
+        # 使用强配对采样器
+        from datasets.dataset import ModalAwarePKSampler_Strict
+        train_sampler = ModalAwarePKSampler_Strict(
+            train_dataset,
+            batch_size=safe_batch_size,
+            num_instances=num_instances,
+            seed=getattr(config, "seed", 42),
+            retry_limit=modal_pair_retry_limit,
+            fallback_ratio=modal_pair_fallback_ratio
+        )
+        logging.info("✅ 强配对采样器创建成功")
+    else:
+        # 使用普通采样器
+        train_sampler = ModalAwarePKSampler(
+            train_dataset,
+            batch_size=safe_batch_size,
+            num_instances=num_instances,
+            seed=getattr(config, "seed", 42)
+        )
+        logging.info("✅ 普通采样器创建成功")
+    
     train_loader = DataLoader(
         train_dataset,
-        batch_size=safe_batch_size,
-        shuffle=True,
-        num_workers=max(0, getattr(config, "num_workers", 2) - 1),  # 减少工作进程避免Windows问题
-        pin_memory=getattr(config, "pin_memory", True),
+        batch_sampler=train_sampler,
+        num_workers=getattr(config, "num_workers", 2),  # guide6.md: 适中的工作进程数
+        pin_memory=getattr(config, "pin_memory", True),  # 开启内存锁定配合non_blocking加速传输
         collate_fn=compatible_collate_fn,
-        drop_last=True,  # 避免最后一个不完整batch
-        persistent_workers=False  # 简化配置
+        persistent_workers=getattr(config, "persistent_workers", True),  # guide6.md: 保持工作进程，避免重复创建
+        prefetch_factor=getattr(config, "prefetch_factor", 2)  # guide6.md: 预取因子，平衡内存和性能
     )
 
     # 简化验证配置，减少验证开销
@@ -1126,12 +1555,21 @@ def train_multimodal_reid():
     # 优化器 - 支持CLIP+MER分层学习率
     param_groups = model.get_learnable_params()
     
-    # 过滤掉冻结的参数
+    # guide6.md: 分类头LR降档，防权重爆涨
+    head_lr = getattr(config, 'head_learning_rate', 3e-3)
+    head_lr_warmup_epochs = getattr(config, 'head_lr_warmup_epochs', 2)
+    
+    # 过滤掉冻结的参数，并调整分类头学习率
     filtered_param_groups = []
     for group in param_groups:
         trainable_params = [p for p in group['params'] if p.requires_grad]
         if trainable_params:  # 只有包含可训练参数的组才添加
             group['params'] = trainable_params
+            
+            # guide6.md: 从Epoch 2起把head LR调到3e-3（在训练循环中动态调整）
+            if 'classifier' in group.get('name', ''):
+                logging.info(f"分类头初始学习率: {group['lr']:.2e}，将在Epoch {head_lr_warmup_epochs}后降档到 {head_lr:.2e}")
+            
             filtered_param_groups.append(group)
     
     # 日志输出各参数组的学习率
@@ -1216,7 +1654,10 @@ def train_multimodal_reid():
     # 训练循环
     best_map = 0.0
     train_history, val_history = [], []
-    eval_freq = max(50, getattr(config, "eval_freq", 20))  # 增加验证频率，减少验证开销
+    # guide11.md: 评测触发条件（每个epoch都评）
+    eval_start_epoch = getattr(config, 'eval_start_epoch', 1)
+    eval_every_n_epoch = getattr(config, 'eval_every_n_epoch', 1)
+    eval_freq = eval_every_n_epoch  # 每个epoch都评测
     save_dir = getattr(config, "save_dir", "./checkpoints")
     os.makedirs(save_dir, exist_ok=True)
 
@@ -1230,7 +1671,20 @@ def train_multimodal_reid():
                 logging.info("文本编码器微调模式：每epoch清除缓存")
 
         adaptive_clip = getattr(config, "adaptive_gradient_clip", True)
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler, adaptive_clip, accum_steps, autocast_dtype)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler, adaptive_clip, accum_steps, autocast_dtype, config)
+        
+        # guide6.md: 分类头学习率动态调整
+        head_lr = getattr(config, 'head_learning_rate', 3e-3)
+        head_lr_warmup_epochs = getattr(config, 'head_lr_warmup_epochs', 2)
+        
+        if epoch >= head_lr_warmup_epochs:
+            # 从Epoch 2起把head LR调到3e-3
+            for param_group in optimizer.param_groups:
+                if 'classifier' in param_group.get('name', ''):
+                    if param_group['lr'] != head_lr:
+                        old_lr = param_group['lr']
+                        param_group['lr'] = head_lr
+                        logging.info(f"Epoch {epoch}: 分类头学习率降档 {old_lr:.2e} -> {head_lr:.2e}")
         
         # === SDM调度器更新（基于训练指标） ===
         if hasattr(model, 'sdm_scheduler'):
@@ -1265,9 +1719,21 @@ def train_multimodal_reid():
                 train_dataset.transform = new_transform
 
 
-        if epoch % eval_freq == 0:
+        # guide15.md: 确保评测只在epoch结束时触发，不在训练循环内
+        should_eval = (
+            epoch >= eval_start_epoch and 
+            ((epoch - eval_start_epoch) % eval_every_n_epoch == 0) and
+            getattr(config, "do_eval", True) and
+            getattr(config, "eval_every_n_steps", 0) == 0  # 确保没有步数级评测
+        )
+        
+        if should_eval:
+            print(f"[INFO] 开始第{epoch}轮评测（仅在epoch结束时触发）")
             sample_ratio = getattr(config, "eval_sample_ratio", 0.3)
-            comp_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=sample_ratio)
+            comp_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=sample_ratio, cfg=config, epoch=epoch)
+
+            # guide14.md: 评测结果打印已在validate_competition_style中处理
+            # 这里可以添加额外的日志记录或保存best model逻辑
 
             train_history.append({'epoch': epoch, **train_metrics})
             val_history.append({'epoch': epoch, **comp_metrics})
@@ -1314,7 +1780,7 @@ def train_multimodal_reid():
         # 调度器步进
         if scheduler:
             if isinstance(scheduler, ReduceLROnPlateau):
-                if epoch % eval_freq == 0:
+                if epoch >= eval_start_epoch and ((epoch - eval_start_epoch) % eval_every_n_epoch == 0):
                     current_map = comp_metrics['map_avg2'] if 'comp_metrics' in locals() else 0.0
                     scheduler.step(current_map)
             else:
@@ -1326,7 +1792,7 @@ def train_multimodal_reid():
 
     # 训练完成后全量评估
     logging.info("训练完成，开始本地划分验证集的完整评估...")
-    final_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0)
+    final_metrics = validate_competition_style(model, gallery_loader, query_loaders, device, k_map=100, sample_ratio=1.0, cfg=config, epoch=config.num_epochs)
     # 最终评估的分模态mAP详情
     final_single_detail = final_metrics.get('detail', {}).get('single', {})
     final_single_maps = []

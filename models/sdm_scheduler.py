@@ -212,6 +212,17 @@ class SDMScheduler:
         self.weight_scheduler = SDMWeightScheduler(config)
         self.temp_scheduler = SDMTemperatureScheduler(config)
         
+        # guide7: 保存配置参数以便直接调用get_weight
+        self.warmup_epochs = getattr(config, 'sdm_weight_warmup_epochs', 1)
+        self.weight_schedule = getattr(config, 'sdm_weight_schedule', [0.1, 0.3, 0.5])
+    
+    def get_weight(self, epoch: int) -> float:
+        """
+        guide7: 添加get_weight方法，与train.py中的调用兼容
+        返回当前epoch的SDM权重
+        """
+        return self.weight_scheduler.get_weight(epoch)
+    
     def get_parameters(self, epoch, train_metrics, val_metrics=None):
         """
         获取当前epoch的SDM参数
@@ -254,3 +265,6 @@ class SDMScheduler:
     def reset_temperature(self):
         """重置温度"""
         return self.temp_scheduler.reset_to_normal()
+    
+    # guide7: 让实例可直接调用：scheduler(epoch) 等价于 get_weight(epoch)
+    __call__ = get_weight

@@ -338,6 +338,13 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         # 训练状态跟踪
         self.current_epoch = 0  # 用于控制modality_dropout的热身期
         
+        # guide6.md: 跨批记忆库初始化
+        if getattr(config, 'sdm_memory_enabled', True):
+            from collections import deque
+            self.sdm_memory = deque(maxlen=getattr(config, 'sdm_memory_steps', 6))
+        else:
+            self.sdm_memory = None
+        
         # 模态配置
         self.modalities = getattr(config, 'modalities', ['rgb', 'ir', 'cpencil', 'sketch', 'text'])
         self.vision_modalities = [m for m in self.modalities if m != 'text']
@@ -606,6 +613,21 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         # 输出feature_masks供损失计算时过滤使用
         outputs['feature_masks'] = feature_masks
         
+        # guide6.md: 跨批记忆库更新（在compute_loss中处理，这里只缓存特征）
+        if self.sdm_memory is not None and self.training:
+            # 缓存当前batch的RGB特征（标签在compute_loss中处理）
+            rgb_features = raw_modality_features.get('rgb', None)
+            rgb_mask = feature_masks.get('rgb', None)
+            
+            if rgb_features is not None and rgb_mask is not None:
+                # 找到有效的RGB样本
+                rgb_valid_idx = (rgb_mask > 0).squeeze(-1) if rgb_mask.dim() > 1 else (rgb_mask > 0)
+                
+                if rgb_valid_idx.sum() > 0:
+                    # 缓存有效的RGB特征（标签在compute_loss中处理）
+                    rgb_valid_feat = rgb_features[rgb_valid_idx].detach()
+                    self.sdm_memory.append((rgb_valid_feat, rgb_valid_idx))
+        
         return outputs
     
     def compute_loss(self, outputs: Dict[str, torch.Tensor], labels: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -675,6 +697,24 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                     # 过滤出有效的RGB特征和标签
                     rgb_valid_feat = rgb_features[rgb_valid_idx]
                     rgb_valid_labels = labels[rgb_valid_idx]
+                    
+                    # guide6.md: 使用跨批记忆库兜底
+                    if self.sdm_memory is not None and len(self.sdm_memory) > 0:
+                        # 从记忆库中获取历史RGB特征和标签
+                        mem_feats = []
+                        mem_labels = []
+                        for mem_feat, mem_label in self.sdm_memory:
+                            mem_feats.append(mem_feat)
+                            mem_labels.append(mem_label)
+                        
+                        if mem_feats:
+                            # 合并当前batch和记忆库的RGB特征
+                            mem_feats_cat = torch.cat(mem_feats, dim=0)
+                            mem_labels_cat = torch.cat(mem_labels, dim=0)
+                            
+                            # 扩展当前batch的RGB特征和标签
+                            rgb_valid_feat = torch.cat([rgb_valid_feat, mem_feats_cat], dim=0)
+                            rgb_valid_labels = torch.cat([rgb_valid_labels, mem_labels_cat], dim=0)
                     
                     sdm_losses = []
                     # 对每个非RGB模态与有效RGB做SDM对齐

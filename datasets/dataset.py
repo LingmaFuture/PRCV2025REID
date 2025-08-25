@@ -11,33 +11,74 @@ import os
 import random
 from collections import defaultdict
 
+# 模态名称规范化映射（使用数据集原生名称）
+CANON_DS = {
+    'vis': 'vis', 'rgb': 'vis',
+    'nir': 'nir', 'ir': 'nir', 
+    'sk': 'sk', 'sketch': 'sk',
+    'cp': 'cp', 'cpencil': 'cp', 'ccpencil': 'cp',
+    'txt': 'text', 'text': 'text'
+}
 
-def infer_modalities_of_sample(ds, idx):
+def canon_mod(name: str) -> str:
+    """规范化模态名称到数据集原生名称"""
+    return CANON_DS.get(str(name).lower().strip(), str(name).lower().strip())
+
+@torch.no_grad()
+def infer_modalities_of_sample(dataset, idx, *, include_text=True, prefer_mask=True):
     """
-    返回该样本拥有哪些模态的集合，如 {'vis','nir'} 或 {'text'} 等
-    兼容两种结构：
-      A) ds.data_list[idx].get('modality') 是单模态字符串
-      B) ds.data_list[idx].get('images') 是dict，键包含多模态
+    统一、稳健地推断样本可用模态（guide17修复版）
+    1) 优先 modality_mask（>0.5 视为可用）
+    2) 其次 images（非空张量）
+    3) 可选 text（text_description 非空）
+    返回：{'vis','nir','sk','cp', ['text']}
     """
-    rec = ds.data_list[idx]
+    try:
+        # 获取样本（优先使用缓存的samples，否则调用__getitem__）
+        s = dataset.samples[idx] if hasattr(dataset, "samples") else dataset[idx]
+    except Exception:
+        # 极端情况回退
+        if hasattr(dataset, 'data_list') and idx < len(dataset.data_list):
+            s = dataset.data_list[idx]
+        else:
+            return set()
+
     mods = set()
 
-    # 常见字段1：单字段
-    m = rec.get('modality', None)
-    if isinstance(m, str) and m:
-        mods.add(m)
+    # 1) modality_mask（推荐方式）
+    if prefer_mask and isinstance(s.get('modality_mask', None), dict):
+        for k, v in s['modality_mask'].items():
+            try:
+                vf = float(v) if not isinstance(v, bool) else (1.0 if v else 0.0)
+            except Exception:
+                vf = 0.0
+            if vf > 0.5:
+                mods.add(canon_mod(k))
 
-    # 常见字段2：图像字典
-    imgs = rec.get('images', None)
-    if isinstance(imgs, dict):
-        for k in imgs.keys():
-            if k in ('vis', 'nir', 'sk', 'cp'):
-                mods.add(k)
+    # 2) images（作为兜底或补充）
+    if ('images' in s) and isinstance(s['images'], dict):
+        for k, img in s['images'].items():
+            if torch.is_tensor(img) and img.numel() > 0:
+                # 粗检非空：避免全零张量
+                try:
+                    if img.dtype.is_floating_point:
+                        non_empty = bool((img.abs() > 1e-6).any())
+                    else:
+                        non_empty = True
+                except Exception:
+                    non_empty = True
+                if non_empty:
+                    mods.add(canon_mod(k))
 
-    # 文本
-    td = rec.get('text_description', None)
-    if isinstance(td, str) and td.strip():
-        mods.add('text')
+    # 3) text（可选）
+    if include_text:
+        td = s.get('text_description', None)
+        has_text = (isinstance(td, str) and len(td.strip()) > 0) or \
+                   (hasattr(td, '__len__') and len(td) > 0 and 
+                    isinstance(td[0] if isinstance(td, list) else td, str) and 
+                    len((td[0] if isinstance(td, list) else td).strip()) > 0)
+        if has_text:
+            mods.add('text')
 
     return mods
 
@@ -303,6 +344,7 @@ class MultiModalDataset(Dataset):
                 - text_description: 文本描述列表
                 - images: 四种模态的图像张量字典
                 - modality_mask: 各模态的可用性掩码
+                - modality: 当前样本的主要模态（用于采样器识别）
         """
         data = self.data_list[idx]
         person_id = data['person_id']
@@ -320,6 +362,7 @@ class MultiModalDataset(Dataset):
         file_path = data.get('file_path', None)  # 获取指定的文件路径（如果有）
         
         # 处理四种模态的图像数据
+        available_modalities = []  # 记录可用的模态
         for modality in self.modality_folders:
             image_paths = self.image_cache[person_id_str][modality]  # 获取该模态的缓存路径
             # 检查是否应用模态dropout（仅在训练时）
@@ -341,6 +384,7 @@ class MultiModalDataset(Dataset):
                     image = Image.open(selected_path).convert('RGB')
                     images[modality] = self.transform(image)  # 应用数据变换
                     sample['modality_mask'][modality] = 1.0  # 标记该模态可用
+                    available_modalities.append(modality)  # 添加到可用模态列表
                 except Exception as e:
                     # 图像加载失败，使用零张量
                     print(f"Error loading {selected_path}: {e}")
@@ -350,6 +394,21 @@ class MultiModalDataset(Dataset):
                 # 无可用图像或被dropout丢弃，使用零张量
                 images[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
                 sample['modality_mask'][modality] = 0.0
+
+        # 设置模态信息 - 关键修复：确保每个样本都有正确的modality字段
+        if available_modalities:
+            # 优先选择vis模态，如果没有则选择第一个可用模态
+            if 'vis' in available_modalities:
+                sample['modality'] = 'vis'
+            else:
+                sample['modality'] = available_modalities[0]
+        else:
+            # 如果没有可用图像模态，但有文本，则标记为text模态
+            if text_desc and text_desc.strip():
+                sample['modality'] = 'text'
+            else:
+                # 兜底：标记为unknown
+                sample['modality'] = 'unknown'
 
         sample['images'] = images
         return sample
@@ -732,6 +791,241 @@ class MultiModalBalancedSampler(Sampler):
         # 末尾不足一个batch则丢弃
 
 
+class ModalAwarePKSampler_Strict(Sampler):
+    """
+    强配对采样器 - guide6.md实现
+    
+    实现"软硬结合"策略：
+    - 优先选择"≥1 RGB + ≥1 非RGB"的ID
+    - 软退路：若某ID无法凑出强配对，重试≤N次；仍失败则改为普通K样本
+    - 目标：把"批内无正样本行"控制到≤15%
+    """
+    def __init__(self, dataset, batch_size, num_instances=4, seed=42,
+                 retry_limit=3, fallback_ratio=0.3):
+        """
+        Args:
+            dataset: 数据集对象
+            batch_size: 批次大小
+            num_instances: 每个ID的实例数量（K）
+            seed: 随机种子
+            retry_limit: 软退路重试次数
+            fallback_ratio: 软退路比例
+        """
+        assert batch_size % num_instances == 0, f"batch_size({batch_size}) must be divisible by num_instances({num_instances})"
+        
+        # 处理数据集子集的情况
+        if hasattr(dataset, 'dataset'):
+            self.base_dataset = dataset.dataset
+            self.indices = dataset.indices
+        else:
+            self.base_dataset = dataset
+            self.indices = list(range(len(dataset)))
+        
+        self.batch_size = batch_size
+        self.num_instances = num_instances
+        self.num_pids_per_batch = batch_size // num_instances
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.retry_limit = retry_limit
+        self.fallback_ratio = fallback_ratio
+
+        # 1) 建 pid -> 索引列表
+        self.pid_to_indices = {}
+        for subset_idx, orig_idx in enumerate(self.indices):
+            if hasattr(self.base_dataset, 'data_list'):
+                person_id = self.base_dataset.data_list[orig_idx]['person_id']
+            else:
+                person_id = self.base_dataset[orig_idx]['person_id'].item() + 1
+            
+            if isinstance(person_id, torch.Tensor):
+                person_id = int(person_id.item())
+            else:
+                person_id = int(person_id)
+                
+            self.pid_to_indices.setdefault(person_id, []).append(subset_idx)
+
+        # 2) 建 pid -> 模态桶（使用数据集原生名称）
+        self.pid_to_mod = {}
+        self.pairable_pids = []  # 可以强配对的ID列表
+        self.fallback_pids = []  # 需要软退路的ID列表
+        
+        for pid, idxs in self.pid_to_indices.items():
+            buckets = {'vis': [], 'nir': [], 'sk': [], 'cp': [], 'text': [], 'nonvis': []}
+            for idx in idxs:
+                orig_idx = self.indices[idx]
+                # guide17修复：使用图像模态判断配对能力，文本单独考虑
+                mods = infer_modalities_of_sample(self.base_dataset, orig_idx, include_text=False)
+                if 'vis' in mods:
+                    buckets['vis'].append(idx)
+                if 'nir' in mods:
+                    buckets['nir'].append(idx)
+                    buckets['nonvis'].append(idx)
+                if 'sk' in mods:
+                    buckets['sk'].append(idx)
+                    buckets['nonvis'].append(idx)
+                if 'cp' in mods:
+                    buckets['cp'].append(idx)
+                    buckets['nonvis'].append(idx)
+                
+                # 文本单独检查
+                mods_with_text = infer_modalities_of_sample(self.base_dataset, orig_idx, include_text=True)
+                if 'text' in mods_with_text:
+                    buckets['text'].append(idx)
+                    # guide17: 文本也可以作为非vis模态参与配对
+                    buckets['nonvis'].append(idx)
+                    
+            self.pid_to_mod[pid] = buckets
+            
+            # 判断是否可以强配对：vis + 非vis（nir/sk/cp/text任一）
+            has_vis = len(buckets['vis']) > 0
+            has_nonvis = len(buckets['nonvis']) > 0
+            if has_vis and has_nonvis:
+                self.pairable_pids.append(pid)
+            else:
+                self.fallback_pids.append(pid)
+
+        print(f"[Sampler] 初始化完成: 可配对ID={len(self.pairable_pids)}, 软退路ID={len(self.fallback_pids)}")
+
+    def __len__(self):
+        # 更准确的长度估算：基于可配对ID数量和允许ID复用
+        if not hasattr(self, '_cached_len'):
+            total_pids = len(self.pairable_pids) + len(self.fallback_pids)
+            if total_pids >= self.num_pids_per_batch:
+                # 估算：允许ID在同一epoch内被多次使用（通过重复采样）
+                # 保守估算：假设每个ID平均可被使用3次
+                effective_pids = total_pids * 3
+                max_batches = effective_pids // self.num_pids_per_batch
+                self._cached_len = max_batches
+            else:
+                # 如果ID总数不足，返回最小值
+                self._cached_len = 1
+            print(f"[Sampler] 估算可生成batch数: {self._cached_len}")
+        return self._cached_len
+
+    def sample_strong_pair(self, pid, retry_count=0):
+        """
+        尝试为指定ID采样强配对样本
+        
+        Args:
+            pid: 人员ID
+            retry_count: 当前重试次数
+            
+        Returns:
+            list: 采样的索引列表，如果失败返回None
+        """
+        b = self.pid_to_mod[pid]
+        chosen = []
+        
+        # 尝试采样1个vis + 1个非vis
+        if len(b['vis']) > 0 and len(b['nonvis']) > 0:
+            # 采样1个vis
+            chosen.append(self.rng.choice(b['vis']))
+            
+            # 采样1个非vis（避免重复）
+            nonvis_candidates = [x for x in b['nonvis'] if x not in chosen]
+            if nonvis_candidates:
+                chosen.append(self.rng.choice(nonvis_candidates))
+            else:
+                chosen.append(self.rng.choice(b['nonvis']))
+            
+            # 补齐到K个样本
+            pool = self.pid_to_indices[pid][:]
+            self.rng.shuffle(pool)
+            j = 0
+            while len(chosen) < self.num_instances and j < 10 * len(pool):
+                idx = pool[j % len(pool)]
+                if idx not in chosen:
+                    chosen.append(idx)
+                j += 1
+            
+            # 若实在不够，允许重复
+            while len(chosen) < self.num_instances:
+                chosen.append(self.rng.choice(self.pid_to_indices[pid]))
+            
+            return chosen
+        
+        # 重试逻辑
+        if retry_count < self.retry_limit:
+            return self.sample_strong_pair(pid, retry_count + 1)
+        
+        return None
+
+    def sample_fallback(self, pid):
+        """
+        软退路：普通K样本采样
+        
+        Args:
+            pid: 人员ID
+            
+        Returns:
+            list: 采样的索引列表
+        """
+        pool = self.pid_to_indices[pid][:]
+        self.rng.shuffle(pool)
+        
+        chosen = []
+        j = 0
+        while len(chosen) < self.num_instances and j < 10 * len(pool):
+            idx = pool[j % len(pool)]
+            if idx not in chosen:
+                chosen.append(idx)
+            j += 1
+        
+        # 若实在不够，允许重复
+        while len(chosen) < self.num_instances:
+            chosen.append(self.rng.choice(self.pid_to_indices[pid]))
+        
+        return chosen
+
+    def __iter__(self):
+        """
+        改进的迭代器：允许ID重用，避免过早终止epoch
+        """
+        # 准备ID池（允许重用）
+        all_pids = self.pairable_pids + self.fallback_pids
+        if not all_pids:
+            return
+        
+        batches_generated = 0
+        max_batches = self._cached_len  # 使用我们估算的最大batch数
+        
+        batch = []
+        
+        while batches_generated < max_batches:
+            # 为当前batch选择ID（允许重复）
+            chosen_pids = self.rng.choices(all_pids, k=self.num_pids_per_batch)
+            
+            batch_samples = []
+            for pid in chosen_pids:
+                # 优先尝试强配对（如果该ID支持）
+                if pid in self.pairable_pids:
+                    samples = self.sample_strong_pair(pid)
+                    if samples is not None:
+                        batch_samples.extend(samples)
+                        continue
+                
+                # 强配对失败或不支持，使用软退路
+                samples = self.sample_fallback(pid)
+                batch_samples.extend(samples)
+            
+            # 确保batch大小正确
+            if len(batch_samples) == self.batch_size:
+                yield batch_samples
+                batches_generated += 1
+            elif len(batch_samples) > 0:
+                # 截断或填充到正确大小
+                if len(batch_samples) > self.batch_size:
+                    yield batch_samples[:self.batch_size]
+                else:
+                    # 填充不足的部分
+                    while len(batch_samples) < self.batch_size:
+                        pid = self.rng.choice(all_pids)
+                        additional_samples = self.sample_fallback(pid)
+                        batch_samples.extend(additional_samples[:self.batch_size - len(batch_samples)])
+                    yield batch_samples[:self.batch_size]
+                batches_generated += 1
+
+
 def compatible_collate_fn(batch):
     """
     兼容的批次整理函数 (Collate Function)
@@ -845,5 +1139,30 @@ def compatible_collate_fn(batch):
     for m in modalities + ['text']:
         mask_out[m] = torch.tensor(real_modality_mask[m], dtype=torch.float)
     batch_dict['modality_mask'] = mask_out
+
+    # guide17修复: 注入规范字段 'modality'，使用数据集原生名称
+    def _norm_one(s):
+        if 'modality' in s: 
+            v = s['modality']
+        elif 'mod' in s:    
+            v = s['mod']
+        else: 
+            # 根据modality_mask推断主要模态
+            max_modal = None
+            max_mask = -1
+            if 'modality_mask' in s and isinstance(s['modality_mask'], dict):
+                for mod_name, mask_val in s['modality_mask'].items():
+                    mask_val = float(mask_val) if not isinstance(mask_val, bool) else (1.0 if mask_val else 0.0)
+                    if mask_val > max_mask:
+                        max_mask = mask_val
+                        max_modal = mod_name
+            if max_modal:
+                v = max_modal
+            else:
+                v = s.get('meta',{}).get('modality', 'vis')  # 默认vis
+        return canon_mod(str(v))  # 使用统一的规范化函数
+
+    batch_mods = [_norm_one(s) for s in batch]
+    batch_dict['modality'] = batch_mods
 
     return batch_dict
