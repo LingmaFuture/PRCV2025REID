@@ -809,7 +809,8 @@ def _extract_modalities_from_batch(batch):
 # ------------------------------
 # 训练一个 epoch
 # ------------------------------
-def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adaptive_clip=True, accum_steps=1, autocast_dtype=torch.float16, cfg=None):
+def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, adaptive_clip=True, accum_steps=1, autocast_dtype=torch.float16, cfg=None, pbar=None):
+    """Fix20: 修复后的训练epoch函数，使用外部传入的进度条"""
     model.train()
     
     # 设置当前epoch，用于控制modality_dropout热身期
@@ -825,16 +826,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
     grad_norms = []
     
     # guide6.md: 三条健康线监控
-    if not hasattr(train_epoch, '_health_monitors'):
-        train_epoch._health_monitors = {
+    if not hasattr(train_epoch_fixed, '_health_monitors'):
+        train_epoch_fixed._health_monitors = {
             'pair_cov_hist': [],  # pair coverage 历史
             'ce_hist': [],        # CE损失历史
             'top1_hist': []       # Top-1准确率历史
         }
     
     # 稳健的Spike检测状态管理
-    if not hasattr(train_epoch, '_spike_state'):
-        train_epoch._spike_state = {
+    if not hasattr(train_epoch_fixed, '_spike_state'):
+        train_epoch_fixed._spike_state = {
             'loss_hist': [],
             'spikes': 0,
             'batches': 0
@@ -850,10 +851,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         logging.warning(f"检测到eval_after_steps={eval_after_steps}，guide15建议禁用此参数")
     steps_run = 0
     
-    # 修复进度条：为每个epoch创建独立的进度条，正确显示epoch进度
-    total_batches = len(dataloader) if hasattr(dataloader, '__len__') else None
-    pbar = tqdm(total=total_batches, desc=f'Epoch {epoch}', 
-                leave=False, ncols=120, mininterval=2.0, maxinterval=5.0)
+    # Fix20: 使用外部传入的进度条，不再创建新的tqdm
+    if pbar is None:
+        raise ValueError("Fix20: train_epoch_fixed 必须传入进度条参数")
     
     # 添加批次构成监控（前3个batch）
     if epoch <= 3:
@@ -981,7 +981,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                     # 内存不足时清理缓存并跳过
                     torch.cuda.empty_cache()
                     logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 内存不足，跳过当前batch")
-                    pbar.update(1)  # 更新进度条
+                    pbar.update(1)  # Fix20: 更新外部进度条
                     continue
                 else:
                     raise e
@@ -1027,8 +1027,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         current_loss = float(loss.item() * accum_steps)  # 显示未缩放的损失
         
         # guide9.md Step 3: 让pair_coverage_mavg真更新（基于真实的批内配对关系）
-        if not hasattr(train_epoch, '_pair_coverage_hist'):
-            train_epoch._pair_coverage_hist = []
+        if not hasattr(train_epoch_fixed, '_pair_coverage_hist'):
+            train_epoch_fixed._pair_coverage_hist = []
         
         # 计算配对覆盖（使用真实的批内配对关系）
         # 假设：非RGB为 query，RGB为 gallery
@@ -1050,9 +1050,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         else:
             cov = 0.0
 
-        train_epoch._pair_coverage_hist.append(cov)
+        train_epoch_fixed._pair_coverage_hist.append(cov)
         pair_coverage_window = getattr(cfg, 'pair_coverage_window', 100)
-        pair_coverage_mavg = sum(train_epoch._pair_coverage_hist[-pair_coverage_window:]) / min(len(train_epoch._pair_coverage_hist), pair_coverage_window)
+        pair_coverage_mavg = sum(train_epoch_fixed._pair_coverage_hist[-pair_coverage_window:]) / min(len(train_epoch_fixed._pair_coverage_hist), pair_coverage_window)
         
         # 每50步打印一次健康线监控
         if batch_idx % 50 == 0:
@@ -1060,7 +1060,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
             logging.info(f"Epoch {epoch}, Batch {batch_idx}: pair_coverage_mavg={pair_coverage_mavg:.3f}")
         
         # 稳健的Spike检测：使用滑动中位数 + MAD（中位数绝对偏差）
-        state = train_epoch._spike_state
+        state = train_epoch_fixed._spike_state
         state['loss_hist'].append(current_loss)
         # 保持最近200个损失值的历史
         if len(state['loss_hist']) > 200:
@@ -1318,7 +1318,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
                 'Spikes': loss_spikes
             })
         
-        # 修复关键问题：每个batch处理完后更新进度条
+        # Fix20: 每个batch处理完后更新外部传入的进度条
         pbar.update(1)
         
         # guide14.md: 成功处理一个batch后增加计数（在所有continue检查之后）
@@ -1348,9 +1348,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         logging.warning(f"[Epoch {epoch}] 采样器提前耗尽: 实际batch={actual}, 名义batch={expected}. "
                        "可能因 unique_id/Kmin/跨模态约束过严或数据不平衡导致。")
     
-    # 关闭进度条
-    pbar.close()
-    
+    # Fix20: 进度条由外部with语句管理，无需手动关闭
     # 训练完成后清理CUDA缓存
     torch.cuda.empty_cache()
     
@@ -1363,7 +1361,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, scaler=None, adapti
         'feature_norm': avg_feat_norm,
         'grad_norm': avg_grad_norm,
         'loss_spikes': loss_spikes,
-        'stability_score': max(0.0, 1.0 - train_epoch._spike_state['spikes'] / max(1, train_epoch._spike_state['batches']))
+        'stability_score': max(0.0, 1.0 - train_epoch_fixed._spike_state['spikes'] / max(1, train_epoch_fixed._spike_state['batches']))
     }
 
 # ------------------------------
@@ -1454,11 +1452,19 @@ def train_multimodal_reid():
                   if torch.distributed.is_available() and torch.distributed.is_initialized() else 1)
     grad_accum_steps = getattr(config, "gradient_accumulation_steps", 4)
     
-    # config.batch_size 约定为"每卡 micro-batch"
-    actual_batch_size = config.batch_size                   # per-GPU micro batch
+    # Fix20: P×K结构强制计算batch_size，确保配对采样
+    P = getattr(config, "num_ids_per_batch", 3)     # P，每个batch的ID数
+    K = getattr(config, "instances_per_id", 2)      # K，每个ID的样本数
+    
+    # 强制约束检查
+    assert K >= 2, f"instances_per_id(K) 必须 ≥ 2，当前为 {K}，无法保证批内配对"
+    assert P >= 2, f"num_ids_per_batch(P) 必须 ≥ 2，当前为 {P}"
+    
+    actual_batch_size = P * K  # 强制P×K结构
     effective_batch_size = actual_batch_size * grad_accum_steps * world_size  # 全局有效 batch
     
-    logging.info(f"Batch size 配置: micro={actual_batch_size}, 累积步数={grad_accum_steps}, 等效={effective_batch_size}")
+    logging.info(f"Fix20 Batch size 配置: P×K={P}×{K}={actual_batch_size}, 累积步数={grad_accum_steps}, 等效={effective_batch_size}")
+    logging.info(f"强制配对约束: 每个ID必须≥2样本且包含vis+nonvis")
 
     # guide16.md: 在创建采样器前分析数据集采样能力
     print("\n" + "="*50)
@@ -1676,6 +1682,9 @@ def train_multimodal_reid():
     save_dir = getattr(config, "save_dir", "./checkpoints")
     os.makedirs(save_dir, exist_ok=True)
 
+    # Fix20: 修复进度条显示问题 - 使用单一进度条控制
+    total_batches = len(train_loader) if hasattr(train_loader, '__len__') else None
+    
     for epoch in range(1, num_epochs + 1):
         start_time = time.time()
         
@@ -1685,8 +1694,17 @@ def train_multimodal_reid():
             if epoch == 1:  # 第一个epoch提醒
                 logging.info("文本编码器微调模式：每epoch清除缓存")
 
-        adaptive_clip = getattr(config, "adaptive_gradient_clip", True)
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, scaler, adaptive_clip, accum_steps, autocast_dtype, config)
+        # Fix20: 创建独立的epoch进度条，确保每个epoch正确重置
+        with tqdm(total=total_batches, 
+                  desc=f"Epoch {epoch}/{num_epochs}", 
+                  leave=False, ncols=120) as epoch_pbar:
+            
+            adaptive_clip = getattr(config, "adaptive_gradient_clip", True)
+            train_metrics = train_epoch_fixed(
+                model, train_loader, optimizer, device, epoch, 
+                scaler, adaptive_clip, accum_steps, autocast_dtype, config, 
+                epoch_pbar  # 传递进度条
+            )
         
         # guide6.md: 分类头学习率动态调整
         head_lr = getattr(config, 'head_learning_rate', 3e-3)

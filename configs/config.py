@@ -48,17 +48,17 @@ class TrainingConfig:
     # num_classes 将在训练时根据实际训练集ID数量动态设置
     dropout_rate: float = 0.5  # 增强dropout
     
-    # 训练相关 - guide4.py: 化简流程确保梯度流，临时设置accumulation=1
-    batch_size: int = 8  # guide3.md: 降低为P×K=4×2，更容易凑齐正对
-    # guide9.md Step 2 & guide16.md: 采样器配置，确保K≥2但允许更宽松约束
-    num_ids_per_batch: int = 3      # P = 每个batch中的ID数量，guide16建议从4降到3
-    num_instances: int = 2          # K = 每个ID的实例数量，强制≥2
+    # 训练相关 - Fix20: 强制配对采样，确保SDM损失有效
+    # P×K结构：每个batch包含P个不同ID，每个ID有K个样本（≥2保证配对）
+    num_ids_per_batch: int = 3      # P = 每个batch中的ID数量
+    instances_per_id: int = 2       # K = 每个ID的实例数量，强制≥2
+    # batch_size自动计算为P×K，不再手动设置避免冲突
     
-    # guide18: 采样器配置（防止再早停）
+    # Fix20: 强化配对约束，确保每个ID至少1个vis + 1个nonvis
     allow_id_reuse: bool = True     # 允许同epoch内ID复用，防止采样耗尽
     sampling_fallback: bool = True  # 无法满足约束时是否回退到随机采样
-    min_modal_coverage: float = 0.6 # 跨模态覆盖率最低要求
-    instances_per_id: int = 2       # K - 每个ID的实例数量，与num_instances保持一致
+    min_modal_coverage: float = 0.8 # 提高跨模态覆盖率要求到0.8
+    force_modal_pairs: bool = True  # 强制每个ID包含vis+nonvis配对
     gradient_accumulation_steps: int = 1  # guide4.py: 临时化简为1，确保梯度流正常
     freeze_backbone: bool = True  # 冻结 CLIP 主干，只训练 LoRA 和特定模块
     num_epochs: int = 60   # 按清单推荐：总60epoch
