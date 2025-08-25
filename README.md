@@ -14,16 +14,19 @@
 ## 🔧 环境配置
 
 ### 1. 激活虚拟环境
+
 ```bash
 conda activate prvc
 ```
 
 ### 2. 安装依赖
+
 ```bash
 pip install -r requirements.txt
 ```
 
 ### 3. 主要依赖版本
+
 - `torch>=2.6.0`
 - `transformers>=4.20.0`
 - `timm>=0.6.0`
@@ -34,6 +37,7 @@ pip install -r requirements.txt
 ## 📊 数据集说明
 
 ### ORBench 五模态数据集
+
 - **规模**：1000个身份，总计152,297个样本
   - 45,113 RGB（画廊集）
   - 26,071 红外(IR)
@@ -44,7 +48,8 @@ pip install -r requirements.txt
 - **评测模式**：单模态(MM-1)、双模态(MM-2)、三模态(MM-3)、四模态(MM-4)
 
 ### 数据结构
-```
+
+```text
 data/
 ├── vis/          # 可见光图像
 ├── nir/          # 红外图像  
@@ -81,6 +86,7 @@ data/
 ### 1. 核心配置文件
 
 **`configs/config.py`** - 训练配置
+
 ```python
 # 模型配置
 clip_model_name = "openai/clip-vit-base-patch16"  # CLIP-B/16统一编码器
@@ -113,6 +119,7 @@ python train.py
 ## 📈 训练与评测
 
 ### 1. 数据采样策略
+
 ```python
 # datasets/dataset.py 中的核心采样器
 class ModalAwarePKBatchSampler_Strict:
@@ -122,6 +129,7 @@ class ModalAwarePKBatchSampler_Strict:
 ```
 
 ### 2. 模型前向流程
+
 ```python
 # models/model.py 中的前向传播
 def forward(self, images, texts, modality_masks):
@@ -191,7 +199,7 @@ python tools/evaluate.py --model_path checkpoints/best_model.pth
 
 ## 📁 代码结构
 
-```
+```text
 PRCV2025REID/
 ├── configs/
 │   └── config.py              # 统一训练配置
