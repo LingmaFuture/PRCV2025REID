@@ -2,7 +2,11 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.eval_cache/
 
+docs/
+fix/
+guide/
 tools/
 submissions
 # C extensions
