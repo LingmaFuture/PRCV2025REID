@@ -1407,23 +1407,25 @@ def train_multimodal_reid():
     val_labels = [pid2label[pid] for pid in val_ids]
     logging.info(f"训练集标签范围: {min(train_labels)}-{max(train_labels)}, 验证集标签范围: {min(val_labels)}-{max(val_labels)}")
 
-    # ==== batch size 统一定义（必须在首次使用前计算）====
+    # ==== Batch Size 统一配置 ====
     world_size = (torch.distributed.get_world_size() 
                   if torch.distributed.is_available() and torch.distributed.is_initialized() else 1)
     grad_accum_steps = getattr(config, "gradient_accumulation_steps", 4)
     
-    # Fix20: P×K结构强制计算batch_size，确保配对采样
-    P = getattr(config, "num_ids_per_batch", 3)     # P，每个batch的ID数
-    K = getattr(config, "instances_per_id", 2)      # K，每个ID的样本数
+    # P×K结构参数（统一从config获取，避免重复定义）
+    P = getattr(config, "num_ids_per_batch", 4)        # P: 每个batch的ID数
+    K = getattr(config, "instances_per_id", 2)         # K: 每个ID的样本数
+    K = max(2, K)  # 强制K>=2保证配对
     
-    # 强制约束检查
+    # 参数验证
     assert K >= 2, f"instances_per_id(K) 必须 ≥ 2，当前为 {K}，无法保证批内配对"
     assert P >= 2, f"num_ids_per_batch(P) 必须 ≥ 2，当前为 {P}"
     
-    actual_batch_size = P * K  # 强制P×K结构
-    effective_batch_size = actual_batch_size * grad_accum_steps * world_size  # 全局有效 batch
+    # 计算实际批次大小
+    actual_batch_size = P * K
+    effective_batch_size = actual_batch_size * grad_accum_steps * world_size
     
-    logging.info(f"Fix20 Batch size 配置: P×K={P}×{K}={actual_batch_size}, 累积步数={grad_accum_steps}, 等效={effective_batch_size}")
+    logging.info(f"Batch Size配置: P×K={P}×{K}={actual_batch_size}, 累积步数={grad_accum_steps}, 等效={effective_batch_size}")
     logging.info(f"强制配对约束: 每个ID必须≥2样本且包含vis+nonvis")
 
     # guide16.md: 在创建采样器前分析数据集采样能力
@@ -1433,13 +1435,6 @@ def train_multimodal_reid():
     dataset_stats = analyze_dataset_sampling_capability(train_dataset, min_k=2)
     print("="*50 + "\n")
 
-    # guide9.md Step 2: 训练 DataLoader（调整 P×K 以适应梯度累积）
-    # 一键把 K ≥ 2 保证"强配对"成立
-    P = getattr(config, "num_ids_per_batch", 4)
-    K = max(2, getattr(config, "num_instances", 2))  # 强制K>=2
-    num_instances = K
-    # 使用 micro batch size（单步实际处理的样本数）
-    
     # guide16.md: 检查采样参数是否合理
     if dataset_stats['pairable_ids'] < P:
         logging.error(f"可配对ID数({dataset_stats['pairable_ids']}) < 每批需要ID数({P})，"
@@ -1447,19 +1442,14 @@ def train_multimodal_reid():
     elif dataset_stats['estimated_max_batches'] < 100:
         logging.warning(f"估算最大batch数({dataset_stats['estimated_max_batches']})较少，"
                        f"可能导致epoch提前结束。建议调整P={P}, K={K}参数")
-    num_pids_per_batch = actual_batch_size // num_instances  # 调整后的P
-    logging.info(f"采样策略: P×K = {num_pids_per_batch}×{num_instances} = {actual_batch_size}")
-    logging.info(f"每个锚的正样本数: {num_instances-1}")
+    
+    logging.info(f"采样策略: P×K = {P}×{K} = {actual_batch_size}")
+    logging.info(f"每个锚的正样本数: {K-1}")
     
     # guide6.md: 使用强配对采样器
     require_modal_pairs = getattr(config, 'require_modal_pairs', True)
     modal_pair_retry_limit = getattr(config, 'modal_pair_retry_limit', 3)
     modal_pair_fallback_ratio = getattr(config, 'modal_pair_fallback_ratio', 0.3)
-    
-    # 关键参数校验
-    assert actual_batch_size % num_instances == 0, \
-        f"actual_batch_size({actual_batch_size}) 必须能被 num_instances({num_instances}) 整除"
-    P = actual_batch_size // num_instances  # 每个batch身份数
     
     if require_modal_pairs:
         logging.info(f"使用强配对采样器: ModalAwarePKSampler_Strict")
@@ -1467,7 +1457,7 @@ def train_multimodal_reid():
         logging.info(f"  软退路比例: {modal_pair_fallback_ratio}")
     else:
         logging.info(f"使用普通采样器: ModalAwarePKSampler")
-    logging.info(f"P×K结构: {P}×{num_instances} = {actual_batch_size}")
+    logging.info(f"最终P×K结构: {P}×{K} = {actual_batch_size}")
     
     # guide6.md: 使用强配对采样器和优化的DataLoader配置
     safe_batch_size = min(8, actual_batch_size)  # 小batch更稳定
@@ -1487,7 +1477,7 @@ def train_multimodal_reid():
     train_batch_sampler = ModalAwarePKBatchSampler_Strict(
         train_dataset,
         num_ids_per_batch=P,
-        num_instances=num_instances,
+        num_instances=K,
         allow_id_reuse=getattr(config, "allow_id_reuse", True),
         include_text=True,
         min_modal_coverage=getattr(config, "min_modal_coverage", 0.6)
