@@ -1,7 +1,6 @@
 # train.py
 import os
 import time
-import math
 import random
 import pickle
 import logging
@@ -14,20 +13,16 @@ import math  # 确保math被导入用于CE诊断
 from tqdm import tqdm
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR, MultiStepLR, LambdaLR, ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
 
-# 立刻止血：开启 TF32 加速
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
 # guide6.md: PyTorch警告处理
 try:
-    from torch.nn.attention import sdpa_kernel, SDPBackend
+    from torch.nn.attention import SDPBackend
     # 设置默认的SDPA后端，避免警告
     if hasattr(SDPBackend, 'flash_attention'):
         torch.nn.attention.SDPBackend.default = SDPBackend.flash_attention
@@ -142,23 +137,6 @@ def compute_cmc(query_features, gallery_features, query_labels, gallery_labels, 
         correct += (topk_labels == query_labels[i]).any().item()
     return correct / sim.size(0) if sim.size(0) > 0 else 0.0
 
-# ------------------------------
-# 划分
-# ------------------------------
-def split_train_dataset(dataset, val_ratio=0.2, seed=42):
-    person_ids = [dataset.data_list[i]['person_id'] for i in range(len(dataset))]
-    person_ids = sorted(list(set(person_ids)))
-    train_ids, val_ids = train_test_split(person_ids, test_size=val_ratio, random_state=seed)
-
-    train_indices, val_indices = [], []
-    for i, sample in enumerate(dataset.data_list):
-        if sample['person_id'] in train_ids:
-            train_indices.append(i)
-        else:
-            val_indices.append(i)
-
-
-    return train_indices, val_indices, train_ids, val_ids
 
 # ------------------------------
 # 赛制对齐数据构建
@@ -177,21 +155,6 @@ MODALITY_MAPPING = {
 def map_modality_name(old_name: str) -> str:
     """将数据集的模态名称映射到新架构的模态名称"""
     return MODALITY_MAPPING.get(old_name, old_name)
-
-
-def move_batch_to_device(batch, device):
-    """将batch数据移动到指定设备"""
-    def _move_to_device(obj):
-        if torch.is_tensor(obj):
-            return obj.to(device)
-        elif isinstance(obj, dict):
-            return {k: _move_to_device(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [_move_to_device(item) for item in obj]
-        else:
-            return obj
-    
-    return _move_to_device(batch)
 
 
 def convert_batch_for_clip_model(batch):
@@ -1382,11 +1345,6 @@ def _build_lambda_with_warmup_cosine(total_epochs, warmup_epochs, start_factor=0
     return lmbda
 
 def train_multimodal_reid():
-    # 启用TF32加速（A100/RTX30xx/40xx系列GPU）
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        logging.info("已启用TF32加速")
     
     # 配置与设备
     config = TrainingConfig()

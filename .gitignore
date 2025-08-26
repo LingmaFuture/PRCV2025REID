@@ -4,10 +4,16 @@ __pycache__/
 *$py.class
 .eval_cache/
 
+scripts/
+tests/
+debug/
+backup/
+
+
 docs/
 fix/
 guide/
-tools/
+test/
 submissions
 # C extensions
 *.so
