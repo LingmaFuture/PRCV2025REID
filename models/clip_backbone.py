@@ -5,9 +5,8 @@ CLIP-B/16统一编码器实现
 """
 import torch
 import torch.nn as nn
-from transformers import CLIPModel, CLIPTokenizer, CLIPConfig
-from typing import List, Optional, Dict, Union, Tuple
-import copy
+from transformers import CLIPModel, CLIPTokenizer
+from typing import List, Optional, Dict
 
 from .mer_lora import MERMultiheadAttention, MERMLP, MERLinear
 from .patch_embeds import MultiModalPatchEmbeds
@@ -149,7 +148,7 @@ class CLIPUnifiedEncoder(nn.Module):
     def __init__(
         self,
         clip_model_name: str = "openai/clip-vit-base-patch16",
-        modalities: List[str] = ['rgb', 'ir', 'cpencil', 'sketch', 'text'],
+        modalities: List[str] = ['vis', 'nir', 'cp', 'sk', 'text'],
         vision_hidden_dim: int = 768,
         text_hidden_dim: int = 512,
         fusion_dim: int = 512,
@@ -186,10 +185,10 @@ class CLIPUnifiedEncoder(nn.Module):
             self.clip_model.vision_model.embeddings.position_embedding.weight.clone()
         )
         
-        # CLS token (从CLIP vision encoder复制，添加batch和序列维度)
+        # CLS token (从CLIP vision encoder复制，添加batch和序列维度)  
         # class_embedding 原始形状: [768], 需要变成 [1, 1, 768] 用于expand
         self.cls_token = nn.Parameter(
-        self.clip_model.vision_model.embeddings.class_embedding.clone().unsqueeze(0).unsqueeze(0)  # [1, 1, 768]
+            self.clip_model.vision_model.embeddings.class_embedding.clone().unsqueeze(0).unsqueeze(0)  # [1, 1, 768]
         )
         
         # 视觉MER Transformer层
@@ -257,7 +256,7 @@ class CLIPUnifiedEncoder(nn.Module):
         视觉编码
         Args:
             images: [B, C, H, W] 图像tensor
-            modality: 视觉模态名 'rgb'|'ir'|'cpencil'|'sketch'
+            modality: 视觉模态名 'vis'|'nir'|'cp'|'sk'
         Returns:
             [B, fusion_dim] 视觉特征
         """
@@ -377,14 +376,14 @@ if __name__ == "__main__":
     encoder = CLIPUnifiedEncoder()
     
     # 测试视觉编码
-    rgb_images = torch.randn(2, 3, 224, 224)
-    ir_images = torch.randn(2, 1, 224, 224)
+    vis_images = torch.randn(2, 3, 224, 224)
+    nir_images = torch.randn(2, 1, 224, 224)
     
-    rgb_features = encoder.encode_vision(rgb_images, 'rgb')
-    ir_features = encoder.encode_vision(ir_images, 'ir')
+    vis_features = encoder.encode_vision(vis_images, 'vis')
+    nir_features = encoder.encode_vision(nir_images, 'nir')
     
-    print(f"RGB features shape: {rgb_features.shape}")  # [2, 512]
-    print(f"IR features shape: {ir_features.shape}")    # [2, 512]
+    print(f"vis features shape: {vis_features.shape}")  # [2, 512]
+    print(f"nir features shape: {nir_features.shape}")    # [2, 512]
     
     # 测试文本编码  
     texts = ["A person walking", "红外图像显示人体轮廓"]

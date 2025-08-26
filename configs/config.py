@@ -1,8 +1,7 @@
 # configs/config.py
 import os
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-import yaml
+from typing import List, Optional
 import torchvision.transforms as T
 
 @dataclass
@@ -29,8 +28,8 @@ class TrainingConfig:
     mer_lora_rank: int = 4          # MER LoRA秩r=4
     mer_lora_alpha: float = 1.0     # MER LoRA缩放因子
     
-    # 支持的模态列表（各自独立tokenizer + MER路由）
-    modalities: List[str] = field(default_factory=lambda: ['rgb', 'ir', 'cpencil', 'sketch', 'text'])
+    # 支持的模态列表（与dataset命名保持一致，各自独立tokenizer + MER路由）
+    modalities: List[str] = field(default_factory=lambda: ['vis', 'nir', 'sk', 'cp', 'text'])
     
     # 各模态tokenizer配置
     patch_size: int = 16            # patch大小（对齐CLIP-B/16）
@@ -48,44 +47,73 @@ class TrainingConfig:
     # num_classes 将在训练时根据实际训练集ID数量动态设置
     dropout_rate: float = 0.5  # 增强dropout
     
-    # 训练相关 - CLIP统一编码器微调超参数
-    batch_size: int = 32
-    num_epochs: int = 150
+    # 训练相关 - Fix20: 强制配对采样，确保SDM损失有效
+    # P×K结构：每个batch包含P个不同ID，每个ID有K个样本（≥2保证配对）
+    num_ids_per_batch: int = 3      # P = 每个batch中的ID数量
+    instances_per_id: int = 2       # K = 每个ID的实例数量，强制≥2
+    # batch_size自动计算为P×K，不再手动设置避免冲突
     
-    # 分层学习率设置（MER和tokenizer需要更大学习率）
-    base_learning_rate: float = 1e-5     # CLIP backbone基础学习率
-    mer_learning_rate: float = 5e-5      # MER LoRA学习率  
-    tokenizer_learning_rate: float = 5e-5 # 非共享tokenizer学习率
-    fusion_learning_rate: float = 5e-5    # 融合层学习率
+    # Fix20: 强化配对约束，确保每个ID至少1个vis + 1个nonvis
+    allow_id_reuse: bool = True     # 允许同epoch内ID复用，防止采样耗尽
+    sampling_fallback: bool = True  # 无法满足约束时是否回退到随机采样
+    min_modal_coverage: float = 0.8 # 提高跨模态覆盖率要求到0.8
+    force_modal_pairs: bool = True  # 强制每个ID包含vis+nonvis配对
+    gradient_accumulation_steps: int = 1  # guide4.py: 临时化简为1，确保梯度流正常
+    freeze_backbone: bool = True  # 冻结 CLIP 主干，只训练 LoRA 和特定模块
+    num_epochs: int = 60   # 按清单推荐：总60epoch
+    
+    # 分层学习率设置（保守配置，优先跑通）
+    base_learning_rate: float = 5e-6     # 降低CLIP学习率，更稳定
+    mer_learning_rate: float = 2e-5      # 降低MER学习率
+    tokenizer_learning_rate: float = 2e-5 # 降低tokenizer学习率  
+    fusion_learning_rate: float = 2e-5    # 降低融合层学习率
+    
+    # guide6.md: 分类头LR降档，防权重爆涨
+    head_learning_rate: float = 3e-3     # guide6.md: 从Epoch 2起把head LR调到3e-3
+    head_lr_warmup_epochs: int = 2       # guide6.md: 从Epoch 2开始降档
     
     weight_decay: float = 1e-4
-    warmup_epochs: int = 15
-    scheduler: str = "cosine"
+    warmup_epochs: int = 5      # 前5个epoch线性warmup
+    scheduler: str = "cosine"   # warmup后cosine衰减
     
     # 调度器与稳定性
     conservative_factor: float = 0.7
     adaptive_gradient_clip: bool = True
     stability_monitoring: bool = True
     
-    # 损失权重（SDM+ID分类组合损失）
+    # SDM损失权重配置（按文档要求）
     ce_weight: float = 1.0  # ID分类损失权重α=1.0（论文要求）
-    contrastive_weight: float = 0.1  # SDM对齐损失权重
     
-    # SDM相关配置
+    # SDM权重调度配置 - guide6.md: 从Epoch 2起启用SDM，起始权重0.1
+    sdm_weight_warmup_epochs: int = 1   # guide9.md: 修复边界，从Epoch 2起启用SDM
+    sdm_weight_schedule: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5])  # guide6.md: 渐进权重
+    sdm_weight_initial: float = 0.1     # guide6.md: 从0.1开始
+    sdm_weight_final: float = 0.5       # guide6.md: 最终0.5，保守稳定
+    sdm_weight_max: float = 0.5         # guide6.md: 最大权重限制在0.5
+    
+    # 当前使用的SDM权重（训练过程中动态调整）
+    contrastive_weight: float = 0.0     # 初始为0，按调度器调整
+    
+    # SDM相关配置（按文档要求）
     sdm_semantic_dim: int = 512  # SDM语义分离特征维度
     sdm_num_heads: int = 8       # SDM注意力头数
-    sdm_temperature: float = 0.1  # RGB锚定对齐温度参数
-    sdm_margin: float = 0.3      # 对齐损失边界参数
+    sdm_temperature: float = 0.2  # SDM损失温度参数（修复后稳定版本）
+    
+    # 温度参数配置（提高稳定性）- guide3.md推荐0.15-0.2
+    sdm_init_temperature: float = 0.18  # guide3.md推荐范围内的初始温度
+    sdm_final_temperature: float = 0.16 # guide3.md推荐范围内的稳定温度
+    sdm_fallback_temperature: float = 0.20  # guide3.md推荐范围内的回退温度
+    
+    # 可学习温度配置
+    sdm_learnable_temp: bool = True     # 使用可学习温度
+    sdm_temp_warmup_epochs: int = 3     # 温度调整的epoch数
     
     # 轻量特征混合器配置
     fusion_num_heads: int = 8     # 融合模块多头注意力头数
     fusion_mlp_ratio: float = 2.0  # 融合模块MLP扩展比例
     fusion_dropout: float = 0.1   # 融合模块dropout率
     
-    # 特征范数正则化参数（收紧范数控制，防大范数背答案）
-    feature_target_norm: float = 10.0    # 目标特征范数
-    feature_norm_band: float = 3.0       # 收紧容忍带宽
-    feature_norm_penalty: float = 2e-3   # 提高正则化权重
+    # 简化损失：移除特征范数正则化，只保留CE+SDM核心损失
     
     # 数据增强
     random_flip: bool = True
@@ -93,14 +121,30 @@ class TrainingConfig:
     color_jitter: bool = True
     random_erase: float = 0.3
     
-    # 模态dropout（降低以提高特征稳定性）
+    # 模态dropout（按优化清单热身期配置）
     modality_dropout: float = 0.15
+    modality_dropout_warmup_epochs: int = 3  # 前3个epoch关闭dropout等训练稳定
     min_modalities: int = 1
     
-    # 设备和并行
+    # guide6.md: 强配对采样器配置
+    require_modal_pairs: bool = True    # guide6.md: 立即开启强配对
+    modal_pair_retry_limit: int = 3     # guide6.md: 软退路重试次数
+    modal_pair_fallback_ratio: float = 0.3  # guide6.md: 软退路比例30%
+    
+    # guide6.md: 跨批记忆库配置
+    sdm_memory_steps: int = 6           # guide6.md: 缓存近N=4~8个step的RGB特征
+    sdm_memory_enabled: bool = True     # guide6.md: 启用跨批记忆库
+    
+    # guide6.md: 健康线监控配置
+    pair_coverage_target: float = 0.85  # guide6.md: pair_coverage_mavg目标≥0.85
+    pair_coverage_window: int = 100     # guide6.md: 滑窗100 step
+    
+    # 设备和并行（按guide6.md优化DataLoader）
     device: str = "cuda"
-    num_workers: int = 2
-    pin_memory: bool = True
+    num_workers: int = 2  # guide6.md: 适中的工作进程数
+    pin_memory: bool = True  # 开启内存锁定配合non_blocking加速传输
+    persistent_workers: bool = True  # guide6.md: 保持工作进程，避免重复创建
+    prefetch_factor: int = 2  # guide6.md: 预取因子，平衡内存和性能
     
     # 保存和日志
     save_dir: str = "./checkpoints"
@@ -109,9 +153,27 @@ class TrainingConfig:
     eval_freq: int = 15  # 与注释一致：每20轮评估一次
     eval_sample_ratio: float = 0.3  # 采样评估比例（mAP快速估算）
     
+    # guide13.md: 仅评测四单模态 + 四模态，跳过双/三模态组合
+    eval_include_patterns: List[str] = field(default_factory=lambda: [
+        "single/nir", "single/sk", "single/cp", "single/text", "quad/nir+sk+cp+text"
+    ])
+    
+    # guide13.md & guide15.md: 确保只在每个epoch结束评测，不在训练步骤中评测
+    eval_every_n_epoch: int = 1
+    eval_every_n_steps: int = 0  # 必须为0，禁用步数级评测
+    do_eval: bool = True  # 是否进行评测
+    eval_after_steps: Optional[int] = None  # 首轮体检步数阈值，设为None禁用
+    
+    # guide14.md: 评测特征缓存配置
+    eval_cache_dir: str = "./.eval_cache"
+    eval_cache_tag: str = "val_v1"  # 数据或预处理改了就换这个tag
+    
     # 验证和推理相关配置
-    inference_batch_size: int = 32
+    inference_batch_size: int = 8   # 推理批次与训练保持一致
     best_model_path: str = "./checkpoints/best_model.pth"
+    
+    # guide6.md: label smoothing配置
+    label_smoothing: float = 0.1    # guide6.md: 建议加label smoothing=0.1，更稳
     
     def __post_init__(self):
         """初始化配置后的处理"""

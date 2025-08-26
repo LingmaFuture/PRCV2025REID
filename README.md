@@ -1,194 +1,148 @@
-## PRCV2025 多模态行人重识别（CLIP + MER + SDM）
+## PRCV2025REID · 多模态人员重识别（CLIP + MER + SDM）
 
-一个面向竞赛与实际应用的多模态 ReID 框架：以 CLIP-B/16 作为统一编码器，结合 MER 模态路由 LoRA 与 SDM 语义分离对齐，统一学习 RGB/IR/Sketch/CPencil/Text 等模态的可检索表征；训练侧强调稳定性与一致性，评估侧严格对齐训练表征。
+### 项目概览
 
----
+PRCV2025REID 是一个面向多模态人员重识别（Re-ID）的训练/评测框架，统一支持 5 种模态：`vis / nir / sk / cp / text`。
 
-## 技术亮点（TL;DR）
+- 主干以 CLIP 统一编码器为核心（视觉/文本统一空间）
+- 引入 MER（Modality-Expert Router，LoRA 形式）进行模态路由/融合
+- 采用 SDM（Semantic Disentanglement Module）以 `vis` 为锚做跨模态语义对齐
+- 训练严格对齐评测协议：实例为“vis↔text 锚点” +（nir/sk/cp 身份级随机），批内 P×K 强配对
 
-- 统一编码器：共享 CLIP-B/16 backbone，继承大规模图文预训练的跨模态能力
-- 模态特异适配（MER）：在 Q/K/V 与 MLP 层插入 LoRA，按模态路由，参数高效且易扩展
-- 语义分离对齐（SDM）：RGB 锚定的跨模态对齐损失，训练时将各模态拉齐到统一语义空间
-- 掩码与占位：精确的模态掩码与可学习 null token，杜绝“零张量污染”融合
-- 轻量融合器：多头注意力 + MLP Mixer，原生支持模态缺失的加权融合
-- BNNeck 检索一致性：训练用的对齐损失与评估检索统一使用 bn_features
-- 稳定训练：对齐损失长周期 warmup、特征范数正则、AMP + 自适应梯度裁剪、TF32 加速
-- 赛制对齐评测：画廊固定 vis，查询组合多模态，mAP/CMC 一致评估
 
----
+### 核心特性
 
-## 架构总览
+- 同名模态映射：全项目统一使用 `vis / nir / sk / cp / text`，并兼容旧命名（rgb/ir/sketch/cpencil/txt）。
+- 实例构造与评测协议完全对齐：
+  - 固定成对：`vis ↔ text`
+  - 身份级池：`nir / sk / cp` 从同一身份池随机抽样（`sk/cp` 支持 `front/back/side` 视角均衡）
+- P×K 强配对采样器（Strict）：每个批次保证每个 ID 含 `vis + non-vis`，稳定触发跨模态对比。
+- 采样能力分析“从估算到精确”：以“多模态样本”为单位统计，精确计算可配对容量与 batch 上限。
+- 训练稳定性：混合精度（AMP/bfloat16）、梯度累积、余弦退火+热身、（可选）自适应梯度裁剪。
+- 工程修复：
+  - 统一并修复 `actual_batch_size = P×K` 逻辑
+  - 清理模态别名与冗余逻辑；`PatchEmbeds` 改为 `vis/nir/sk/cp`
+  - 采样统计/容量估算逻辑与采样器完全对齐
 
-数据（多模态） → 非共享 Tokenizer → CLIP 统一编码器（含 MER 路由） → 语义分离（SDM） → 轻量特征融合（掩码友好） → BNNeck → 分类头/检索特征
 
-- 统一编码器：`models/clip_backbone.py`（共享 ViT-B/16 主干，文本使用 CLIP 文本塔）
-- 多模态 Tokenizer：`models/patch_embeds.py`（RGB/IR/Sketch/CPencil 独立 PatchEmbed，自动 1↔3 通道适配）
-- MER 模态路由：`models/mer_lora.py`（按模态注入 LoRA 到 Q/K/V 与 MLP）
-- SDM 模块与损失：`models/model.py`（语义分离 + RGB 锚定对齐）
-- 特征融合器：`models/model.py`（Multi-Head Attention + MLP Mixer，带 key_padding_mask）
-- BNNeck + 线性分类器：`models/model.py`
+### 数据与实例（Instance）
 
-### 关键一致性原则
+- JSON 标注（`data/train/text_annos.json`）仅列出 `vis` 路径与对应 `caption`（文本），即：`vis ↔ text` 严格成对。
+- 对于同一 `person_id`：
+  - `nir / sk / cp` 与具体某帧 `vis` 并不逐帧对齐，只保证“同身份”。
+  - `sk / cp` 进一步按 `front/back/side` 视角组织，支持训练时视角均衡抽样。
 
-- 训练与评估统一以 BNNeck 后的 `bn_features` 作为检索表征，并在相似度计算前做 L2 归一化；保证与对齐损失的表征完全一致。
+一个训练 instance 的构成：
 
----
+- 固定：锚点 `vis`（来自 JSON 的该条目）+ 对应 `text`
+- 随机：从该 ID 的 `nir/sk/cp` 池中各随机抽 1 张（`sk/cp` 先选目标视角、无则回退）
 
-## 组件细节
 
-### 1) CLIP 统一编码器 + MER 路由（`models/clip_backbone.py`, `models/mer_lora.py`）
+### 训练流程
 
-- 使用 CLIP ViT-B/16 共享主干，视觉层按层引入 MER LoRA：
-  - 注入位置：自注意力的 Q/K/V、输出投影；FFN 的 FC1/FC2
-  - 每模态独立 LoRA 分支，`rank=4, alpha=1.0`，共享主干参数保持稳定
-- 文本通过 CLIP 文本编码器，是否冻结可配
+1) 读取配置（含 P、K、AMP、调度器、模态列表等）
 
-### 2) 多模态非共享 Tokenizer（`models/patch_embeds.py`）
+2) 数据集构建（`datasets/dataset.py`）：
+   - 从 JSON 的 `vis` 锚点扩展出多模态样本结构：
+     - `images['vis']` 只含锚点图；`nir` 为同 pid 下所有红外；`sk/cp` 按视角分组
+     - 生成 `modality_mask` 标记可用模态
+   - 智能采样（`__getitem__`）：
+     - `vis` 用锚点；`nir` 身份级随机；`sk/cp` 视角优先 + 回退；可启用模态 dropout
 
-- RGB/CPencil：3 通道；IR/Sketch：1 通道
-- 自动通道适配（如 1→3 使用 1×1 卷积适配）以对齐 CLIP ViT 输入
+3) 批采样（`datasets/dataset.py`）：
+   - `ModalAwarePKSampler_Strict` / `ModalAwarePKBatchSampler_Strict`
+   - 建立 `pid -> {vis, nonvis}` 索引，`strong_ids` 为两侧都存在的身份
+   - 每个 batch 选 P 个 ID，每 ID 取 `K//2 vis + K//2 nonvis`（短缺时回退/复用）
 
-### 3) 语义分离对齐 SDM（`models/model.py`）
+4) 前向（`models/model.py`）：
+   - CLIP 编码（视觉/文本） → MER（LoRA 路由/融合） → BN-Neck → 分类头
+   - 使用 `modality_mask` 仅对有效模态建模/计损
 
-- 多头注意力进行语义分离，线性投影至统一语义维度（默认 512）
-- RGB 锚定对齐损失：对每个非 RGB 模态与 RGB 建立对比约束（温度/边距可配）
+5) 损失：
+   - ID 分类（CE）+ SDM 跨模态对齐（以 `vis` 为锚）
 
-### 4) 掩码友好特征融合器（`models/model.py`）
+6) 训练细节：
+   - AMP（`bfloat16` 推荐）、梯度累积、Warmup+Cosine 调度
 
-- 堆叠多模态特征后以 Multi-Head Attention + MLP Mixer 融合
-- 支持 `key_padding_mask`，并在输出侧做带掩码的加权平均，天然适配“缺模态”
+7) 评测/保存：
+   - 对齐 MM-2/3/4 协议生成查询组；导出指标与权重
 
-### 5) BNNeck + 线性分类器（`models/model.py`）
 
-- BNNeck 输出 `bn_features`（检索向量），Dropout 后接线性分类器
-- 训练损失与评估检索均基于 `bn_features`，强化一致性
+### 模型架构
 
----
+- CLIP 统一编码器（视觉/文本共享表征空间）
+- 非共享 PatchEmbeds：`vis/nir/sk/cp` 独立 patch 投影（`models/patch_embeds.py`）
+- MER（Modality-Expert Router, LoRA）：按模态进行轻量路由与融合
+- BN-Neck + 线性分类头（多类 ID 分类）
+- SDM：以 `vis` 为锚的跨模态语义对齐损失，提升跨模态检索一致性
 
-## 训练流程（`train.py`）
 
-### 数据与采样
+### 关键配置
 
-- 数据根目录与标注：`configs/config.py`
-  - `data_root=./data/train`，图像目录：`vis/`, `nir/`, `sk/`, `cp/`
-  - `json_file=./data/train/text_annos.json`（字段：`file_path`, `caption`）
-- 数据集实现：`datasets/dataset.py`
-  - 构建样本清单与模态路径缓存，训练增强/验证变换分离
-  - 返回：`images`、`text_description`、`modality_mask`（按样本与模态精确标注可用性）
-- 采样器：`BalancedBatchSampler`（P×K）
-  - 默认 `batch_size=32, K=4 → P=8`，为对比目标提供稳定的正样本数
+```python
+# configs/config.py（节选）
+modalities = ['vis', 'nir', 'sk', 'cp', 'text']
 
-### 前向与掩码/占位机制
+# 采样结构（P×K）
+num_ids_per_batch = 4   # P：每个 batch 的身份数（≥3 建议）
+instances_per_id = 2    # K：每个身份的实例数（≥2，强配对至少需要 2）
 
-- 批处理转模型输入：`convert_batch_for_clip_model`
-  - 按 `modality_mask` 过滤无效模态；文本无效位置以空字符串占位
-- 缺失模态用“可学习 null token”占位，类型/精度与有效特征对齐，避免零张量污染
-- 融合器使用 `key_padding_mask` 忽略无效模态，输出侧再做掩码加权平均
+# 训练稳定性
+gradient_accumulation_steps = 2
+amp_dtype = "bfloat16"  # 或 autocast 默认 fp16
+```
 
-### 损失与正则
 
-- 总损失 = `CE（ID 分类）` + `λ · SDM 对齐` + `特征范数正则`
-  - SDM 对齐：以 `bn_features` 作为对齐特征
-  - 特征范数正则：目标范数≈10，带容忍带宽（防止“靠放大范数取巧”）
+### 快速开始
 
-### 训练稳定性与调度
-
-- 对齐损失权重长周期 warmup：前 5 个 epoch 关闭，6→25 线性升温，再恒定
-- AMP + GradScaler（CUDA 自动开启），开启 TF32；自适应梯度裁剪（分位数阈）
-- 学习率策略（可选）：warmup+cosine（默认）/ step / multistep / plateau
-- 分层学习率：
-  - CLIP backbone：1e-5（低学习率，保留预训练能力）
-  - MER/Tokenizer/Projections/其他模块：5e-5（更快适配新模态/任务）
-
-### 日志与监控
-
-- 记录总损失/CE/SDM/特征范数/梯度范数/异常 spike 次数
-- 训练前期打印每 batch 的 ID 组成与 K 值，便于检查 P×K 采样是否生效
-
----
-
-## 评估流程（赛制对齐）
-
-- 画廊（Gallery）：只使用 `vis` 模态
-- 查询（Query）：在 `nir/sk/cp/text` 上构造单/双/三/四模态组合（脚本已内置）
-- 特征提取：严格使用 `bn_features` 并做 L2 归一化；相似度 = 余弦相似度（内积）
-- 指标：`mAP@100`、`CMC@1/5/10`，并输出各单模态 mAP 便于定位“短板模态”
-
----
-
-## 快速开始（Windows/PowerShell）
-
-### 准备环境
-
-```powershell
+```bash
+# 1) 激活环境
 conda activate prvc
-pip install -r requirements.txt
-```
 
-### 数据准备
-
-目录结构示意：
-
-```
-data/train/
-  ├─ vis/0001/*.jpg  ─┐
-  ├─ nir/0001/*.jpg  ─┤ 可选，不同身份以四位目录名区分（0001、0002、…）
-  ├─ sk/0001/*.jpg   ─┤
-  └─ cp/0001/*.jpg   ─┘
-  └─ text_annos.json   # [{"file_path": "vis/0001/xxx.jpg", "caption": "…"}, ...]
-```
-
-### 训练
-
-```powershell
+# 2) 训练（默认配置）
 python train.py
+
+# 3) 评测（多模态协议）
+python tools/eval_mm_protocol.py
+
+# 4) 生成提交
+python tools/generate_submission.py
 ```
 
-如需调整超参，编辑 `configs/config.py`（如学习率、调度器、对齐损失权重、评估频率等）。
 
----
+### 工程结构
 
-## 关键配置（`configs/config.py`，部分）
+- 训练入口：`train.py`
+- 配置：`configs/config.py`
+- 数据集/采样器：`datasets/dataset.py`
+- 模型：`models/model.py`
+- PatchEmbeds：`models/patch_embeds.py`
+- 评测工具：`tools/eval_mm_protocol.py`
+- 数据划分与验证：`tools/split.py`
 
-- 模型/模态：`clip_model_name`, `modalities`, `fusion_dim`, `vision_hidden_dim`
-- MER：`enable_mer`, `mer_lora_rank`, `mer_lora_alpha`
-- SDM：`sdm_semantic_dim`, `sdm_temperature`, `sdm_margin`, `contrastive_weight`
-- 融合器：`fusion_num_heads`, `fusion_mlp_ratio`, `fusion_dropout`
-- 正则：`feature_target_norm`, `feature_norm_band`, `feature_norm_penalty`
-- 训练：`num_epochs`, `batch_size`, `scheduler`, `warmup_epochs`, `weight_decay`
-- 数据增强：`random_erase`, `color_jitter`
-- 模态 dropout：`modality_dropout`, `min_modalities`
 
----
+### 常见问题（FAQ）
 
-## 目录结构
+- Q：实例（instance）是什么？
+  - A：一次训练输入的“多模态样本组”。固定为 `vis↔text` 锚点，`nir/sk/cp` 从身份池随机抽取 1 张。
 
-```
-PRCV2025REID/
-├─ configs/
-│  └─ config.py
-├─ datasets/
-│  └─ dataset.py
-├─ models/
-│  ├─ clip_backbone.py
-│  ├─ mer_lora.py
-│  ├─ patch_embeds.py
-│  └─ model.py
-├─ tools/
-├─ docs/
-│  ├─ CLIP_MER_Architecture.md
-│  └─ 评估指标说明.md 等
-└─ train.py
-```
+- Q：为什么需要 P×K 强配对？
+  - A：确保每个 batch 中每个身份同时包含 `vis` 与 `non-vis`，稳定触发跨模态对齐与对比学习。
 
----
+- Q：`modality_mask` 的作用？
+  - A：前向/损失仅对有效模态参与；被 dropout 或缺失的模态不计损，保障鲁棒性。
 
-## 常见问题（FAQ）
 
-- 评估结果波动大？
-  - 检查是否严格使用 `bn_features` 做检索；对齐损失是否已过 warmup；P×K 是否满足每类≥4
-- 某模态 mAP 偏低？
-  - 查看日志中的单模态 mAP；适当提高 MER/Tokenizer 学习率或延长训练轮次
-- 训练不稳定或损失 spike 频繁？
-  - 降低学习率、开启/加强自适应梯度裁剪、减小 `modality_dropout`、检查特征范数是否过大
+### 版本修复要点
+
+- 统一模态命名与映射；删除冗余/冲突逻辑
+- 修复 `actual_batch_size = P×K` 与相关计算链路
+- 采样统计从“模态实例”改为“多模态样本”，容量估算与采样器严格对齐
+- `PatchEmbeds`、`Model`、`Config` 全面切换至 `vis/nir/sk/cp/text`
+
+
+### 致谢
+
+感谢相关论文与开源实现为本项目提供的灵感与基础。若使用本项目，请在论文或报告中注明来源。
+
 

@@ -2,8 +2,18 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.eval_cache/
 
-tools/
+scripts/
+tests/
+debug/
+backup/
+
+
+docs/
+fix/
+guide/
+test/
 submissions
 # C extensions
 *.so
