@@ -12,7 +12,7 @@ PRCV2025REID 是一个面向多模态人员重识别（Re-ID）的训练/评测�
 
 ### 核心特性
 
-- 同名模态映射：全项目统一使用 `vis / nir / sk / cp / text`，并兼容旧命名（rgb/ir/sketch/cpencil/txt）。
+- 同名模态映射：全项目统一使用 `vis / nir / sk / cp / text`。
 - 实例构造与评测协议完全对齐：
   - 固定成对：`vis ↔ text`
   - 身份级池：`nir / sk / cp` 从同一身份池随机抽样（`sk/cp` 支持 `front/back/side` 视角均衡）
