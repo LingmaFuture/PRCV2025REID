@@ -145,11 +145,19 @@ MODALITIES = ['vis', 'nir', 'sk', 'cp', 'text']
 
 # 模态名称映射：兼容新CLIP+MER架构
 MODALITY_MAPPING = {
-    'vis': 'rgb',      # 可见光 -> RGB
-    'nir': 'ir',       # 近红外 -> IR
-    'sk': 'sketch',    # 素描 -> sketch
-    'cp': 'cpencil',   # 彩铅 -> cpencil
-    'text': 'text'     # 文本保持不变
+    # 统一使用dataset原生命名 - 恒等映射，消除命名转换
+    'vis': 'vis',       # 可见光保持原名
+    'nir': 'nir',       # 近红外保持原名  
+    'sk': 'sk',         # 素描保持原名
+    'cp': 'cp',         # 彩铅保持原名
+    'text': 'text',     # 文本保持原名
+    
+    # 向后兼容映射（支持旧版本模态名）
+    'rgb': 'vis',       # 旧版本RGB -> vis
+    'ir': 'nir',        # 旧版本ir -> nir  
+    'sketch': 'sk',     # 旧版本sketch -> sk
+    'cpencil': 'cp',    # 旧版本cpencil -> cp
+    'txt': 'text'       # 文本简写
 }
 
 def map_modality_name(old_name: str) -> str:
@@ -722,14 +730,8 @@ def validate_competition_style(model, gallery_loader, query_loaders, device, k_m
         'cmc1': cmc1, 'cmc5': cmc5, 'cmc10': cmc10
     }
 
-# guide10.md: 模态名归一化和健壮提取工具
-MOD_MAP = {
-    'vis':'rgb','rgb':'rgb',
-    'nir':'ir','ir':'ir',
-    'sk':'sketch','sketch':'sketch',
-    'cp':'cp','cpencil':'cp',
-    'txt':'text','text':'text'
-}
+# guide10.md: 统一模态名映射工具 - 使用MODALITY_MAPPING
+# ID到模态映射（用于支持数字模态ID）
 ID2MOD = {0:'rgb', 1:'ir', 2:'cp', 3:'sketch', 4:'text'}
 
 def _extract_modalities_from_batch(batch):
@@ -765,8 +767,8 @@ def _extract_modalities_from_batch(batch):
         else:
             raw = list(raw)
 
-    # 归一化到标准模态名
-    mods = [MOD_MAP.get(str(x).lower(), str(x).lower()) for x in raw]
+    # 归一化到标准模态名 - 使用统一的MODALITY_MAPPING
+    mods = [map_modality_name(str(x).lower()) for x in raw]
     return mods
 
 # ------------------------------

@@ -288,23 +288,3 @@ class MERMLP(nn.Module):
         self.fc1.load_pretrained_weights(fc1_weight, fc1_bias)
         self.fc2.load_pretrained_weights(fc2_weight, fc2_bias)
 
-
-if __name__ == "__main__":
-    # 简单测试
-    modalities = ['rgb', 'ir', 'cpencil', 'sketch', 'text']
-    
-    # 测试MER线性层
-    mer_linear = MERLinear(768, 512, modalities, lora_rank=4)
-    x = torch.randn(4, 196, 768)
-    out_rgb = mer_linear(x, 'rgb')
-    out_ir = mer_linear(x, 'ir')
-    
-    print(f"MER Linear - RGB output shape: {out_rgb.shape}")
-    print(f"MER Linear - IR output shape: {out_ir.shape}")
-    
-    # 测试MER注意力
-    mer_attn = MERMultiheadAttention(768, 12, modalities, lora_rank=4)
-    attn_out = mer_attn(x, x, x, 'rgb')
-    print(f"MER Attention output shape: {attn_out.shape}")
-    
-    print("✅ MER模态路由LoRA测试通过！")

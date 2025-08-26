@@ -99,24 +99,24 @@ class RGBAnchoredAlignmentLoss(nn.Module):
         Returns:
             对齐损失
         """
-        if 'rgb' not in modality_features:
+        if 'vis' not in modality_features:
             return torch.tensor(0.0, device=fused_features.device, requires_grad=True)
         
-        rgb_features = modality_features['rgb']  # [B, D] RGB目标特征
+        vis_features = modality_features['vis']  # [B, D] 可见光目标特征
         total_loss = torch.tensor(0.0, device=fused_features.device, requires_grad=True)
         num_modalities = 0
         
-        # 计算每个非RGB模态与RGB的对齐损失
+        # 计算每个非可见光模态与可见光的对齐损失
         for modality, features in modality_features.items():
-            if modality == 'rgb':
+            if modality == 'vis':
                 continue
                 
             # 归一化特征以稳定相似度计算
             features_norm = F.normalize(features, p=2, dim=1)
-            rgb_features_norm = F.normalize(rgb_features, p=2, dim=1)
+            vis_features_norm = F.normalize(vis_features, p=2, dim=1)
             
             # 对比损失：相同ID拉近，不同ID推远
-            sim_matrix = torch.matmul(features_norm, rgb_features_norm.T) / self.temperature
+            sim_matrix = torch.matmul(features_norm, vis_features_norm.T) / self.temperature
             
             # 构建正负样本掩码
             batch_size = features.shape[0]
@@ -166,14 +166,14 @@ class SDMContrastiveLoss(nn.Module):
     
     def __init__(self, temperature: float = 0.1, margin: float = 0.3, alpha: float = 1.0):
         super().__init__()
-        self.rgb_alignment = RGBAnchoredAlignmentLoss(temperature, margin, alpha)
+        self.vis_alignment = RGBAnchoredAlignmentLoss(temperature, margin, alpha)  # 保持类名兼容性
         
     def forward(self, 
                 modality_features: Dict[str, torch.Tensor],
                 fused_features: torch.Tensor,
                 labels: torch.Tensor) -> torch.Tensor:
         """计算SDM对比损失"""
-        alignment_loss = self.rgb_alignment(modality_features, fused_features, labels)
+        alignment_loss = self.vis_alignment(modality_features, fused_features, labels)
         return alignment_loss
 
 
@@ -346,7 +346,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             self.sdm_memory = None
         
         # 模态配置
-        self.modalities = getattr(config, 'modalities', ['rgb', 'ir', 'cpencil', 'sketch', 'text'])
+        self.modalities = getattr(config, 'modalities', ['vis', 'nir', 'sk', 'cp', 'text'])
         self.vision_modalities = [m for m in self.modalities if m != 'text']
         
         # 特征维度配置
@@ -465,10 +465,8 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                     if modality_masks is not None:
                         # 需要从原始模态名映射回来
                         original_modality = None
-                        for orig, new in [('vis', 'rgb'), ('nir', 'ir'), ('sk', 'sketch'), ('cp', 'cpencil')]:
-                            if new == modality:
-                                original_modality = orig
-                                break
+                        # 同名映射：模态名直接对应，无需转换
+                        original_modality = modality
                         if original_modality and original_modality in modality_masks:
                             mask = modality_masks[original_modality]  # [B]
                     
@@ -554,11 +552,11 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                 original_modality_features = modality_features.copy()
                 original_feature_masks = feature_masks.copy()
                 
-                # 永不drop 'rgb'，优先保留主模态
+                # 永不drop 'vis'，优先保留主模态
                 keep_modalities = []
                 keep_masks = []
                 for mod, feat in modality_features.items():
-                    if mod == 'rgb' or torch.rand(1).item() > modality_dropout:
+                    if mod == 'vis' or torch.rand(1).item() > modality_dropout:
                         keep_modalities.append((mod, feat))
                         keep_masks.append((mod, feature_masks[mod]))
                 
@@ -615,18 +613,18 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         
         # guide6.md: 跨批记忆库更新（在compute_loss中处理，这里只缓存特征）
         if self.sdm_memory is not None and self.training:
-            # 缓存当前batch的RGB特征（标签在compute_loss中处理）
-            rgb_features = raw_modality_features.get('rgb', None)
-            rgb_mask = feature_masks.get('rgb', None)
+            # 缓存当前batch的vis特征（标签在compute_loss中处理）
+            vis_features = raw_modality_features.get('vis', None)
+            vis_mask = feature_masks.get('vis', None)
             
-            if rgb_features is not None and rgb_mask is not None:
-                # 找到有效的RGB样本
-                rgb_valid_idx = (rgb_mask > 0).squeeze(-1) if rgb_mask.dim() > 1 else (rgb_mask > 0)
+            if vis_features is not None and vis_mask is not None:
+                # 找到有效的vis样本
+                vis_valid_idx = (vis_mask > 0).squeeze(-1) if vis_mask.dim() > 1 else (vis_mask > 0)
                 
-                if rgb_valid_idx.sum() > 0:
-                    # 缓存有效的RGB特征（标签在compute_loss中处理）
-                    rgb_valid_feat = rgb_features[rgb_valid_idx].detach()
-                    self.sdm_memory.append((rgb_valid_feat, rgb_valid_idx))
+                if vis_valid_idx.sum() > 0:
+                    # 缓存有效的vis特征（标签在compute_loss中处理）
+                    vis_valid_feat = vis_features[vis_valid_idx].detach()
+                    self.sdm_memory.append((vis_valid_feat, vis_valid_idx))
         
         return outputs
     
@@ -680,27 +678,27 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
             
             # 使用fp32计算SDM损失，避免半精度下的数值不稳定  
             with torch.amp.autocast('cuda', enabled=False):
-                rgb_features = raw_modality_features.get('rgb', None)
-                rgb_mask = feature_masks.get('rgb', None)
+                vis_features = raw_modality_features.get('vis', None)
+                vis_mask = feature_masks.get('vis', None)
             
-            if rgb_features is None or rgb_mask is None:
-                # 回退：如果没有RGB特征或mask，跳过SDM对齐
+            if vis_features is None or vis_mask is None:
+                # 回退：如果没有vis特征或mask，跳过SDM对齐
                 sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
             else:
-                # 找到有效的RGB样本索引
-                rgb_valid_idx = (rgb_mask > 0).squeeze(-1) if rgb_mask.dim() > 1 else (rgb_mask > 0)
+                # 找到有效的vis样本索引
+                vis_valid_idx = (vis_mask > 0).squeeze(-1) if vis_mask.dim() > 1 else (vis_mask > 0)
                 
-                if rgb_valid_idx.sum() == 0:
-                    # 没有有效RGB样本，跳过对齐
+                if vis_valid_idx.sum() == 0:
+                    # 没有有效vis样本，跳过对齐
                     sdm_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
                 else:
-                    # 过滤出有效的RGB特征和标签
-                    rgb_valid_feat = rgb_features[rgb_valid_idx]
-                    rgb_valid_labels = labels[rgb_valid_idx]
+                    # 过滤出有效的vis特征和标签
+                    vis_valid_feat = vis_features[vis_valid_idx]
+                    vis_valid_labels = labels[vis_valid_idx]
                     
                     # guide6.md: 使用跨批记忆库兜底
                     if self.sdm_memory is not None and len(self.sdm_memory) > 0:
-                        # 从记忆库中获取历史RGB特征和标签
+                        # 从记忆库中获取历史vis特征和标签
                         mem_feats = []
                         mem_labels = []
                         for mem_feat, mem_label in self.sdm_memory:
@@ -708,18 +706,18 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                             mem_labels.append(mem_label)
                         
                         if mem_feats:
-                            # 合并当前batch和记忆库的RGB特征
+                            # 合并当前batch和记忆库的vis特征
                             mem_feats_cat = torch.cat(mem_feats, dim=0)
                             mem_labels_cat = torch.cat(mem_labels, dim=0)
                             
-                            # 扩展当前batch的RGB特征和标签
-                            rgb_valid_feat = torch.cat([rgb_valid_feat, mem_feats_cat], dim=0)
-                            rgb_valid_labels = torch.cat([rgb_valid_labels, mem_labels_cat], dim=0)
+                            # 扩展当前batch的vis特征和标签
+                            vis_valid_feat = torch.cat([vis_valid_feat, mem_feats_cat], dim=0)
+                            vis_valid_labels = torch.cat([vis_valid_labels, mem_labels_cat], dim=0)
                     
                     sdm_losses = []
-                    # 对每个非RGB模态与有效RGB做SDM对齐
+                    # 对每个非vis模态与有效vis做SDM对齐
                     for mod_name, mod_feat in raw_modality_features.items():
-                        if mod_name == 'rgb':
+                        if mod_name == 'vis':
                             continue
                             
                         mod_mask = feature_masks.get(mod_name, None)
@@ -737,17 +735,17 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                         mod_valid_labels = labels[mod_valid_idx]
                         
                         # 构造有效样本间的同身份指示矩阵
-                        y = (mod_valid_labels.view(-1, 1) == rgb_valid_labels.view(1, -1)).float()
+                        y = (mod_valid_labels.view(-1, 1) == vis_valid_labels.view(1, -1)).float()
                         
-                        # ❸ 轻兜底：检查该模态与RGB是否有正对
+                        # ❸ 轻兜底：检查该模态与vis是否有正对
                         if y.numel() == 0 or y.sum() == 0:
                             if self.training:
                                 # 只在训练时警告，推理时静默跳过
-                                logger.debug(f"SDM: {mod_name}↔RGB无正对，跳过该模态对齐")
+                                logger.debug(f"SDM: {mod_name}↔vis无正对，跳过该模态对齐")
                             continue  # 跳过这个模态，不加入sdm_losses
                         
-                        # 模态特征 -> RGB特征的SDM对齐（天然非负）
-                        L = sdm_loss_stable(mod_valid_feat, rgb_valid_feat, y, 
+                        # 模态特征 -> vis特征的SDM对齐（天然非负）
+                        L = sdm_loss_stable(mod_valid_feat, vis_valid_feat, y, 
                                           tau=self.sdm_temperature)
                         if torch.isfinite(L):
                             sdm_losses.append(L)
@@ -878,7 +876,7 @@ if __name__ == "__main__":
     
     @dataclass
     class TestConfig:
-        modalities = ['rgb', 'ir', 'cpencil', 'sketch', 'text']
+        modalities = ['vis', 'nir', 'sk', 'cp', 'text']
         fusion_dim = 512
         vision_hidden_dim = 768
         clip_model_name = 'openai/clip-vit-base-patch16'
@@ -892,8 +890,8 @@ if __name__ == "__main__":
     
     # 测试前向传播
     images = {
-        'rgb': torch.randn(2, 3, 224, 224),
-        'ir': torch.randn(2, 1, 224, 224)
+        'vis': torch.randn(2, 3, 224, 224),
+        'nir': torch.randn(2, 1, 224, 224)
     }
     texts = ["A person walking", "红外图像中的行人"]
     

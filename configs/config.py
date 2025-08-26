@@ -1,8 +1,7 @@
 # configs/config.py
 import os
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-import yaml
+from typing import List, Optional
 import torchvision.transforms as T
 
 @dataclass
@@ -29,8 +28,8 @@ class TrainingConfig:
     mer_lora_rank: int = 4          # MER LoRA秩r=4
     mer_lora_alpha: float = 1.0     # MER LoRA缩放因子
     
-    # 支持的模态列表（各自独立tokenizer + MER路由）
-    modalities: List[str] = field(default_factory=lambda: ['rgb', 'ir', 'cpencil', 'sketch', 'text'])
+    # 支持的模态列表（与dataset命名保持一致，各自独立tokenizer + MER路由）
+    modalities: List[str] = field(default_factory=lambda: ['vis', 'nir', 'sk', 'cp', 'text'])
     
     # 各模态tokenizer配置
     patch_size: int = 16            # patch大小（对齐CLIP-B/16）
