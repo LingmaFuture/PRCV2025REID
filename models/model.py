@@ -18,7 +18,7 @@ from .clip_backbone import CLIPUnifiedEncoder
 # 导入原有的SDM和损失函数组件
 class SemanticDisentanglementModule(nn.Module):
     """
-    语义分离模块：将各模态特征投影到语义空间，便于与RGB对齐
+    语义分离模块：将各模态特征投影到语义空间，便于与vis对齐
     保持原有实现，与新架构兼容
     """
     def __init__(self, input_dim: int = 512, semantic_dim: int = 512, num_heads: int = 8):
@@ -78,7 +78,7 @@ class SemanticDisentanglementModule(nn.Module):
 
 
 class RGBAnchoredAlignmentLoss(nn.Module):
-    """RGB锚定对齐损失：推动所有查询模态对齐到RGB目标表征"""
+    """vis锚定对齐损失：推动所有查询模态对齐到vis目标表征"""
     
     def __init__(self, temperature: float = 0.1, margin: float = 0.3, alpha: float = 1.0):
         super().__init__()
@@ -91,7 +91,7 @@ class RGBAnchoredAlignmentLoss(nn.Module):
                 fused_features: torch.Tensor,
                 labels: torch.Tensor) -> torch.Tensor:
         """
-        计算RGB锚定对齐损失
+        计算vis锚定对齐损失
         Args:
             modality_features: 各模态原始特征字典
             fused_features: 融合后特征
@@ -162,7 +162,7 @@ class RGBAnchoredAlignmentLoss(nn.Module):
 
 
 class SDMContrastiveLoss(nn.Module):
-    """SDM对比损失：结合语义分离和RGB锚定对齐"""
+    """SDM对比损失：结合语义分离和vis锚定对齐"""
     
     def __init__(self, temperature: float = 0.1, margin: float = 0.3, alpha: float = 1.0):
         super().__init__()

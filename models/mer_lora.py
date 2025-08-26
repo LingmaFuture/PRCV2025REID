@@ -6,7 +6,7 @@ MER (Modality-Expert Router) 模态路由LoRA适配器实现
 import torch
 import torch.nn as nn
 import math
-from typing import List, Dict, Optional, Union
+from typing import List, Optional
 
 
 class LoRAAdapter(nn.Module):

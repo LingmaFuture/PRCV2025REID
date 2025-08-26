@@ -154,7 +154,7 @@ class SDMLoss(nn.Module):
     SDM (Similarity Distribution Matching) 损失函数
     
     计算查询特征与图库特征之间的分布匹配损失
-    支持多模态查询特征与RGB图库特征的匹配
+    支持多模态查询特征与vis图库特征的匹配
     """
     
     def __init__(self, temperature=0.2, eps=1e-6):
@@ -173,7 +173,7 @@ class SDMLoss(nn.Module):
         
         Args:
             qry_features (torch.Tensor): 查询特征 [N, D] - 任意模态或多模态融合
-            gal_features (torch.Tensor): 图库特征 [M, D] - RGB特征
+            gal_features (torch.Tensor): 图库特征 [M, D] - vis特征
             qry_labels (torch.Tensor): 查询样本的身份ID [N]
             gal_labels (torch.Tensor, optional): 图库样本的身份ID [M]，None时使用qry_labels
             return_details (bool): 是否返回详细信息

@@ -4,7 +4,6 @@ SDM权重和温度调度器
 实现文档中推荐的"热身→放量"策略
 """
 
-import math
 import logging
 
 

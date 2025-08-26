@@ -368,33 +368,79 @@ class MultiModalDataset(Dataset):
             else:
                 continue
                 
-            # === 各模态路径收集 ===
-            images = {'vis': [], 'nir': [], 'sk': [], 'cp': []}
+            # === 各模态路径收集（官方评测对齐策略）===
+            images = {'vis': [], 'nir': [], 'sk': {'front': [], 'back': [], 'side': []}, 'cp': {'front': [], 'back': [], 'side': []}}
             
-            # VIS: 直接来自file_path
+            # VIS: 直接来自file_path（与Text成对）
             vis_full_path = os.path.join(self.config.data_root, file_path)
             if os.path.exists(vis_full_path):
                 images['vis'].append(vis_full_path)
             
-            # NIR/SK/CP: 根据PID检索同身份目录下的所有图像
-            for mod in ['nir', 'sk', 'cp']:
+            # NIR: 同身份级别，保持随机组合能力
+            nir_dir = os.path.join(self.config.data_root, 'nir', pid_str)
+            if os.path.isdir(nir_dir):
+                import glob
+                imgs = glob.glob(os.path.join(nir_dir, "*.jpg"))
+                imgs.extend(glob.glob(os.path.join(nir_dir, "*.jpeg")))
+                imgs.extend(glob.glob(os.path.join(nir_dir, "*.png")))
+                images['nir'].extend(imgs)
+            
+            # CP/SK: 按视角组织，支持视角对齐
+            for mod in ['sk', 'cp']:
                 mod_dir = os.path.join(self.config.data_root, mod, pid_str)
                 if os.path.isdir(mod_dir):
                     import glob
-                    imgs = glob.glob(os.path.join(mod_dir, "*.jpg"))
-                    imgs.extend(glob.glob(os.path.join(mod_dir, "*.jpeg")))
-                    imgs.extend(glob.glob(os.path.join(mod_dir, "*.png")))
-                    images[mod].extend(imgs)
+                    all_imgs = glob.glob(os.path.join(mod_dir, "*.jpg"))
+                    all_imgs.extend(glob.glob(os.path.join(mod_dir, "*.jpeg")))
+                    all_imgs.extend(glob.glob(os.path.join(mod_dir, "*.png")))
+                    
+                    # 按视角分组
+                    for img_path in all_imgs:
+                        img_name = os.path.basename(img_path)
+                        if '_front_' in img_name:
+                            images[mod]['front'].append(img_path)
+                        elif '_back_' in img_name:
+                            images[mod]['back'].append(img_path)
+                        elif '_side_' in img_name:
+                            images[mod]['side'].append(img_path)
+                        else:
+                            # 兜底：未知视角归入front
+                            images[mod]['front'].append(img_path)
             
-            # === 构建样本结构 ===
+            # === 构建样本结构（支持视角对齐）===
+            # 计算模态可用性（扁平化视角信息用于兼容性）
+            images_flat = {}
+            modality_mask = {}
+            
+            # VIS和NIR保持列表结构
+            for mod in ['vis', 'nir']:
+                if images[mod]:
+                    images_flat[mod] = images[mod]
+                    modality_mask[mod] = 1.0
+                else:
+                    modality_mask[mod] = 0.0
+            
+            # CP/SK: 保留视角结构，同时提供扁平化版本用于兼容性
+            for mod in ['cp', 'sk']:
+                view_imgs = []
+                for view in ['front', 'back', 'side']:
+                    view_imgs.extend(images[mod][view])
+                if view_imgs:
+                    images_flat[mod] = view_imgs  # 扁平化用于兼容性
+                    modality_mask[mod] = 1.0
+                else:
+                    modality_mask[mod] = 0.0
+            
             sample = {
                 'person_id': pid,
-                'pid': pid,  # 采样器可能使用这个字段
-                'images': {k: v for k, v in images.items() if len(v) > 0},
-                'modality_mask': {k: float(len(v) > 0) for k, v in images.items()},
-                'text': caption,
+                'pid': pid,  # 采样器兼容字段
+                'images': images_flat,  # 扁平化结构（兼容现有代码）
+                'images_by_view': images,  # 视角结构（新增，用于精细控制）
+                'modality_mask': modality_mask,
+                'text': caption,  # VIS↔Text成对
                 'text_description': caption,  # 兼容性字段
-                'file_path': file_path,  # 保留原始路径用于调试
+                'file_path': file_path,  # 原始路径
+                'anchor_vis': vis_full_path,  # 明确标记锚点VIS图像
             }
             self.samples.append(sample)
         
@@ -479,28 +525,75 @@ class MultiModalDataset(Dataset):
         # 转换person_id为标签索引
         sample['person_id'] = torch.tensor(self.pid2label[sample['person_id']], dtype=torch.long)
         
-        # 处理图像数据
+        # === 智能模态采样（对齐官方评测策略）===
         images_tensor = {}
         available_modalities = []
         
+        # 检查模态dropout（仅训练时）
+        use_drop = self.is_training and hasattr(self.config, 'modality_dropout') and (self.config.modality_dropout > 0)
+        
+        # 选择CP/SK的目标视角（用于视角对齐）
+        target_view = random.choice(['front', 'back', 'side']) if self.is_training else 'front'
+        
         for modality in self.modality_folders:
-            image_paths = sample.get('images', {}).get(modality, [])
-            
-            # 检查模态dropout（仅训练时）
-            use_drop = self.is_training and hasattr(self.config, 'modality_dropout') and (self.config.modality_dropout > 0)
-            
-            if image_paths and (not use_drop or random.random() > self.config.modality_dropout):
-                try:
-                    # 随机选择一张图像
-                    selected_path = random.choice(image_paths)
-                    image = Image.open(selected_path).convert('RGB')
-                    images_tensor[modality] = self.transform(image)
-                    available_modalities.append(modality)
-                except Exception as e:
-                    print(f"Error loading {modality} image: {e}")
-                    images_tensor[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
-            else:
-                # 无图像或被dropout，使用零张量
+            if use_drop and random.random() <= self.config.modality_dropout:
+                # 模态被dropout
+                images_tensor[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
+                continue
+                
+            try:
+                if modality == 'vis':
+                    # VIS: 使用锚点图像（与Text成对）
+                    if 'anchor_vis' in sample and os.path.exists(sample['anchor_vis']):
+                        selected_path = sample['anchor_vis']
+                    else:
+                        # 兜底：从vis列表随机选择
+                        image_paths = sample.get('images', {}).get('vis', [])
+                        if image_paths:
+                            selected_path = image_paths[0]  # 选择第一张（通常就是锚点）
+                        else:
+                            raise FileNotFoundError("No VIS images available")
+                            
+                elif modality == 'nir':
+                    # NIR: 身份级随机组合
+                    image_paths = sample.get('images', {}).get('nir', [])
+                    if image_paths:
+                        selected_path = random.choice(image_paths)
+                    else:
+                        raise FileNotFoundError("No NIR images available")
+                        
+                elif modality in ['cp', 'sk']:
+                    # CP/SK: 视角均衡采样，优先目标视角
+                    images_by_view = sample.get('images_by_view', {}).get(modality, {})
+                    
+                    # 优先选择目标视角
+                    if images_by_view.get(target_view):
+                        selected_path = random.choice(images_by_view[target_view])
+                    else:
+                        # 兜底：从可用视角中随机选择
+                        available_views = [v for v in ['front', 'back', 'side'] if images_by_view.get(v)]
+                        if available_views:
+                            fallback_view = random.choice(available_views)
+                            selected_path = random.choice(images_by_view[fallback_view])
+                        else:
+                            # 最后兜底：使用扁平化列表
+                            image_paths = sample.get('images', {}).get(modality, [])
+                            if image_paths:
+                                selected_path = random.choice(image_paths)
+                            else:
+                                raise FileNotFoundError(f"No {modality} images available")
+                else:
+                    raise ValueError(f"Unknown modality: {modality}")
+                
+                # 加载和转换图像
+                image = Image.open(selected_path).convert('RGB')
+                images_tensor[modality] = self.transform(image)
+                available_modalities.append(modality)
+                
+            except Exception as e:
+                if self.is_training:
+                    print(f"Warning: Error loading {modality} image: {e}")
+                # 使用零张量作为占位符
                 images_tensor[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
         
         # 设置主模态
@@ -516,6 +609,71 @@ class MultiModalDataset(Dataset):
         # 更新样本结构
         sample['images'] = images_tensor
         sample['text_description'] = [sample.get('text', 'unknown person')]  # 兼容性
+        
+        return sample
+    
+    def get_multimodal_query(self, idx, query_modalities=['vis', 'nir'], anchor_modality='vis'):
+        """
+        获取多模态查询样本（复现评测协议）
+        
+        Args:
+            idx (int): 样本索引
+            query_modalities (list): 查询模态列表 ['vis', 'nir', 'sk', 'cp', 'text']
+            anchor_modality (str): 锚点模态（通常为'vis'）
+            
+        Returns:
+            dict: 多模态查询样本，用于复现MM-2/3/4评测
+        """
+        sample = self.data_list[idx].copy()
+        sample['person_id'] = torch.tensor(self.pid2label[sample['person_id']], dtype=torch.long)
+        
+        images_tensor = {}
+        query_info = {'modalities': query_modalities, 'anchor': anchor_modality}
+        
+        # 统一视角选择（支持CP↔SK视角对齐）
+        target_view = random.choice(['front', 'back', 'side'])
+        
+        for modality in query_modalities:
+            if modality == 'text':
+                # 文本模态直接使用
+                continue
+            elif modality == 'vis':
+                # VIS锚点：使用成对图像
+                if 'anchor_vis' in sample:
+                    selected_path = sample['anchor_vis']
+                else:
+                    image_paths = sample.get('images', {}).get('vis', [])
+                    selected_path = image_paths[0] if image_paths else None
+            elif modality == 'nir':
+                # NIR: 身份级随机
+                image_paths = sample.get('images', {}).get('nir', [])
+                selected_path = random.choice(image_paths) if image_paths else None
+            elif modality in ['cp', 'sk']:
+                # CP/SK: 优先目标视角（支持视角对齐）
+                images_by_view = sample.get('images_by_view', {}).get(modality, {})
+                if images_by_view.get(target_view):
+                    selected_path = random.choice(images_by_view[target_view])
+                else:
+                    # 兜底到扁平化列表
+                    image_paths = sample.get('images', {}).get(modality, [])
+                    selected_path = random.choice(image_paths) if image_paths else None
+            else:
+                selected_path = None
+            
+            if selected_path and os.path.exists(selected_path):
+                try:
+                    image = Image.open(selected_path).convert('RGB')
+                    images_tensor[modality] = self.transform(image)
+                except Exception:
+                    images_tensor[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
+            else:
+                images_tensor[modality] = torch.zeros(3, self.config.image_size, self.config.image_size)
+        
+        # 设置样本信息
+        sample['images'] = images_tensor
+        sample['modality'] = anchor_modality
+        sample['query_info'] = query_info
+        sample['text_description'] = [sample.get('text', 'unknown person')]
         
         return sample
     
@@ -1010,14 +1168,21 @@ class ModalAwarePKSampler_Strict(Sampler):
         if len(self.strong_ids) < self.P:
             print(f"[警告] 可配对ID数({len(self.strong_ids)}) < 每批需要ID数({self.P})，将使用回退ID做兜底。")
 
-        # 估算长度（粗略）：每个强ID能支撑的实例对数
-        est_pairs = sum(min(len(self.pid_to_mod_idxs[pid]['vis']),
-                            len(self.pid_to_mod_idxs[pid]['nonvis'])) for pid in self.strong_ids)
-        self._len_est = max(1, est_pairs // (self.P * self.K)) if self.P * self.K > 0 else 1
+        # 估算长度（修正多模态采样逻辑）：基于多模态样本而非单模态实例
+        total_multimodal_samples = 0
+        for pid in self.strong_ids:
+            vis_count = len(self.pid_to_mod_idxs[pid]['vis'])
+            nonvis_count = len(self.pid_to_mod_idxs[pid]['nonvis'])
+            # 估算该ID的多模态样本数（保守估计：取最小值确保配对）
+            multimodal_samples = min(vis_count, nonvis_count)
+            total_multimodal_samples += multimodal_samples
+        
+        # 每个batch需要 P*K 个样本，估算可生成的batch数
+        self._len_est = max(1, total_multimodal_samples // (self.P * self.K)) if self.P * self.K > 0 else 1
 
         import logging
         logging.info("==================================================")
-        logging.info("数据集采样能力分析(基于采样器视角)")
+        logging.info("数据集采样能力分析 (采样器处理后)")
         logging.info(f"  强配对ID数: {len(self.strong_ids)} / {len(self.pids)}")
         logging.info(f"  估算可生成batch数: ~{self._len_est}")
         logging.info("==================================================")
@@ -1225,14 +1390,21 @@ class ModalAwarePKBatchSampler_Strict(Sampler):
                            if len(d['vis']) > 0 and len(d['nonvis']) > 0]
         self.soft_ids = [pid for pid in self.pids if pid not in self.strong_ids]
 
-        # 粗略估算可用 batch 数（仅用来 __len__）
-        est_pairs = sum(min(len(self.pid_to_mod_idxs[pid]['vis']),
-                            len(self.pid_to_mod_idxs[pid]['nonvis'])) for pid in self.strong_ids)
-        self._len_est = max(1, est_pairs // max(1, (self.P * self.K)))
+        # 估算可用batch数（修正多模态采样逻辑）
+        total_multimodal_samples = 0
+        for pid in self.strong_ids:
+            vis_count = len(self.pid_to_mod_idxs[pid]['vis'])
+            nonvis_count = len(self.pid_to_mod_idxs[pid]['nonvis'])
+            # 估算该ID的多模态样本数（保守估计：取最小值确保配对）
+            multimodal_samples = min(vis_count, nonvis_count)
+            total_multimodal_samples += multimodal_samples
+        
+        # 每个batch需要 P*K 个样本，估算可生成的batch数
+        self._len_est = max(1, total_multimodal_samples // max(1, (self.P * self.K)))
 
         import logging
         logging.info("==================================================")
-        logging.info("数据集采样能力分析(采样器视角)")
+        logging.info("数据集采样能力分析 (采样器处理后)")
         logging.info(f"  强配对ID数: {len(self.strong_ids)} / {len(self.pids)}")
         logging.info(f"  估算可生成batch数: ~{self._len_est}")
         logging.info("==================================================")
