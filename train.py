@@ -896,9 +896,14 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
     if epoch <= 3:
         logging.info(f"=== Epoch {epoch} 批次构成监控 ===")
     
-    # guide14.md: 只统计成功步，避免continue误报
-    processed = 0
+    # guide14.md: 统计各种batch处理状态
+    processed = 0       # 成功处理的batch数
+    skipped = 0        # 跳过的batch数  
+    total_attempted = 0 # 尝试处理的总batch数
+    
     for batch_idx, batch in enumerate(dataloader):
+        total_attempted += 1  # 记录尝试处理的batch总数
+        
         batch = move_batch_to_device(batch, device)
         labels = batch['person_id']
         
@@ -1018,7 +1023,9 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
                     # 内存不足时清理缓存并跳过
                     torch.cuda.empty_cache()
                     logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 内存不足，跳过当前batch")
-                    pbar.update(1)  # Fix20: 更新外部进度条
+                    skipped += 1  # 记录跳过的batch
+                    # 跳过的batch也更新进度条，保持进度连续性
+                    pbar.update(1)
                     continue
                 else:
                     raise e
@@ -1028,7 +1035,9 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
             if not torch.isfinite(total_loss_val):
                 logging.warning(f"Epoch {epoch}, Batch {batch_idx}: 发现非有限损失值 {total_loss_val.item():.6f}，跳过当前step")
                 optimizer.zero_grad(set_to_none=True)
-                pbar.update(1)  # 更新进度条
+                skipped += 1  # 记录跳过的batch
+                # 跳过的batch也更新进度条，保持进度连续性
+                pbar.update(1)
                 continue
             
             # SDM对比损失监控（仅在实际参与训练时警告）
@@ -1126,7 +1135,9 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
             logging.error(f"Epoch {epoch}, Batch {batch_idx}: 损失无效 {current_loss}, 跳过")
             loss_spikes += 1
             state['spikes'] += 1
-            pbar.update(1)  # 更新进度条
+            skipped += 1  # 记录跳过的batch
+            # 跳过的batch也更新进度条，保持进度连续性
+            pbar.update(1)
             continue
         
         # 计算梯度（支持梯度累积）
@@ -1355,11 +1366,11 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
                 'Spikes': loss_spikes
             })
         
-        # Fix20: 每个batch处理完后更新外部传入的进度条
-        pbar.update(1)
-        
-        # guide14.md: 成功处理一个batch后增加计数（在所有continue检查之后）
+        # 成功处理一个batch后增加计数（在所有continue检查之后）
         processed += 1
+        
+        # 每个batch处理完后更新进度条（无论成功还是跳过）
+        pbar.update(1)
         
         # guide15.md: 明确禁止在训练循环内触发评测
         # 所有评测应该在epoch结束后进行，不应该在batch级别触发
@@ -1398,7 +1409,10 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
         'feature_norm': avg_feat_norm,
         'grad_norm': avg_grad_norm,
         'loss_spikes': loss_spikes,
-        'stability_score': max(0.0, 1.0 - train_epoch_fixed._spike_state['spikes'] / max(1, train_epoch_fixed._spike_state['batches']))
+        'stability_score': max(0.0, 1.0 - train_epoch_fixed._spike_state['spikes'] / max(1, train_epoch_fixed._spike_state['batches'])),
+        'actual_batches': total_attempted,  # 实际尝试的batch数（包含跳过的）
+        'processed_batches': processed,     # 成功处理的batch数
+        'skipped_batches': skipped          # 跳过的batch数
     }
 
 # ------------------------------
@@ -1704,8 +1718,14 @@ def train_multimodal_reid():
     save_dir = getattr(config, "save_dir", "./checkpoints")
     os.makedirs(save_dir, exist_ok=True)
 
-    # Fix20: 修复进度条显示问题 - 使用单一进度条控制
-    total_batches = len(train_loader) if hasattr(train_loader, '__len__') else None
+    # 改进方案：自适应进度条 + 动态batch数学习
+    estimated_batches = len(train_loader) if hasattr(train_loader, '__len__') else 1000
+    actual_batches_per_epoch = []  # 记录每轮的真实batch数
+    
+    logging.info(f"=== 训练配置总结 ===")
+    logging.info(f"计划训练轮次: {num_epochs}")
+    logging.info(f"采样器估算batch数: {estimated_batches}")
+    logging.info(f"注意: 第1轮为自适应学习，第2轮起进度条将基于实际数据")
     
     for epoch in range(1, num_epochs + 1):
         start_time = time.time()
@@ -1716,10 +1736,24 @@ def train_multimodal_reid():
             if epoch == 1:  # 第一个epoch提醒
                 logging.info("文本编码器微调模式：每epoch清除缓存")
 
-        # Fix20: 创建独立的epoch进度条，确保每个epoch正确重置
-        with tqdm(total=total_batches, 
-                  desc=f"Epoch {epoch}/{num_epochs}", 
-                  leave=False, ncols=120) as epoch_pbar:
+        # 自适应进度条：第1轮学习，第2轮起使用真实数据
+        if epoch == 1:
+            # 第1轮：使用估算值 + 动态扩展
+            progress_total = estimated_batches
+            progress_desc = f"Epoch {epoch}/{num_epochs} [Learning]"
+        elif len(actual_batches_per_epoch) > 0:
+            # 第2轮起：使用前一轮的真实batch数
+            progress_total = actual_batches_per_epoch[-1]  # 使用最近一轮的实际数据
+            progress_desc = f"Epoch {epoch}/{num_epochs} [Actual: {progress_total}]"
+        else:
+            # 备用方案
+            progress_total = estimated_batches
+            progress_desc = f"Epoch {epoch}/{num_epochs} [Est: {progress_total}]"
+        
+        with tqdm(total=progress_total, 
+                  desc=progress_desc, 
+                  leave=False, ncols=130,
+                  dynamic_ncols=True) as epoch_pbar:
             
             adaptive_clip = getattr(config, "adaptive_gradient_clip", True)
             train_metrics = train_epoch_fixed(
@@ -1727,6 +1761,27 @@ def train_multimodal_reid():
                 scaler, adaptive_clip, accum_steps, autocast_dtype, config, 
                 epoch_pbar  # 传递进度条
             )
+        
+        # 记录本轮的真实batch数，用于下轮进度条精确显示
+        actual_batches_this_epoch = train_metrics.get('actual_batches', estimated_batches)
+        actual_batches_per_epoch.append(actual_batches_this_epoch)
+        
+        # 统计监控：估算vs实际的差异
+        if epoch == 1:
+            batch_accuracy = actual_batches_this_epoch / estimated_batches
+            logging.info(f"第1轮batch数学习完成: 估算={estimated_batches}, 实际={actual_batches_this_epoch}, 准确率={batch_accuracy:.1%}")
+            if abs(batch_accuracy - 1.0) > 0.2:  # 如果误差超过20%
+                logging.warning(f"⚠️  采样器估算偏差较大({batch_accuracy:.1%})，建议检查数据分布")
+        else:
+            expected = actual_batches_per_epoch[-2] if len(actual_batches_per_epoch) > 1 else estimated_batches
+            if abs(actual_batches_this_epoch - expected) > max(10, expected * 0.1):
+                logging.warning(f"⚠️  Epoch {epoch} batch数波动: 预期≈{expected}, 实际={actual_batches_this_epoch}")
+        
+        # 动态调整进度条到正确的完成状态
+        if epoch_pbar.total != actual_batches_this_epoch:
+            epoch_pbar.total = actual_batches_this_epoch
+            epoch_pbar.n = actual_batches_this_epoch
+            epoch_pbar.refresh()
         
         # guide6.md: 分类头学习率动态调整
         head_lr = getattr(config, 'head_learning_rate', 3e-3)
@@ -1832,12 +1887,21 @@ def train_multimodal_reid():
                 os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
             )
 
-        # 调度器步进
+        # 改进的调度器步进 - 基于实际step数而非估算
         if scheduler:
             if isinstance(scheduler, ReduceLROnPlateau):
                 if epoch >= eval_start_epoch and ((epoch - eval_start_epoch) % eval_every_n_epoch == 0):
                     current_map = comp_metrics['map_avg2'] if 'comp_metrics' in locals() else 0.0
                     scheduler.step(current_map)
+            elif isinstance(scheduler, LambdaLR) and len(actual_batches_per_epoch) > 0:
+                # 对于基于epoch的调度器，使用实际batch数信息
+                # 但仍然按epoch步进，只是在日志中记录实际的step信息
+                scheduler.step()
+                
+                # 额外信息：计算实际训练的总step数
+                total_actual_steps = sum(actual_batches_per_epoch)
+                avg_steps_per_epoch = sum(actual_batches_per_epoch) / len(actual_batches_per_epoch)
+                logging.info(f"Epoch {epoch}: 累计实际steps={total_actual_steps}, 本轮steps={actual_batches_this_epoch}, 平均={avg_steps_per_epoch:.1f}")
             else:
                 scheduler.step()
 
@@ -1884,7 +1948,24 @@ def train_multimodal_reid():
     with open(os.path.join(save_dir, 'dataset_split.pkl'), 'wb') as f:
         pickle.dump(split_info, f)
 
-    logging.info(f"训练完成. 本地划分验证集最佳(四类平均) mAP: {best_map:.4f}")
+    # 训练完成统计
+    if actual_batches_per_epoch:
+        avg_batches = sum(actual_batches_per_epoch) / len(actual_batches_per_epoch)
+        min_batches = min(actual_batches_per_epoch)
+        max_batches = max(actual_batches_per_epoch)
+        logging.info(f"=== 训练完成统计 ===")
+        logging.info(f"采样器初始估算: {estimated_batches} batch/epoch")
+        logging.info(f"实际batch数统计: 均值={avg_batches:.1f}, 范围=[{min_batches}, {max_batches}]")
+        logging.info(f"估算准确率: {avg_batches/estimated_batches:.1%} (理想值: 90%-110%)")
+        
+        # 分析采样稳定性
+        if len(actual_batches_per_epoch) > 1:
+            batch_variance = sum((b - avg_batches)**2 for b in actual_batches_per_epoch) / len(actual_batches_per_epoch)
+            batch_cv = (batch_variance**0.5) / avg_batches if avg_batches > 0 else 0
+            logging.info(f"批次稳定性: 变异系数={batch_cv:.3f} ({'稳定' if batch_cv < 0.1 else '波动较大'})")
+    
+    logging.info(f"最佳(四类平均) mAP: {best_map:.4f}")
+    logging.info("=====================")
 
 def save_checkpoint(model, optimizer, scheduler, epoch, best_map, config, filename):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
