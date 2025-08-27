@@ -77,10 +77,6 @@ class SemanticDisentanglementModule(nn.Module):
         return semantic_features
 
 
-# 注释：这些损失类已被移除，因为实际使用的是 models/sdm_loss.py 中的 sdm_loss_stable 函数
-# 原有的 RGBAnchoredAlignmentLoss 和 SDMContrastiveLoss 类完全未使用，造成代码冗余
-# 实际的SDM损失计算在 compute_loss 方法中通过 from .sdm_loss import sdm_loss_stable 实现
-
 
 class FeatureFusion(nn.Module):
     """轻量特征融合器：多头注意力 + MLP混合器"""
