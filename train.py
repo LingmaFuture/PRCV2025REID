@@ -1188,6 +1188,7 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
                 'Loss': f'{current_loss:.3f}',
                 'CE': f'{float(ce_loss.item()):.3f}',
                 'SDMLoss': f'{sdm_loss_val:.3f}',  # 修复后应该非负
+                'Fusion': f'{avg_fusion_feat:.2f}',  # 多模态融合后特征范数
                 'PreBN': f'{avg_feat_pre_bn:.2f}',  # BN前原始特征范数
                 'PostBN': f'{avg_feat_bnneck:.2f}',  # BN后特征范数（用于ReID检索）
                 'GradNorm': ('—' if recent_grad_norm is None else f'{recent_grad_norm:.2f}'),
