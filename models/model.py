@@ -77,104 +77,9 @@ class SemanticDisentanglementModule(nn.Module):
         return semantic_features
 
 
-class RGBAnchoredAlignmentLoss(nn.Module):
-    """vis锚定对齐损失：推动所有查询模态对齐到vis目标表征"""
-    
-    def __init__(self, temperature: float = 0.1, margin: float = 0.3, alpha: float = 1.0):
-        super().__init__()
-        self.temperature = temperature
-        self.margin = margin 
-        self.alpha = alpha
-        
-    def forward(self, 
-                modality_features: Dict[str, torch.Tensor],
-                fused_features: torch.Tensor,
-                labels: torch.Tensor) -> torch.Tensor:
-        """
-        计算vis锚定对齐损失
-        Args:
-            modality_features: 各模态原始特征字典
-            fused_features: 融合后特征
-            labels: ID标签
-        Returns:
-            对齐损失
-        """
-        if 'vis' not in modality_features:
-            return torch.tensor(0.0, device=fused_features.device, requires_grad=True)
-        
-        vis_features = modality_features['vis']  # [B, D] 可见光目标特征
-        total_loss = torch.tensor(0.0, device=fused_features.device, requires_grad=True)
-        num_modalities = 0
-        
-        # 计算每个非可见光模态与可见光的对齐损失
-        for modality, features in modality_features.items():
-            if modality == 'vis':
-                continue
-                
-            # 归一化特征以稳定相似度计算
-            features_norm = F.normalize(features, p=2, dim=1)
-            vis_features_norm = F.normalize(vis_features, p=2, dim=1)
-            
-            # 对比损失：相同ID拉近，不同ID推远
-            sim_matrix = torch.matmul(features_norm, vis_features_norm.T) / self.temperature
-            
-            # 构建正负样本掩码
-            batch_size = features.shape[0]
-            labels_expand = labels.unsqueeze(1).expand(batch_size, batch_size)
-            pos_mask = (labels_expand == labels_expand.T).float()
-            neg_mask = 1.0 - pos_mask
-            
-            # 避免对角线上的自相似
-            eye_mask = torch.eye(batch_size, device=features.device)
-            pos_mask = pos_mask * (1.0 - eye_mask)  # 移除对角线
-            
-            # 正样本损失（相同ID应该相似）- 使用数值稳定的logsumexp
-            if pos_mask.sum() > 0:
-                pos_sim = sim_matrix * pos_mask
-                # 将非正样本位置设为极小值，避免影响logsumexp
-                pos_logits = pos_sim + (1.0 - pos_mask) * (-1e9)
-                pos_loss = -torch.logsumexp(pos_logits, dim=1).mean()
-            else:
-                pos_loss = torch.tensor(0.0, device=features.device)
-            
-            # 负样本损失（不同ID应该不相似）- 使用数值稳定的logsumexp
-            if neg_mask.sum() > 0:
-                neg_sim = sim_matrix * neg_mask - self.margin
-                # 将非负样本位置设为极小值，避免影响logsumexp
-                neg_logits = neg_sim + (1.0 - neg_mask) * (-1e9)
-                neg_loss = torch.logsumexp(neg_logits, dim=1).mean()
-            else:
-                neg_loss = torch.tensor(0.0, device=features.device)
-            
-            modality_loss = pos_loss + neg_loss
-            
-            # 检查是否为NaN
-            if torch.isnan(modality_loss):
-                continue
-                
-            total_loss = total_loss + modality_loss
-            num_modalities += 1
-        
-        if num_modalities > 0:
-            return total_loss / num_modalities
-        else:
-            return torch.tensor(0.0, device=fused_features.device, requires_grad=True)
-
-
-class SDMContrastiveLoss(nn.Module):
-    """SDM对比损失：结合语义分离和vis锚定对齐"""
-    
-    def __init__(self, temperature: float = 0.1, margin: float = 0.3, alpha: float = 1.0):
-        super().__init__()
-        self.vis_alignment = RGBAnchoredAlignmentLoss(temperature, margin, alpha)  # 保持类名兼容性
-        
-    def forward(self, 
-                modality_features: Dict[str, torch.Tensor],
-                fused_features: torch.Tensor,
-                labels: torch.Tensor) -> torch.Tensor:
-        """计算SDM对比损失"""
-        alignment_loss = self.vis_alignment(modality_features, fused_features, labels)
-        return alignment_loss
+# 注释：这些损失类已被移除，因为实际使用的是 models/sdm_loss.py 中的 sdm_loss_stable 函数
+# 原有的 RGBAnchoredAlignmentLoss 和 SDMContrastiveLoss 类完全未使用，造成代码冗余
+# 实际的SDM损失计算在 compute_loss 方法中通过 from .sdm_loss import sdm_loss_stable 实现
 
 
 class FeatureFusion(nn.Module):
@@ -338,12 +243,9 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         # 训练状态跟踪
         self.current_epoch = 0  # 用于控制modality_dropout的热身期
         
-        # guide6.md: 跨批记忆库初始化
-        if getattr(config, 'sdm_memory_enabled', True):
-            from collections import deque
-            self.sdm_memory = deque(maxlen=getattr(config, 'sdm_memory_steps', 6))
-        else:
-            self.sdm_memory = None
+        # 简化：移除复杂的跨批记忆库，避免内存管理复杂性和潜在bug
+        # 原实现存在特征-标签匹配错误，且增加了不必要的复杂性
+        self.sdm_memory = None
         
         # 模态配置
         self.modalities = getattr(config, 'modalities', ['vis', 'nir', 'sk', 'cp', 'text'])
@@ -388,11 +290,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         
         # ===== 损失函数和SDM参数 =====
         self.sdm_temperature = getattr(config, "sdm_temperature", 0.2)  # 保存温度参数
-        self.sdm_contrastive_loss = SDMContrastiveLoss(
-            temperature=getattr(config, "sdm_temperature", 0.1),
-            margin=getattr(config, "sdm_margin", 0.3),
-            alpha=1.0
-        )
+        # 注释：移除了未使用的 self.sdm_contrastive_loss，实际使用 sdm_loss_stable 函数
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)  # guide6.md: 增加到0.1更稳
         
         # 损失权重
@@ -611,20 +509,7 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
         # 输出feature_masks供损失计算时过滤使用
         outputs['feature_masks'] = feature_masks
         
-        # guide6.md: 跨批记忆库更新（在compute_loss中处理，这里只缓存特征）
-        if self.sdm_memory is not None and self.training:
-            # 缓存当前batch的vis特征（标签在compute_loss中处理）
-            vis_features = raw_modality_features.get('vis', None)
-            vis_mask = feature_masks.get('vis', None)
-            
-            if vis_features is not None and vis_mask is not None:
-                # 找到有效的vis样本
-                vis_valid_idx = (vis_mask > 0).squeeze(-1) if vis_mask.dim() > 1 else (vis_mask > 0)
-                
-                if vis_valid_idx.sum() > 0:
-                    # 缓存有效的vis特征（标签在compute_loss中处理）
-                    vis_valid_feat = vis_features[vis_valid_idx].detach()
-                    self.sdm_memory.append((vis_valid_feat, vis_valid_idx))
+        # 注释：简化跨批记忆库逻辑，将在compute_loss中正确实现
         
         return outputs
     
@@ -696,23 +581,9 @@ class CLIPBasedMultiModalReIDModel(nn.Module):
                     vis_valid_feat = vis_features[vis_valid_idx]
                     vis_valid_labels = labels[vis_valid_idx]
                     
-                    # guide6.md: 使用跨批记忆库兜底
-                    if self.sdm_memory is not None and len(self.sdm_memory) > 0:
-                        # 从记忆库中获取历史vis特征和标签
-                        mem_feats = []
-                        mem_labels = []
-                        for mem_feat, mem_label in self.sdm_memory:
-                            mem_feats.append(mem_feat)
-                            mem_labels.append(mem_label)
-                        
-                        if mem_feats:
-                            # 合并当前batch和记忆库的vis特征
-                            mem_feats_cat = torch.cat(mem_feats, dim=0)
-                            mem_labels_cat = torch.cat(mem_labels, dim=0)
-                            
-                            # 扩展当前batch的vis特征和标签
-                            vis_valid_feat = torch.cat([vis_valid_feat, mem_feats_cat], dim=0)
-                            vis_valid_labels = torch.cat([vis_valid_labels, mem_labels_cat], dim=0)
+                    # 简化：暂时禁用跨批记忆库，避免复杂的内存管理和潜在bug
+                    # 原实现存在特征-标签不匹配问题，需要重新设计
+                    pass
                     
                     sdm_losses = []
                     # 对每个非vis模态与有效vis做SDM对齐
