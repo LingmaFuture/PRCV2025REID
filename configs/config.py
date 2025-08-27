@@ -131,9 +131,6 @@ class TrainingConfig:
     modal_pair_retry_limit: int = 3     # guide6.md: 软退路重试次数
     modal_pair_fallback_ratio: float = 0.3  # guide6.md: 软退路比例30%
     
-    # guide6.md: 跨批记忆库配置
-    sdm_memory_steps: int = 6           # guide6.md: 缓存近N=4~8个step的RGB特征
-    sdm_memory_enabled: bool = True     # guide6.md: 启用跨批记忆库
     
     # guide6.md: 健康线监控配置
     pair_coverage_target: float = 0.85  # guide6.md: pair_coverage_mavg目标≥0.85

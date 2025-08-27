@@ -149,66 +149,6 @@ def sdm_loss_stable(qry, gal, y, tau=0.2, eps=1e-8):
     return result
 
 
-class SDMLoss(nn.Module):
-    """
-    SDM (Similarity Distribution Matching) 损失函数
-    
-    计算查询特征与图库特征之间的分布匹配损失
-    支持多模态查询特征与vis图库特征的匹配
-    """
-    
-    def __init__(self, temperature=0.2, eps=1e-6):
-        """
-        Args:
-            temperature (float): 温度参数，控制softmax的陡峭程度
-            eps (float): 数值稳定性参数
-        """
-        super().__init__()
-        self.temperature = temperature
-        self.eps = eps
-        
-    def forward(self, qry_features, gal_features, qry_labels, gal_labels=None, return_details=False):
-        """
-        计算SDM损失 - 修复版本，支持两套标签
-        
-        Args:
-            qry_features (torch.Tensor): 查询特征 [N, D] - 任意模态或多模态融合
-            gal_features (torch.Tensor): 图库特征 [M, D] - vis特征
-            qry_labels (torch.Tensor): 查询样本的身份ID [N]
-            gal_labels (torch.Tensor, optional): 图库样本的身份ID [M]，None时使用qry_labels
-            return_details (bool): 是否返回详细信息
-            
-        Returns:
-            torch.Tensor: SDM损失值
-            dict (optional): 详细信息
-        """        
-        if gal_labels is None:
-            gal_labels = qry_labels  # 仅在完全对齐的 toy case 使用
-        
-        # 构造同身份指示矩阵
-        y = (qry_labels.view(-1,1) == gal_labels.view(1,-1)).float()  # [N,M]
-
-        # 直接把"未归一化的原始特征"交给 sdm_loss_stable，内部会做 L2 normalize
-        total_loss = sdm_loss_stable(qry_features, gal_features, y,
-                                     tau=self.temperature, eps=self.eps)
-
-        if return_details:
-            with torch.no_grad():
-                qn = F.normalize(qry_features, dim=1, eps=self.eps)
-                gn = F.normalize(gal_features, dim=1, eps=self.eps)
-                S = qn @ gn.t()
-            details = {
-                'total_loss': float(total_loss),
-                'temperature': self.temperature,
-                'similarity_mean': float(S.mean()),
-                'similarity_std': float(S.std()),
-                'valid_queries': int((y.sum(dim=1)>0).sum()),
-                'valid_gallery': int((y.sum(dim=0)>0).sum()),
-            }
-            return total_loss, details
-            
-        return total_loss
-
 
 def _quick_check():
     """快速自测函数"""
@@ -226,13 +166,6 @@ def _quick_check():
     assert float(loss) >= 0.0, f"loss 为负: {float(loss)}"
     print("✅ SDM quick check OK:", float(loss))
     
-    # 测试SDMLoss模块
-    sdm_module = SDMLoss(temperature=0.2)
-    module_loss, details = sdm_module(qry, gal, qry_labels, gal_labels, return_details=True)
-    assert torch.isfinite(module_loss), "module loss 出现 NaN/Inf"
-    assert float(module_loss) >= 0.0, f"module loss 为负: {float(module_loss)}"
-    print("✅ SDMLoss module check OK:", float(module_loss))
-    print("详细信息:", details)
 
 
 # 测试函数
@@ -257,18 +190,12 @@ def test_sdm_loss():
     labels_gal = labels.view(1, -1)
     y = (labels_qry == labels_gal).float()
     
-    # 测试SDM损失
-    sdm_module = SDMLoss(temperature=0.2)
-    loss, details = sdm_module(qry_features, gal_features, labels, labels, return_details=True)
-    
-    print(f"SDM损失: {loss.item():.4f}")
-    print(f"详细信息: {details}")
     
     # 测试函数版本
     loss_func = sdm_loss_stable(qry_features, gal_features, y, tau=0.1)
     print(f"函数版本SDM损失: {loss_func.item():.4f}")
     
-    return loss.item() > 0  # 确保损失为正
+    return loss_func.item() > 0  # 确保损失为正
 
 
 if __name__ == "__main__":

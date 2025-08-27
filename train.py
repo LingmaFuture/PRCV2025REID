@@ -30,7 +30,7 @@ try:
         torch.nn.attention.SDPBackend.default = SDPBackend.FLASH_ATTENTION
 except ImportError:
     pass  # 如果导入失败，忽略
-from sklearn.model_selection import train_test_split
+
 import torchvision.transforms as transforms
 
 # === 你项目里的数据与模型 ===
@@ -151,13 +151,6 @@ MODALITY_MAPPING = {
     'sk': 'sk',         # 素描保持原名
     'cp': 'cp',         # 彩铅保持原名
     'text': 'text',     # 文本保持原名
-    
-    # 向后兼容映射（支持旧版本模态名）
-    'rgb': 'vis',       # 旧版本RGB -> vis
-    'ir': 'nir',        # 旧版本ir -> nir  
-    'sketch': 'sk',     # 旧版本sketch -> sk
-    'cpencil': 'cp',    # 旧版本cpencil -> cp
-    'txt': 'text'       # 文本简写
 }
 
 def map_modality_name(old_name: str) -> str:
@@ -430,164 +423,6 @@ def _flatten_loaders(obj, prefix=""):
 
     raise TypeError(f"Unsupported query_loaders node type: {type(obj)} at {prefix!r}")
 
-# guide16.md: 数据集采样能力分析工具
-def analyze_dataset_sampling_capability(dataset, min_k=2):
-    """
-    分析数据集在当前采样约束下的可用性
-    返回每个ID的模态分布和可配对能力
-    """
-    from collections import Counter, defaultdict
-    
-    print("[INFO] 开始分析数据集采样能力...")
-    cnt = defaultdict(lambda: defaultdict(int))
-    
-    # 统计每个ID在各模态的样本数
-    for i in range(len(dataset)):
-        try:
-            # 获取person_id，兼容不同数据集结构
-            if hasattr(dataset, 'data_list'):
-                pid = str(dataset.data_list[i]['person_id'])
-                sample_data = dataset.data_list[i]
-            elif hasattr(dataset, 'person_id'):
-                pid = dataset.person_id[i] if isinstance(dataset.person_id[i], str) else str(dataset.person_id[i])
-                sample_data = None
-            else:
-                # 通过__getitem__获取
-                sample_data = dataset[i]
-                pid = str(sample_data.get('person_id', i))
-                
-            # 获取样本的完整模态信息，而不是只看主模态
-            available_modalities = set()
-            
-            # 方法1: 使用数据集的infer_modalities_of_sample方法
-            if hasattr(dataset, 'infer_modalities_of_sample'):
-                try:
-                    mods = dataset.infer_modalities_of_sample(i)
-                    available_modalities.update(mods)
-                except:
-                    pass
-            
-            # 方法2: 直接检查样本数据
-            if not available_modalities and sample_data:
-                # 检查images字段
-                if 'images' in sample_data and isinstance(sample_data['images'], dict):
-                    for mod_key, mod_data in sample_data['images'].items():
-                        if mod_data and len(mod_data) > 0:  # 有实际的图像数据
-                            std_mod = map_modality_name(mod_key)
-                            available_modalities.add(std_mod)
-                
-                # 检查文本模态
-                if sample_data.get('text'):
-                    available_modalities.add('text')
-                    
-            # 如果还是没有找到，回退到主模态
-            if not available_modalities:
-                if sample_data:
-                    main_mod = sample_data.get('modality', 'unknown')
-                else:
-                    main_mod = 'unknown'
-                available_modalities.add(map_modality_name(main_mod))
-            
-            # 每个多模态样本只计数1次，同时记录其配对能力
-            cnt[pid]['total_samples'] += 1
-            
-            # 检查该样本的配对能力
-            has_vis = 'vis' in available_modalities
-            has_nonvis = bool(available_modalities & {'nir', 'sk', 'cp', 'text'})
-            
-            if has_vis and has_nonvis:
-                cnt[pid]['pairable_samples'] += 1
-            elif has_vis:
-                cnt[pid]['vis_only_samples'] += 1  
-            elif has_nonvis:
-                cnt[pid]['nonvis_only_samples'] += 1
-        except Exception as e:
-            logging.warning(f"分析第{i}个样本时出错: {e}")
-            continue
-    
-    # 分析可配对能力
-    total_ids = len(cnt)
-    pairable_ids = []
-    
-    # 重构后的统计信息
-    total_multimodal_samples = 0
-    total_pairable_samples = 0
-    total_vis_only = 0
-    total_nonvis_only = 0
-    
-    for pid, c in cnt.items():
-        total_samples = c.get('total_samples', 0)
-        pairable_samples = c.get('pairable_samples', 0) 
-        
-        # 累计统计
-        total_multimodal_samples += total_samples
-        total_pairable_samples += pairable_samples
-        total_vis_only += c.get('vis_only_samples', 0)
-        total_nonvis_only += c.get('nonvis_only_samples', 0)
-        
-        # 判断ID是否可配对（有可配对样本，且总样本数≥min_k）
-        if pairable_samples > 0 and total_samples >= min_k:
-            pairable_ids.append(pid)
-    
-    print(f"数据集统计:")
-    print(f"  总ID数: {total_ids}")
-    print(f"  多模态样本总数: {total_multimodal_samples}")
-    print(f"  完全配对样本数: {total_pairable_samples}")
-    print(f"  仅vis样本数: {total_vis_only}")
-    print(f"  仅nonvis样本数: {total_nonvis_only}")
-    print(f"  样本分布: 配对{total_pairable_samples} + 仅vis{total_vis_only} + 仅nonvis{total_nonvis_only} = {total_multimodal_samples}")
-    
-    # 添加除零保护
-    if total_ids > 0:
-        print(f"  可配对ID数 (K≥{min_k}): {len(pairable_ids)} ({len(pairable_ids)/total_ids*100:.1f}%)")
-    else:
-        print(f"  可配对ID数 (K≥{min_k}): {len(pairable_ids)} (无法计算百分比：总ID数为0)")
-        print("  ⚠️ 警告：没有成功分析到任何ID，请检查数据集结构")
-    
-    # 精确batch数计算（基于真实多模态样本）
-    P = 4  # unique_id per batch  
-    K = min_k  # instances per id
-    estimated_max_batches = 0
-    
-    if len(pairable_ids) >= P:
-        # 统计可用于强配对采样的样本数
-        available_pairable_samples = sum(cnt[pid]['pairable_samples'] for pid in pairable_ids)
-        
-        if available_pairable_samples > 0:
-            samples_per_batch = P * K
-            
-            # 情况1：不考虑ID重用（每个ID只能用一次）
-            min_samples_per_id = min(cnt[pid]['pairable_samples'] for pid in pairable_ids)
-            no_reuse_batches = min_samples_per_id * len(pairable_ids) // samples_per_batch
-            
-            # 情况2：考虑ID重用（ID可以重复使用，这是采样器的默认行为）
-            reuse_batches = available_pairable_samples // samples_per_batch
-            
-            # 采样器实际使用重用模式
-            estimated_max_batches = reuse_batches
-            
-            # 计算可持续训练轮次（每个ID平均被使用的次数）
-            avg_reuse_per_id = (estimated_max_batches * P) / len(pairable_ids) if len(pairable_ids) > 0 else 0
-        
-        print(f"  可配对样本总数: {available_pairable_samples}")
-        print(f"  精确batch数估算 (P={P}, K={K}):")
-        print(f"    - ID重用模式: ~{estimated_max_batches} batches")
-        print(f"    - 每个ID平均重用: ~{avg_reuse_per_id:.1f} 次")
-        print(f"    - 理论训练容量: {available_pairable_samples} samples")
-    else:
-        print(f"  ⚠️  可配对ID数({len(pairable_ids)}) < 每批需要ID数({P})，无法生成有效batch")
-    
-    return {
-        'total_ids': total_ids,
-        'pairable_ids': len(pairable_ids),
-        'total_multimodal_samples': total_multimodal_samples,
-        'total_pairable_samples': total_pairable_samples,
-        'total_vis_only': total_vis_only,
-        'total_nonvis_only': total_nonvis_only,
-        'estimated_max_batches': estimated_max_batches,
-        'P': P,
-        'K': K
-    }
 
 # guide14.md: 单条查询评测的完整实现
 @torch.no_grad()
@@ -1055,20 +890,10 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
                 logging.error(f"Epoch {epoch}, Batch {batch_idx}: SDM损失出现NaN/Inf, 重置为0")
                 loss_dict['sdm_loss'] = torch.tensor(0.0, device=device)
                 loss_dict['contrastive_loss'] = torch.tensor(0.0, device=device)
-                # 重新计算总损失（简化版）
-                ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
-                sdm_weight = getattr(model.config, 'contrastive_weight', 0.1)
-                loss_dict['total_loss'] = ce_loss + sdm_weight * loss_dict['sdm_loss']
             
-            loss = loss_dict['total_loss']
-        
-        # 用 warmup 后的有效权重重算总损失（简化版：只有CE+SDM）
-        ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
-        sdm_loss = loss_dict.get('sdm_loss', torch.tensor(0.0, device=device))
-        cont_loss = loss_dict.get('contrastive_loss', sdm_loss)  # 兼容性
-        loss = ce_loss + effective_cont_w * sdm_loss  # 简化：只有CE + SDM
-        loss = loss / accum_steps  # 梯度累积：缩放损失
-        loss_dict['total_loss'] = loss
+            # 使用模型计算的total_loss，仅应用梯度累积缩放
+            loss = loss_dict['total_loss'] / accum_steps
+            loss_dict['total_loss'] = loss
 
         current_loss = float(loss.item() * accum_steps)  # 显示未缩放的损失
         
@@ -1251,6 +1076,8 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
 
         # 统计信息更新（移回循环内部）
         total_loss += current_loss
+        ce_loss = loss_dict.get('ce_loss', torch.tensor(0.0, device=device))
+        # 复用前面已提取的sdm_loss，避免重复定义
         ce_loss_sum += float(ce_loss.item())
         contrastive_loss_sum += float(sdm_loss.item())  # 累计SDM损失
 
@@ -1261,29 +1088,29 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         
-        # 监控三种特征范数：融合、BN后、原始ReID特征
-        fused_norms = None
-        bn_norms = None
-        reid_raw_norms = None
+        # 监控三种特征范数：融合、BN前、BN后
+        fusion_feat_norms = None
+        feat_pre_bn_norms = None
+        feat_bnneck_norms = None
         if isinstance(outputs, dict):
             if 'features' in outputs:
-                fused_norms = torch.norm(outputs['features'].detach(), p=2, dim=1)  # 融合后特征范数
-            if 'bn_features' in outputs:
-                bn_norms = torch.norm(outputs['bn_features'].detach(), p=2, dim=1)  # BN后特征（对齐+检索用）
+                fusion_feat_norms = torch.norm(outputs['features'].detach(), p=2, dim=1)  # 融合输出的特征范数
             if 'reid_features_raw' in outputs:
-                reid_raw_norms = torch.norm(outputs['reid_features_raw'].detach(), p=2, dim=1)  # 受LayerNorm影响
+                feat_pre_bn_norms = torch.norm(outputs['reid_features_raw'].detach(), p=2, dim=1)  # BNNeck之前的原始特征范数
+            if 'bn_features' in outputs:
+                feat_bnneck_norms = torch.norm(outputs['bn_features'].detach(), p=2, dim=1)  # BNNeck之后的对齐特征范数
 
-        # 使用BN特征范数更新累积统计（因为这是对齐和检索的关键）
-        if bn_norms is not None:
-            feature_norms.extend(bn_norms.cpu().numpy())
-        elif fused_norms is not None:
-            feature_norms.extend(fused_norms.cpu().numpy())
+        # 使用BNNeck特征范数更新累积统计（因为这是对齐和检索的关键）
+        if feat_bnneck_norms is not None:
+            feature_norms.extend(feat_bnneck_norms.cpu().numpy())
+        elif fusion_feat_norms is not None:
+            feature_norms.extend(fusion_feat_norms.cpu().numpy())
 
-        # 进度条显示BN后特征范数（最重要的监控指标）
-        avg_fused = float(fused_norms.mean().item()) if fused_norms is not None else 0.0
-        avg_bn = float(bn_norms.mean().item()) if bn_norms is not None else 0.0
-        avg_reid  = float(reid_raw_norms.mean().item()) if reid_raw_norms is not None else 0.0
-        avg_grad_norm = (np.mean(grad_norms[-10:]) if grad_norms else None)
+        # 进度条显示BNNeck特征范数（最重要的监控指标）
+        avg_fusion_feat = float(fusion_feat_norms.mean().item()) if fusion_feat_norms is not None else 0.0
+        avg_feat_bnneck = float(feat_bnneck_norms.mean().item()) if feat_bnneck_norms is not None else 0.0
+        avg_feat_pre_bn = float(feat_pre_bn_norms.mean().item()) if feat_pre_bn_norms is not None else 0.0
+        recent_grad_norm = (np.mean(grad_norms[-10:]) if grad_norms else None)
 
         # 区分SDM损失和分数进行监控
         sdm_loss_val = float(sdm_loss.item())
@@ -1310,7 +1137,7 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
             # 输出关键字段
             logging.info(f"[{epoch:02d}, {batch_idx:03d}] "
                         f"vis_cnt={vis_cnt}, ce_valid={ce_valid_cnt}, "
-                        f"Feat(BN)_mean={avg_bn:.2f}, "
+                        f"BNNeckNorm_mean={avg_feat_bnneck:.2f}, "
                         f"SDMLoss={sdm_loss_val:.3f}, CE={float(ce_loss.item()):.3f}")
         
         # 早期训练详细监控（前3个epoch，每20个batch）
@@ -1330,7 +1157,7 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
             elif sdm_loss_val > 5.0:
                 logging.warning(f"⚠️ SDM损失过大: {sdm_loss_val:.4f} - 可能存在数值不稳定")
         
-        # ✅ 修复3: 调整BN特征范数阈值 - 如果使用L2归一化，范数应该接近1
+        # ✅ 修复3: 调整BNNeck特征范数阈值 - 如果使用L2归一化，范数应该接近1
         # 检查模型是否在使用L2归一化
         using_l2_norm = False
         if isinstance(outputs, dict) and 'bn_features' in outputs:
@@ -1342,18 +1169,18 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
         # 根据是否使用L2归一化调整阈值
         if using_l2_norm:
             # L2归一化情况下，范数应该接近1
-            if avg_bn > 2.0 and epoch > 5 and batch_idx % 50 == 0:
-                logging.warning(f"⚠️ BN特征范数异常(L2归一化): {avg_bn:.2f} - 应接近1.0 (Epoch {epoch})")
+            if avg_feat_bnneck > 2.0 and epoch > 5 and batch_idx % 50 == 0:
+                logging.warning(f"⚠️ BNNeck特征范数异常(L2归一化): {avg_feat_bnneck:.2f} - 应接近1.0 (Epoch {epoch})")
         else:
             # 非归一化情况下，范数阈值设为更合理的值
-            if avg_bn > 15.0 and epoch > 5 and batch_idx % 50 == 0:
-                logging.warning(f"⚠️ BN特征范数过大(非归一化): {avg_bn:.2f} - 正则化未生效 (Epoch {epoch})")
+            if avg_feat_bnneck > 15.0 and epoch > 5 and batch_idx % 50 == 0:
+                logging.warning(f"⚠️ BNNeck特征范数过大(非归一化): {avg_feat_bnneck:.2f} - 正则化未生效 (Epoch {epoch})")
         
         # 特征范数监控改进（降频优化）
         if batch_idx % NORM_EVERY == 0 and batch_idx > 0:
             logging.info(f"[特征监控] Epoch {epoch}, Batch {batch_idx}: "
-                        f"融合特征={avg_fused:.2f}, BN特征={avg_bn:.2f}, "
-                        f"原始ReID特征={avg_reid:.2f}, 是否L2归一化={using_l2_norm}")
+                        f"融合特征={avg_fusion_feat:.2f}, BNNeck特征={avg_feat_bnneck:.2f}, "
+                        f"BN前特征={avg_feat_pre_bn:.2f}, 是否L2归一化={using_l2_norm}")
         
         # ✅ 进度条更新降频：从5提高到10，减少GPU-CPU同步开销
         if batch_idx % 10 == 0:
@@ -1361,8 +1188,10 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
                 'Loss': f'{current_loss:.3f}',
                 'CE': f'{float(ce_loss.item()):.3f}',
                 'SDMLoss': f'{sdm_loss_val:.3f}',  # 修复后应该非负
-                'Feat(BN)': f'{avg_bn:.2f}',  # 重点监控BN后特征范数
-                'GradNorm': ('—' if avg_grad_norm is None else f'{avg_grad_norm:.2f}'),
+                'Fusion': f'{avg_fusion_feat:.2f}',  # 多模态融合后特征范数
+                'PreBN': f'{avg_feat_pre_bn:.2f}',  # BN前原始特征范数
+                'PostBN': f'{avg_feat_bnneck:.2f}',  # BN后特征范数（用于ReID检索）
+                'GradNorm': ('—' if recent_grad_norm is None else f'{recent_grad_norm:.2f}'),
                 'Spikes': loss_spikes
             })
         
@@ -1379,7 +1208,7 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
     avg_loss = total_loss / max(1, len(dataloader))
     accuracy = 100. * correct / max(1, total)
     avg_feat_norm = np.mean(feature_norms) if feature_norms else 0.0
-    avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+    epoch_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
     
     if loss_spikes > len(dataloader) * 0.1:
         logging.warning(f"Epoch {epoch}: 损失异常次数 {loss_spikes}，建议降低学习率")
@@ -1407,7 +1236,7 @@ def train_epoch_fixed(model, dataloader, optimizer, device, epoch, scaler=None, 
         'sdm_loss': contrastive_loss_sum / max(1, len(dataloader)),  # 明确的SDM损失
         'accuracy': accuracy,
         'feature_norm': avg_feat_norm,
-        'grad_norm': avg_grad_norm,
+        'grad_norm': epoch_grad_norm,
         'loss_spikes': loss_spikes,
         'stability_score': max(0.0, 1.0 - train_epoch_fixed._spike_state['spikes'] / max(1, train_epoch_fixed._spike_state['batches'])),
         'actual_batches': total_attempted,  # 实际尝试的batch数（包含跳过的）
@@ -1514,20 +1343,6 @@ def train_multimodal_reid():
     logging.info(f"Batch Size配置: P×K={P}×{K}={actual_batch_size}, 累积步数={grad_accum_steps}, 等效={effective_batch_size}")
     logging.info(f"强制配对约束: 每个ID必须≥2样本且包含vis+nonvis")
 
-    # guide16.md: 在创建采样器前分析数据集采样能力
-    print("\n" + "="*50)
-    print("数据集采样能力分析 (原始数据集)")
-    print("="*50)
-    dataset_stats = analyze_dataset_sampling_capability(train_dataset, min_k=2)
-    print("="*50 + "\n")
-
-    # guide16.md: 检查采样参数是否合理
-    if dataset_stats['pairable_ids'] < P:
-        logging.error(f"可配对ID数({dataset_stats['pairable_ids']}) < 每批需要ID数({P})，"
-                     f"建议降低num_ids_per_batch或增加数据集多样性")
-    elif dataset_stats['estimated_max_batches'] < 100:
-        logging.warning(f"估算最大batch数({dataset_stats['estimated_max_batches']})较少，"
-                       f"可能导致epoch提前结束。建议调整P={P}, K={K}参数")
     
     logging.info(f"采样策略: P×K = {P}×{K} = {actual_batch_size}")
     logging.info(f"每个锚的正样本数: {K-1}")
